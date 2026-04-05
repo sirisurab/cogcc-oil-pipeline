@@ -1,0 +1,12 @@
+data/
+large_tool_results/
+conversation_history/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+logs/
+dist/
+build/

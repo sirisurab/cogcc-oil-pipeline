@@ -1,0 +1,31 @@
+acquire:
+  base_url_zip: "https://ecmc.state.co.us/documents/data/downloads/production/{year}_prod_reports.zip"
+  base_url_monthly: "https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv"
+  data_dictionary_url: "https://ecmc.state.co.us/documents/data/downloads/production/production_record_data_dictionary.htm"
+  start_year: 2020
+  raw_dir: "data/raw"
+  references_dir: "references"
+  max_workers: 5
+  sleep_seconds: 0.5
+
+ingest:
+  raw_dir: "data/raw"
+  interim_dir: "data/interim"
+  start_year: 2020
+
+transform:
+  interim_dir: "data/interim"
+  processed_dir: "data/processed"
+  cleaned_file: "cogcc_production_cleaned.parquet"
+
+features:
+  processed_dir: "data/processed"
+  cleaned_file: "cogcc_production_cleaned.parquet"
+  features_file: "cogcc_production_features.parquet"
+  quality_report: "data_quality_report.json"
+  rolling_windows: [3, 6, 12]
+
+logging:
+  log_dir: "logs"
+  log_file: "pipeline_run.log"
+  level: "INFO"

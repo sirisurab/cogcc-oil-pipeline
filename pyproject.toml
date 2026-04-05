@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cogcc_pipeline"
+version = "0.1.0"
+description = "COGCC/ECMC oil and gas production data pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "requests",
+    "beautifulsoup4",
+    "lxml",
+    "pandas",
+    "numpy",
+    "pyarrow",
+    "dask[dataframe]",
+    "pyyaml",
+    "tqdm",
+    "scikit-learn",
+    "joblib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-mock",
+    "responses",
+    "mypy",
+    "ruff",
+    "pandas-stubs",
+    "types-requests",
+    "types-PyYAML",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cogcc_pipeline*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: fast unit tests with no external I/O",
+    "integration: tests requiring real data files or network access",
+]
