@@ -208,8 +208,8 @@
 		<description>
 			After ingest is complete, read a sample of at least 3 interim Parquet
 			partitions and assert that all expected columns are present in every partition:
-			APICountyCode, APISeqNum, ReportYear, ReportMonth, OilProduced, OilSold,
-			GasProduced, GasSold, GasFlared, GasUsed, WaterProduced, DaysProduced, Well, OpName, OpNum,
+			ApiCountyCode, ApiSequenceNumber, ReportYear, ReportMonth, OilProduced, OilSales,
+			GasProduced, GasSales, FlaredVented, GasUsedOnLease, WaterProduced, DaysProduced, Well, OpName, OpNum,
 			DocNum. Assert no expected column is missing or renamed in any sampled
 			partition.
 		</description>

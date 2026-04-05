@@ -1,565 +1,431 @@
-"""Features stage: engineer ML-ready features per well."""
+"""Features stage — engineer ML-ready features from processed Parquet data."""
 
 from __future__ import annotations
 
-import json
-import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import dask.dataframe as dd
-import joblib  # type: ignore[import-untyped]
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler  # type: ignore[import-untyped]
+from sklearn.preprocessing import LabelEncoder, StandardScaler  # type: ignore[import-untyped]
 
-# ---------------------------------------------------------------------------
-# Output schema
-# ---------------------------------------------------------------------------
+from cogcc_pipeline.acquire import get_logger, load_config
 
-FEATURE_COLUMNS: list[str] = [
-    "well_id",
-    "production_date",
-    "oil_bbl",
-    "gas_mcf",
-    "water_bbl",
-    "days_produced",
-    "cum_oil",
-    "cum_gas",
-    "cum_water",
-    "gor",
-    "water_cut",
-    "decline_rate",
-    "well_age_months",
-    "oil_bbl_30d",
-    "gas_mcf_30d",
-    "water_bbl_30d",
-    "oil_bbl_rolling_3m",
-    "oil_bbl_rolling_6m",
-    "oil_bbl_rolling_12m",
-    "gas_mcf_rolling_3m",
-    "gas_mcf_rolling_6m",
-    "gas_mcf_rolling_12m",
-    "water_bbl_rolling_3m",
-    "water_bbl_rolling_6m",
-    "water_bbl_rolling_12m",
-    "oil_bbl_lag1",
-    "gas_mcf_lag1",
-    "water_bbl_lag1",
-    "op_name_encoded",
-    "county_encoded",
-]
+_log = get_logger(__name__)
 
-SCALE_COLS: list[str] = [
-    "oil_bbl",
-    "gas_mcf",
-    "water_bbl",
-    "cum_oil",
-    "cum_gas",
-    "cum_water",
-    "gor",
-    "water_cut",
-    "decline_rate",
-    "well_age_months",
-    "oil_bbl_rolling_3m",
-    "oil_bbl_rolling_6m",
-    "oil_bbl_rolling_12m",
-]
+_NUMERIC_SCALE_COLS = ["oil_bbl", "gas_mcf", "water_bbl", "cum_oil", "cum_gas", "cum_water"]
+_CAT_ENCODE_COLS = ["county_code", "operator_name"]
 
 
 # ---------------------------------------------------------------------------
-# Per-well feature functions (pandas)
+# Task 01 — cumulative production
 # ---------------------------------------------------------------------------
 
 
-def compute_cumulative_production(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute cumulative oil, gas, and water production per well.
+def compute_cumulative_production(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Add cum_oil, cum_gas, cum_water per well (monotonically non-decreasing)."""
+    if "well_id" not in ddf.columns or "production_date" not in ddf.columns:
+        raise KeyError("compute_cumulative_production requires well_id and production_date")
 
-    Null months are treated as zero for cumsum purposes so NaN does not
-    propagate into the cumulative total.
+    meta = ddf._meta.copy()
+    for col in ("cum_oil", "cum_gas", "cum_water"):
+        meta[col] = pd.Series(dtype="float64")
 
-    Args:
-        df: Single-well DataFrame sorted ascending by production_date.
+    def _cumulative(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        cum_results: dict[str, list] = {"cum_oil": [], "cum_gas": [], "cum_water": []}
+        for well_id, grp in out.groupby("well_id", sort=False):
+            grp = grp.sort_values("production_date")
+            cum_results["cum_oil"].append(grp["oil_bbl"].fillna(0).cumsum())
+            cum_results["cum_gas"].append(grp["gas_mcf"].fillna(0).cumsum())
+            cum_results["cum_water"].append(grp["water_bbl"].fillna(0).cumsum())
 
-    Returns:
-        DataFrame with ``cum_oil``, ``cum_gas``, ``cum_water`` columns added.
-    """
-    df = df.copy()
-    df["cum_oil"] = df["oil_bbl"].fillna(0).cumsum()
-    df["cum_gas"] = df["gas_mcf"].fillna(0).cumsum()
-    df["cum_water"] = df["water_bbl"].fillna(0).cumsum()
-    return df
+        for col, parts in cum_results.items():
+            if parts:
+                combined = pd.concat(parts).reindex(out.index)
+                out[col] = combined
+            else:
+                out[col] = np.nan
 
+        return out
 
-def compute_ratios(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute gas-oil ratio (GOR) and water cut for each row.
-
-    Uses ``numpy.where`` to avoid ZeroDivisionError and Inf values.
-
-    Args:
-        df: DataFrame with ``oil_bbl``, ``gas_mcf``, ``water_bbl`` columns.
-
-    Returns:
-        DataFrame with ``gor`` and ``water_cut`` columns added.
-    """
-    df = df.copy()
-    oil = pd.to_numeric(df["oil_bbl"], errors="coerce")
-    gas = pd.to_numeric(df["gas_mcf"], errors="coerce")
-    water = pd.to_numeric(df["water_bbl"], errors="coerce")
-
-    # GOR: gas / oil when oil > 0, else NaN
-    gor = np.where(oil > 0, gas / oil, np.nan)
-    df["gor"] = gor.astype(float)
-
-    # Water cut: water / (oil + water) when denominator > 0
-    denom = oil + water
-    water_cut = np.where(denom > 0, water / denom, np.nan)
-    df["water_cut"] = water_cut.astype(float)
-    return df
+    return ddf.map_partitions(_cumulative, meta=meta)
 
 
-def compute_decline_rate(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute period-over-period oil production decline rate, clipped to [-1, 10].
+# ---------------------------------------------------------------------------
+# Task 02 — GOR calculator
+# ---------------------------------------------------------------------------
 
-    Special cases:
-    - ``oil_bbl_prev == 0`` and ``oil_bbl_curr > 0``: decline_rate = -1.0
-    - ``oil_bbl_prev == 0`` and ``oil_bbl_curr == 0``: decline_rate = 0.0
-    - First record (no prior month): decline_rate = NaN
 
-    Args:
-        df: Single-well DataFrame sorted ascending by production_date.
+def compute_gor(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Add gor = gas_mcf / oil_bbl with zero/null handling per TR-06."""
+    meta = ddf._meta.copy()
+    meta["gor"] = pd.Series(dtype="float64")
 
-    Returns:
-        DataFrame with ``decline_rate`` column added.
-    """
-    df = df.copy()
-    oil = pd.to_numeric(df["oil_bbl"], errors="coerce")
-    prev = oil.shift(1)
+    def _gor(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        oil = out["oil_bbl"]
+        gas = out["gas_mcf"]
+        gor = pd.Series(np.nan, index=out.index, dtype="float64")
+        # oil > 0: normal division
+        mask_pos = oil > 0
+        gor[mask_pos] = gas[mask_pos] / oil[mask_pos]
+        # oil == 0 and gas == 0: NaN (shut-in)  — already NaN
+        # oil == 0 and gas > 0: NaN — already NaN
+        # oil > 0 and gas == 0 or gas is NaN → 0.0 (fillna with 0 for gas when oil > 0)
+        gor[mask_pos] = (gas[mask_pos].fillna(0)) / oil[mask_pos]
+        out["gor"] = gor
 
-    # Raw computation using numpy
-    prev_arr = prev.to_numpy(dtype=float, na_value=np.nan)
-    curr_arr = oil.to_numpy(dtype=float, na_value=np.nan)
+        null_frac = gor[oil > 0].isna().mean() if (oil > 0).any() else 0.0
+        if null_frac > 0.10:
+            _log.debug("compute_gor: %.1f%% null gor for oil>0 rows", null_frac * 100)
+        return out
 
-    decline = np.full(len(df), np.nan)
-    for i in range(len(df)):
-        p = prev_arr[i]
-        c = curr_arr[i]
-        if np.isnan(p):
-            decline[i] = np.nan
-        elif p == 0 and c > 0:
-            decline[i] = -1.0
-        elif p == 0 and c == 0:
-            decline[i] = 0.0
-        elif np.isnan(c):
-            decline[i] = np.nan
+    return ddf.map_partitions(_gor, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Task 03 — water cut calculator
+# ---------------------------------------------------------------------------
+
+
+def compute_water_cut(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Add water_cut = water_bbl / (oil_bbl + water_bbl) per TR-10."""
+    meta = ddf._meta.copy()
+    meta["water_cut"] = pd.Series(dtype="float64")
+
+    def _water_cut(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        oil = out["oil_bbl"].fillna(0.0)
+        water = out["water_bbl"].fillna(0.0)
+        total = oil + water
+
+        wc = pd.Series(np.nan, index=out.index, dtype="float64")
+        mask_pos = total > 0
+        wc[mask_pos] = water[mask_pos] / total[mask_pos]
+        # shut-in (both 0): NaN — already NaN
+
+        out["water_cut"] = wc
+
+        # Integrity check
+        invalid = wc[(~wc.isna()) & ((wc < 0.0) | (wc > 1.0))]
+        if not invalid.empty:
+            _log.error("compute_water_cut: %d values outside [0,1]", len(invalid))
+
+        return out
+
+    return ddf.map_partitions(_water_cut, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Task 04 — decline rate calculator
+# ---------------------------------------------------------------------------
+
+
+def compute_decline_rate(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Add decline_rate per well per TR-07. Clipped to [-1.0, 10.0]."""
+    meta = ddf._meta.copy()
+    meta["decline_rate"] = pd.Series(dtype="float64")
+
+    def _decline(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        dr_series: list[pd.Series] = []
+
+        for _, grp in out.groupby("well_id", sort=False):
+            grp = grp.sort_values("production_date")
+            oil = grp["oil_bbl"].fillna(0.0)
+            prev = oil.shift(1)
+
+            raw = pd.Series(np.nan, index=grp.index, dtype="float64")
+            has_prev = prev.notna()
+
+            # prev == 0, current == 0 → 0.0
+            mask_zero_zero = has_prev & (prev == 0) & (oil == 0)
+            raw[mask_zero_zero] = 0.0
+            # prev == 0, current > 0 → 10.0 (cap, handled by clip)
+            mask_zero_pos = has_prev & (prev == 0) & (oil > 0)
+            raw[mask_zero_pos] = 10.0
+            # prev > 0 → normal
+            mask_normal = has_prev & (prev > 0)
+            raw[mask_normal] = (oil[mask_normal] - prev[mask_normal]) / prev[mask_normal]
+
+            raw = raw.clip(lower=-1.0, upper=10.0)
+            dr_series.append(raw)
+
+        if dr_series:
+            out["decline_rate"] = pd.concat(dr_series).reindex(out.index)
         else:
-            decline[i] = (p - c) / p
+            out["decline_rate"] = np.nan
+        return out
 
-    decline = np.clip(decline, -1.0, 10.0)
-    df["decline_rate"] = decline
-    return df
-
-
-def compute_rolling_and_lag(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
-    """Compute rolling averages and lag-1 features for production columns.
-
-    Rolling averages use ``min_periods=1`` so partial windows yield a value
-    rather than NaN.
-
-    Args:
-        df: Single-well DataFrame sorted ascending by production_date.
-        windows: List of rolling window sizes in months (e.g. [3, 6, 12]).
-
-    Returns:
-        DataFrame with rolling and lag columns added.
-    """
-    df = df.copy()
-    prod_cols = ["oil_bbl", "gas_mcf", "water_bbl"]
-
-    for col in prod_cols:
-        series = pd.to_numeric(df[col], errors="coerce")
-        for w in windows:
-            df[f"{col}_rolling_{w}m"] = series.rolling(window=w, min_periods=1).mean()
-        df[f"{col}_lag1"] = series.shift(1)
-
-    return df
+    return ddf.map_partitions(_decline, meta=meta)
 
 
-def compute_well_age_and_normalised(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute well age in months and 30-day-normalised production.
+# ---------------------------------------------------------------------------
+# Task 05 — rolling averages and lag features
+# ---------------------------------------------------------------------------
 
-    ``well_age_months = 0`` for the first month.
-    Days-normalised production is NaN when ``days_produced`` is 0 or null.
 
-    Args:
-        df: Single-well DataFrame sorted ascending by production_date.
+def compute_rolling_and_lag_features(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Add 3m/6m rolling means and 1m lag features per well (TR-09)."""
+    if "well_id" not in ddf.columns or "production_date" not in ddf.columns:
+        raise KeyError("compute_rolling_and_lag_features requires well_id and production_date")
 
-    Returns:
-        DataFrame with ``well_age_months``, ``oil_bbl_30d``, ``gas_mcf_30d``,
-        ``water_bbl_30d`` columns added.
-    """
-    df = df.copy()
-    dates = pd.to_datetime(df["production_date"])
-    first_date = dates.min()
+    new_cols = [
+        "oil_roll_3m",
+        "gas_roll_3m",
+        "water_roll_3m",
+        "oil_roll_6m",
+        "gas_roll_6m",
+        "water_roll_6m",
+        "oil_lag_1m",
+        "gas_lag_1m",
+        "water_lag_1m",
+    ]
+    meta = ddf._meta.copy()
+    for col in new_cols:
+        meta[col] = pd.Series(dtype="float64")
 
-    df["well_age_months"] = (
-        (dates.dt.year - first_date.year) * 12 + (dates.dt.month - first_date.month)
-    ).astype("Int64")
+    def _rolling_lag(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        accum: dict[str, list[pd.Series]] = {c: [] for c in new_cols}
 
-    days = pd.to_numeric(df["days_produced"], errors="coerce")
-    for col in ("oil_bbl", "gas_mcf", "water_bbl"):
-        out_col = col.replace("bbl", "bbl_30d").replace("mcf", "mcf_30d")
-        # Handle oil_bbl_30d vs oil_bbl_30d naming
-        if col == "oil_bbl":
-            out_col = "oil_bbl_30d"
-        elif col == "gas_mcf":
-            out_col = "gas_mcf_30d"
+        for _, grp in out.groupby("well_id", sort=False):
+            grp = grp.sort_values("production_date")
+            for prod, w3, w6, lag in [
+                ("oil_bbl", "oil_roll_3m", "oil_roll_6m", "oil_lag_1m"),
+                ("gas_mcf", "gas_roll_3m", "gas_roll_6m", "gas_lag_1m"),
+                ("water_bbl", "water_roll_3m", "water_roll_6m", "water_lag_1m"),
+            ]:
+                s = grp[prod]
+                accum[w3].append(s.rolling(window=3, min_periods=3).mean())
+                accum[w6].append(s.rolling(window=6, min_periods=6).mean())
+                accum[lag].append(s.shift(1))
+
+        for col, parts in accum.items():
+            if parts:
+                out[col] = pd.concat(parts).reindex(out.index)
+            else:
+                out[col] = np.nan
+        return out
+
+    return ddf.map_partitions(_rolling_lag, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Task 06 — month-over-month % change
+# ---------------------------------------------------------------------------
+
+
+def compute_mom_pct_change(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Add oil_mom_pct and gas_mom_pct per well. Clipped to [-100, 1000]."""
+    meta = ddf._meta.copy()
+    meta["oil_mom_pct"] = pd.Series(dtype="float64")
+    meta["gas_mom_pct"] = pd.Series(dtype="float64")
+
+    def _mom(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        oil_acc: list[pd.Series] = []
+        gas_acc: list[pd.Series] = []
+
+        for _, grp in out.groupby("well_id", sort=False):
+            grp = grp.sort_values("production_date")
+            for s, acc in [(grp["oil_bbl"], oil_acc), (grp["gas_mcf"], gas_acc)]:
+                prev = s.shift(1)
+                pct = pd.Series(np.nan, index=grp.index, dtype="float64")
+                mask = prev.notna() & (prev != 0)
+                pct[mask] = ((s[mask] - prev[mask]) / prev[mask]) * 100
+                pct = pct.clip(lower=-100.0, upper=1000.0)
+                acc.append(pct)
+
+        out["oil_mom_pct"] = pd.concat(oil_acc).reindex(out.index) if oil_acc else np.nan
+        out["gas_mom_pct"] = pd.concat(gas_acc).reindex(out.index) if gas_acc else np.nan
+        return out
+
+    return ddf.map_partitions(_mom, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Task 07 — categorical encoder
+# ---------------------------------------------------------------------------
+
+
+def encode_categoricals(ddf: dd.DataFrame, encoders: dict[str, Any]) -> dd.DataFrame:
+    """Apply pre-fitted LabelEncoders to categorical columns (adds _enc columns)."""
+    enc_cols = {"county_code": "county_code_enc", "operator_name": "operator_name_enc"}
+    meta = ddf._meta.copy()
+    for _, enc_col in enc_cols.items():
+        meta[enc_col] = pd.Series(dtype="int32")
+
+    def _encode(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        for src_col, enc_col in enc_cols.items():
+            enc = encoders[src_col]
+            classes = set(enc.classes_)
+            vals = out[src_col].fillna("UNKNOWN").astype(str)
+            encoded = np.full(len(vals), -1, dtype="int32")
+            known_mask = vals.isin(classes)
+            if (~known_mask).any():
+                _log.warning("encode_categoricals: unseen labels in %s", src_col)
+            if known_mask.any():
+                encoded[known_mask.to_numpy()] = enc.transform(vals[known_mask]).astype("int32")
+            out[enc_col] = encoded
+        return out
+
+    return ddf.map_partitions(_encode, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Task 08 — numerical scaler
+# ---------------------------------------------------------------------------
+
+
+def scale_numerics(ddf: dd.DataFrame, scalers: dict[str, Any]) -> dd.DataFrame:
+    """Apply pre-fitted StandardScalers to numeric columns (adds _scaled columns)."""
+    scale_map = {col: f"{col}_scaled" for col in _NUMERIC_SCALE_COLS}
+
+    # Validate all scalers present
+    for col in _NUMERIC_SCALE_COLS:
+        if col not in scalers:
+            raise KeyError(f"No scaler provided for column: {col}")
+
+    meta = ddf._meta.copy()
+    for _, scaled_col in scale_map.items():
+        meta[scaled_col] = pd.Series(dtype="float64")
+
+    def _scale(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        for col, scaled_col in scale_map.items():
+            scaler = scalers[col]
+            vals = out[col].values.astype("float64")
+            result = np.full(len(vals), np.nan, dtype="float64")
+            mask = ~np.isnan(vals)
+            if mask.any():
+                result[mask] = scaler.transform(np.asarray(vals[mask]).reshape(-1, 1)).flatten()
+            out[scaled_col] = result
+        return out
+
+    return ddf.map_partitions(_scale, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Task 09 — scaler and encoder fitter
+# ---------------------------------------------------------------------------
+
+
+def fit_scalers_and_encoders(
+    ddf: dd.DataFrame,
+) -> tuple[dict[str, StandardScaler], dict[str, LabelEncoder]]:
+    """Fit StandardScaler per numeric column and LabelEncoder per categorical column."""
+    required_num = set(_NUMERIC_SCALE_COLS)
+    required_cat = set(_CAT_ENCODE_COLS)
+    missing = (required_num | required_cat) - set(ddf.columns)
+    if missing:
+        raise KeyError(f"fit_scalers_and_encoders: missing columns: {missing}")
+
+    # Fit scalers
+    num_df = ddf[_NUMERIC_SCALE_COLS].compute()
+    scalers: dict[str, StandardScaler] = {}
+    for col in _NUMERIC_SCALE_COLS:
+        valid = num_df[col].dropna()
+        scaler = StandardScaler()
+        if len(valid) == 0:
+            _log.warning("fit_scalers_and_encoders: no non-null values for %s", col)
+            scaler.mean_ = np.array([0.0])
+            scaler.scale_ = np.array([1.0])
+            scaler.var_ = np.array([1.0])
+            scaler.n_features_in_ = 1
+            scaler.n_samples_seen_ = 0
         else:
-            out_col = "water_bbl_30d"
-        vals = pd.to_numeric(df[col], errors="coerce")
-        df[out_col] = np.where(days > 0, vals * 30.0 / days, np.nan)
+            scaler.fit(valid.values.reshape(-1, 1))
+        _log.info(
+            "Scaler %s: mean=%.4f std=%.4f", col, float(scaler.mean_[0]), float(scaler.scale_[0])
+        )
+        scalers[col] = scaler
 
-    return df
+    # Fit encoders
+    cat_df = ddf[_CAT_ENCODE_COLS].compute()
+    encoders: dict[str, LabelEncoder] = {}
+    for col in _CAT_ENCODE_COLS:
+        enc = LabelEncoder()
+        vals = cat_df[col].fillna("UNKNOWN").astype(str)
+        enc.fit(vals)
+        _log.info("Encoder %s: %d unique classes", col, len(enc.classes_))
+        encoders[col] = enc
 
-
-def engineer_well_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
-    """Apply all per-well feature computations in order.
-
-    Validates that the output contains exactly the expected columns.
-
-    Args:
-        df: Single-well pandas DataFrame (all rows for one well_id).
-        windows: Rolling average window sizes.
-
-    Returns:
-        Enriched DataFrame with all feature columns.
-
-    Raises:
-        ValueError: If a required output column is missing.
-    """
-    df = df.sort_values("production_date").copy()
-
-    # Rename canonical columns to feature names if needed
-    rename_map = {
-        "OilProduced": "oil_bbl",
-        "GasProduced": "gas_mcf",
-        "WaterProduced": "water_bbl",
-        "DaysProduced": "days_produced",
-        "OpName": "OpName",
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-
-    # Ensure required production columns exist
-    for col in ("oil_bbl", "gas_mcf", "water_bbl", "days_produced"):
-        if col not in df.columns:
-            df[col] = pd.NA
-
-    df = compute_cumulative_production(df)
-    df = compute_ratios(df)
-    df = compute_decline_rate(df)
-    df = compute_rolling_and_lag(df, windows)
-    df = compute_well_age_and_normalised(df)
-
-    return df
+    return scalers, encoders
 
 
 # ---------------------------------------------------------------------------
-# Dask parallel per-well dispatcher
-# ---------------------------------------------------------------------------
-
-
-def _build_features_meta(windows: list[int]) -> pd.DataFrame:
-    """Build empty meta DataFrame for the features output schema."""
-    # Column order must exactly match what engineer_well_features produces:
-    # input cols first (well_id, production_date, oil_bbl, gas_mcf, water_bbl,
-    # days_produced, OpName), then computed cols in order of addition.
-    dtypes: dict[str, Any] = {
-        "well_id": pd.StringDtype(),
-        "production_date": pd.Series(dtype="datetime64[us]").dtype,
-        "oil_bbl": pd.Float64Dtype(),
-        "gas_mcf": pd.Float64Dtype(),
-        "water_bbl": pd.Float64Dtype(),
-        "days_produced": pd.Float64Dtype(),
-        "OpName": pd.StringDtype(),
-        "cum_oil": pd.Float64Dtype(),
-        "cum_gas": pd.Float64Dtype(),
-        "cum_water": pd.Float64Dtype(),
-        "gor": pd.Float64Dtype(),
-        "water_cut": pd.Float64Dtype(),
-        "decline_rate": pd.Float64Dtype(),
-    }
-    for col in ("oil_bbl", "gas_mcf", "water_bbl"):
-        for w in windows:
-            dtypes[f"{col}_rolling_{w}m"] = pd.Float64Dtype()
-        dtypes[f"{col}_lag1"] = pd.Float64Dtype()
-    dtypes["well_age_months"] = pd.Float64Dtype()
-    dtypes["oil_bbl_30d"] = pd.Float64Dtype()
-    dtypes["gas_mcf_30d"] = pd.Float64Dtype()
-    dtypes["water_bbl_30d"] = pd.Float64Dtype()
-
-    meta = pd.DataFrame({k: pd.array([], dtype=v) for k, v in dtypes.items()})
-    return meta
-
-
-def _apply_per_well(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
-    """Apply engineer_well_features to each well within a partition group."""
-    results = []
-    for _, well_df in df.groupby("well_id", sort=False):
-        try:
-            enriched = engineer_well_features(well_df, windows)
-            results.append(enriched)
-        except Exception:
-            pass
-    if results:
-        return pd.concat(results, ignore_index=True)
-    return _build_features_meta(windows).iloc[:0]
-
-
-def apply_well_features_parallel(
-    ddf: dd.DataFrame,
-    windows: list[int],
-    logger: logging.Logger,
-) -> dd.DataFrame:
-    """Apply per-well feature engineering across all wells using Dask.
-
-    Does not call ``.compute()`` internally.
-
-    Args:
-        ddf: Cleaned Dask DataFrame sorted by (well_id, production_date).
-        windows: Rolling average window sizes.
-        logger: Configured logger instance.
-
-    Returns:
-        Dask DataFrame with all feature columns.
-    """
-    logger.info("Applying per-well feature engineering (windows=%s)", windows)
-    ddf = ddf.map_partitions(
-        _apply_per_well,
-        windows,
-        meta=_build_features_meta(windows),
-    )
-    return ddf
-
-
-# ---------------------------------------------------------------------------
-# Categorical encoding
-# ---------------------------------------------------------------------------
-
-
-def encode_categoricals(
-    ddf: dd.DataFrame,
-    encoders_output_path: Path,
-    logger: logging.Logger,
-) -> dd.DataFrame:
-    """Label-encode OpName and county_code; save mapping JSON.
-
-    Calls ``.compute()`` once to build the encoding maps.
-
-    Args:
-        ddf: Dask DataFrame with ``OpName`` and ``well_id`` columns.
-        encoders_output_path: Path for the JSON encoding mapping file.
-        logger: Configured logger instance.
-
-    Returns:
-        Dask DataFrame with ``op_name_encoded`` and ``county_encoded`` columns added,
-        ``OpName`` dropped.
-    """
-    logger.info("Encoding categorical columns")
-
-    # Build county_code from well_id
-    def _add_county(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["county_code"] = df["well_id"].str[2:5].astype(pd.StringDtype())
-        return df
-
-    meta_with_county = ddf._meta.copy()
-    meta_with_county["county_code"] = pd.array([], dtype=pd.StringDtype())
-    ddf = ddf.map_partitions(_add_county, meta=meta_with_county)
-
-    # Compute unique values for encoding maps
-    op_names = sorted(ddf["OpName"].dropna().compute().unique().tolist())  # type: ignore[union-attr]
-    counties = sorted(ddf["county_code"].dropna().compute().unique().tolist())  # type: ignore[union-attr]
-
-    op_map: dict[str, int] = {name: i for i, name in enumerate(op_names)}
-    county_map: dict[str, int] = {code: i for i, code in enumerate(counties)}
-
-    encoders_output_path.parent.mkdir(parents=True, exist_ok=True)
-    with encoders_output_path.open("w", encoding="utf-8") as fh:
-        json.dump({"op_name": op_map, "county_code": county_map}, fh, indent=2)
-    logger.info("Label encoders saved to %s", encoders_output_path)
-
-    def _encode_partition(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["op_name_encoded"] = df["OpName"].map(op_map).fillna(-1).astype(pd.Int32Dtype())
-        df["county_encoded"] = df["county_code"].map(county_map).fillna(-1).astype(pd.Int32Dtype())
-        df = df.drop(columns=["OpName", "county_code"], errors="ignore")
-        return df
-
-    meta_encoded = ddf._meta.copy()
-    meta_encoded["op_name_encoded"] = pd.array([], dtype=pd.Int32Dtype())
-    meta_encoded["county_encoded"] = pd.array([], dtype=pd.Int32Dtype())
-    meta_encoded = meta_encoded.drop(columns=["OpName", "county_code"], errors="ignore")
-
-    return ddf.map_partitions(_encode_partition, meta=meta_encoded)
-
-
-# ---------------------------------------------------------------------------
-# Numeric scaling
-# ---------------------------------------------------------------------------
-
-
-def scale_numeric_features(
-    ddf: dd.DataFrame,
-    scaler_output_path: Path,
-    logger: logging.Logger,
-) -> dd.DataFrame:
-    """Fit a StandardScaler and apply it to numeric feature columns.
-
-    Calls ``.compute()`` to fit the scaler on the full dataset.
-
-    Args:
-        ddf: Dask DataFrame with numeric feature columns.
-        scaler_output_path: Path where the fitted scaler will be saved.
-        logger: Configured logger instance.
-
-    Returns:
-        Dask DataFrame with scaled numeric column values.
-    """
-    logger.info("Fitting StandardScaler on numeric features")
-    scale_cols = [c for c in SCALE_COLS if c in ddf.columns]
-
-    df_full = ddf[scale_cols].compute()
-    fill_values = df_full.mean()
-    df_filled = df_full.fillna(fill_values)
-
-    scaler = StandardScaler()
-    scaler.fit(df_filled)
-
-    scaler_output_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(scaler, scaler_output_path)
-    logger.info("Scaler saved to %s", scaler_output_path)
-
-    means = fill_values.to_dict()
-
-    def _scale_partition(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        present = [c for c in scale_cols if c in df.columns]
-        if present:
-            sub = df[present].copy()
-            for col in present:
-                sub[col] = pd.to_numeric(sub[col], errors="coerce")
-            sub = sub.fillna({c: means.get(c, 0.0) for c in present})
-            scaled = scaler.transform(sub[scale_cols if scale_cols == present else present])
-            for i, col in enumerate(present):
-                df[col] = scaled[:, i]
-        return df
-
-    return ddf.map_partitions(_scale_partition, meta=ddf._meta)
-
-
-# ---------------------------------------------------------------------------
-# Feature Parquet writer and schema validator
+# Task 10 — features Parquet writer
 # ---------------------------------------------------------------------------
 
 
 def write_features_parquet(
     ddf: dd.DataFrame,
-    processed_dir: Path,
-    filename: str,
-    logger: logging.Logger,
-) -> Path:
-    """Write the feature matrix to Parquet with 30 partitions.
-
-    Args:
-        ddf: Feature Dask DataFrame.
-        processed_dir: Directory for output Parquet dataset.
-        filename: Subdirectory name for the Parquet dataset.
-        logger: Configured logger instance.
-
-    Returns:
-        Path to the written Parquet dataset directory.
-    """
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    output_path = processed_dir / filename
-    logger.info("Writing features Parquet to %s", output_path)
-    ddf.repartition(npartitions=30).to_parquet(
-        str(output_path),
-        write_index=False,
-        engine="pyarrow",
-        overwrite=True,
+    output_dir: Path,
+    total_rows_estimate: int,
+) -> None:
+    """Write ML-ready features DataFrame to *output_dir* as Parquet."""
+    npartitions = max(1, min(total_rows_estimate // 500_000, 50))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _log.info("write_features_parquet: npartitions=%d → %s", npartitions, output_dir)
+    ddf.repartition(npartitions=npartitions).to_parquet(
+        str(output_dir), write_index=False, overwrite=True
     )
-    logger.info("Features Parquet write complete: %s", output_path)
-    return output_path
-
-
-def validate_features_schema(features_parquet_path: Path, logger: logging.Logger) -> list[str]:
-    """Validate that the features Parquet contains all expected columns.
-
-    Args:
-        features_parquet_path: Path to the Parquet dataset directory.
-        logger: Configured logger instance.
-
-    Returns:
-        List of validation error strings; empty if all columns present.
-    """
-    parquet_files = sorted(features_parquet_path.glob("*.parquet"))
-    if not parquet_files:
-        return [f"No Parquet files found in {features_parquet_path}"]
-
-    sample_file = parquet_files[0]
-    df = pd.read_parquet(sample_file)
-    errors: list[str] = []
-    for col in FEATURE_COLUMNS:
-        if col not in df.columns:
-            msg = f"Missing column '{col}' in features Parquet"
-            logger.warning(msg)
-            errors.append(msg)
-    return errors
+    _log.info("Features Parquet written to %s", output_dir)
 
 
 # ---------------------------------------------------------------------------
-# Top-level entry point
+# Task 11 — features orchestrator
 # ---------------------------------------------------------------------------
 
 
-def run_features(config: dict[str, Any], logger: logging.Logger) -> Path:
-    """Run the full features stage: engineer features, encode, scale, write.
+def run_features(config_path: str = "config.yaml") -> dd.DataFrame:
+    """Run the full features stage: processed Parquet → ML-ready features Parquet."""
+    import traceback
 
-    Args:
-        config: Pipeline configuration dictionary (top-level).
-        logger: Configured logger instance.
+    t0 = datetime.now()
+    _log.info("Features stage started")
 
-    Returns:
-        Path to the features Parquet dataset directory.
-    """
-    fcfg = config["features"]
-    processed_dir = Path(fcfg["processed_dir"])
-    cleaned_file: str = fcfg["cleaned_file"]
-    features_file: str = fcfg["features_file"]
-    windows: list[int] = list(fcfg["rolling_windows"])
+    cfg = load_config(config_path)
+    processed_dir = Path(cfg["features"]["processed_dir"])
+    output_dir = Path(cfg["features"]["output_dir"])
 
-    encoders_path = processed_dir / "label_encoders.json"
-    scaler_path = processed_dir / "scaler.joblib"
+    try:
+        ddf = dd.read_parquet(str(processed_dir))
+        ddf = ddf.repartition(npartitions=min(ddf.npartitions, 50))
 
-    cleaned_path = processed_dir / cleaned_file
-    logger.info("Reading cleaned Parquet from %s", cleaned_path)
-    ddf = dd.read_parquet(str(cleaned_path), engine="pyarrow")
-    ddf = ddf.repartition(npartitions=min(ddf.npartitions, 50))
+        # Filter to valid rows only for ML
+        if "is_valid" in ddf.columns:
+            ddf = ddf[ddf["is_valid"]]
 
-    # Sort by well_id, production_date for deterministic per-well processing
-    ddf = ddf.map_partitions(
-        lambda df: df.sort_values(["well_id", "production_date"]),
-        meta=ddf._meta,
-    )
+        ddf = compute_cumulative_production(ddf)
+        ddf = compute_gor(ddf)
+        ddf = compute_water_cut(ddf)
+        ddf = compute_decline_rate(ddf)
+        ddf = compute_rolling_and_lag_features(ddf)
+        ddf = compute_mom_pct_change(ddf)
 
-    ddf = apply_well_features_parallel(ddf, windows, logger)
-    ddf = encode_categoricals(ddf, encoders_path, logger)
-    ddf = scale_numeric_features(ddf, scaler_path, logger)
+        scalers, encoders = fit_scalers_and_encoders(ddf)
+        ddf = scale_numerics(ddf, scalers)
+        ddf = encode_categoricals(ddf, encoders)
 
-    features_path = write_features_parquet(ddf, processed_dir, features_file, logger)
+        total_rows_estimate: int = int(ddf.shape[0].compute())
+        _log.info("Features rows estimate: %d", total_rows_estimate)
 
-    errors = validate_features_schema(features_path, logger)
-    for err in errors:
-        logger.warning("Features schema validation: %s", err)
+        write_features_parquet(ddf, output_dir, total_rows_estimate)
 
-    return features_path
+    except Exception:
+        _log.error("Features stage failed:\n%s", traceback.format_exc())
+        raise
+
+    elapsed = (datetime.now() - t0).total_seconds()
+    _log.info("Features stage complete in %.1fs, columns: %d", elapsed, len(ddf.columns))
+    return ddf
+
+
+if __name__ == "__main__":
+    run_features()

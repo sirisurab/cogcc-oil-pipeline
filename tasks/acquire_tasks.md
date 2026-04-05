@@ -2,429 +2,435 @@
 
 ## Overview
 
-The acquire stage is responsible for downloading COGCC/ECMC oil and gas production data
-files from the public ECMC data portal for years 2020 through the current year. Each year
-except the current year is available as a ZIP archive containing a CSV; the current year
-is available as a direct CSV download. The stage uses Dask (via `dask.bag` or
-`concurrent.futures` coordinated by Dask delayed) for parallel downloads, rate-limited to
-a maximum of 5 concurrent workers with a 0.5-second sleep per worker.
+The acquire stage downloads COGCC (Colorado Energy & Carbon Management Commission, ECMC) production
+data files for years 2020 through the current year and places the resulting CSV files in `data/raw/`.
 
-The pipeline package is named `cogcc_pipeline`. All source modules live under
-`cogcc_pipeline/`. All test files live under `tests/`.
+- For years 2020 through (current year − 1): download a zip archive, extract the CSV, and save it.
+- For the current year: download the live monthly CSV directly (no zip).
 
----
+All downloads must be rate-limited to a maximum of 5 concurrent workers and must be idempotent
+(skip already-downloaded files). A 0.5-second sleep is applied per download worker after each
+request to avoid overloading the server.
 
-## Component Architecture
-
-### Modules and files produced by this stage
-
-| Artefact | Purpose |
-|---|---|
-| `cogcc_pipeline/acquire.py` | All acquisition logic |
-| `config/pipeline_config.yaml` | YAML configuration for URLs, years, paths, worker counts |
-| `references/production-data-dictionary.csv` | Data dictionary parsed from ECMC HTML page |
-| `data/raw/{year}_prod_reports.csv` | Annual production CSVs (2020 … current-year-minus-1) |
-| `data/raw/monthly_prod.csv` | Current-year live monthly CSV |
-| `tests/test_acquire.py` | Pytest unit and integration tests |
-| `pyproject.toml` | Project build configuration (build-backend = setuptools.build_meta) |
-| `Makefile` | `make env` and `make install` targets |
-| `.gitignore` | Ignores data/, large_tool_results/, conversation_history/ |
-| `requirements.txt` | Third-party dependencies |
+**Package:** `cogcc_pipeline`
+**Module:** `cogcc_pipeline/acquire.py`
+**Test file:** `tests/test_acquire.py`
 
 ---
 
-## Design Decisions and Constraints
+## Design Decisions & Constraints
 
-- **Build backend**: `pyproject.toml` must use `build-backend = "setuptools.build_meta"`.
-  Never use `"setuptools.backends.legacy:build"`.
-- **Makefile**: must include a `make env` target that creates `.venv` via
-  `python3 -m venv .venv`. The `make install` target must bootstrap pip, setuptools, and
-  wheel (`pip install --upgrade pip setuptools wheel`) before running
-  `pip install -e ".[dev]"`. Never rely solely on `pip install -r requirements.txt`.
-- **HTTP only**: Use `requests` and `BeautifulSoup` for HTTP downloads and HTML parsing.
-  Do not use Playwright or any browser automation.
-- **Idempotency**: If a target file already exists in `data/raw/`, skip the download.
-  Never overwrite or corrupt an existing file.
-- **Rate limiting**: Maximum 5 concurrent download workers. Each worker sleeps 0.5 seconds
-  before issuing its HTTP request.
-- **Parallelism**: Coordinate parallel downloads using Dask delayed or
-  `concurrent.futures.ThreadPoolExecutor` with `max_workers=5`.
-- **Configuration**: All URLs, year range, output paths, and worker counts must be read
-  from `config/pipeline_config.yaml`. Hard-coding is not permitted.
-- **Logging**: Use Python `logging` (structured). Log download start, skip (file exists),
-  success (bytes written), and failure (exception type + message) for every file.
-- **`.gitignore`**: The file must list `data/`, `large_tool_results/`, and
-  `conversation_history/` so large data files are not committed.
-- **pyproject.toml dev extras** must include `pandas-stubs` and `types-requests` so mypy
-  type checks pass.
-- **Type hints**: All public functions and classes must have full type annotations.
-- **Docstrings**: All public functions and classes must have docstrings.
+- Use `requests` for all HTTP operations. Do not use Playwright, Selenium, or any browser automation.
+- Use `concurrent.futures.ThreadPoolExecutor` (I/O-bound) with `max_workers=5` for parallel downloads.
+- All configurable values (base URL, output directory, years, worker count, sleep duration, retry
+  parameters) must be read from `config.yaml` at runtime, never hardcoded in function bodies.
+- Retry logic: up to 3 attempts per file with exponential back-off (1 s, 2 s, 4 s). Log a warning
+  after each failed attempt; log an error and skip the file after 3 failures.
+- A download failure for one year must not abort downloads for other years.
+- File-already-exists check: if the target CSV file is present on disk and has size > 0 bytes, skip
+  the download entirely (idempotency — TR-20).
+- Zip extraction: use `zipfile.ZipFile`. Extract only the CSV file from the archive (ignore any other
+  members). If the zip contains multiple CSV files, select the one whose name matches
+  `*prod_reports*` (case-insensitive).
+- URL patterns:
+    - Annual zip: `https://ecmc.state.co.us/documents/data/downloads/production/{year}_prod_reports.zip`
+    - Current-year monthly CSV: `https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv`
+- Output file naming convention:
+    - Annual files: `data/raw/{year}_prod_reports.csv`
+    - Current-year file: `data/raw/monthly_prod.csv`
+- The data dictionary HTML page must be fetched once and saved to
+  `references/production-data-dictionary.md` during the acquire stage.
+- Data dictionary URL: `https://ecmc.state.co.us/documents/data/downloads/production/production_record_data_dictionary.htm`
+- All logging must use Python's `logging` module with structured messages (include year/filename in
+  every log entry). Do not use `print()`.
+- `pyproject.toml` build-backend must be `setuptools.build_meta`. The `[project.optional-dependencies]`
+  `dev` group must include `pandas-stubs` and `types-requests`.
+- The `make env` target must create `.venv` using `python3 -m venv .venv` and bootstrap pip before
+  installing: `pip install --upgrade pip setuptools wheel && pip install -e ".[dev]"`.
 
 ---
 
 ## Task 01: Create project scaffolding
 
-**Artefacts:**
-- `pyproject.toml`
-- `Makefile`
-- `.gitignore`
-- `requirements.txt`
-- `cogcc_pipeline/__init__.py`
-- `config/pipeline_config.yaml`
+**Module:** `cogcc_pipeline/__init__.py`, `pyproject.toml`, `Makefile`, `config.yaml`, `.gitignore`
 
 **Description:**
+Set up the project package and configuration infrastructure that all pipeline stages depend on.
 
-Create the full project scaffolding so that the package is installable and the development
-environment is reproducible.
+Create the following artefacts:
 
-### pyproject.toml
+1. **`cogcc_pipeline/__init__.py`** — empty init file marking the package.
 
-Define the package name `cogcc_pipeline`, version `0.1.0`, Python requires `>=3.11`.
-Set `build-backend = "setuptools.build_meta"` (not the legacy variant).
+2. **`pyproject.toml`** — project metadata and dependency specification:
+   - `build-backend = "setuptools.build_meta"` (never `setuptools.backends.legacy:build`)
+   - `[project]` name: `cogcc-pipeline`, version: `0.1.0`, requires-python: `>=3.11`
+   - Runtime dependencies: `pandas`, `pyarrow`, `dask[dataframe]`, `requests`, `tqdm`,
+     `scikit-learn`, `pyyaml`, `beautifulsoup4`, `lxml`
+   - `[project.optional-dependencies]` dev group: `pytest`, `pytest-mock`, `ruff`, `mypy`,
+     `pandas-stubs`, `types-requests`
+   - `[tool.setuptools.packages.find]` where: `["."]`
 
-Runtime dependencies (install_requires):
-`requests`, `beautifulsoup4`, `lxml`, `pandas`, `numpy`, `pyarrow`, `dask[dataframe]`,
-`pyyaml`, `tqdm`, `scikit-learn`.
+3. **`Makefile`** — with the following targets:
+   - `env`: creates `.venv` using `python3 -m venv .venv`
+   - `install`: activates `.venv`, runs `pip install --upgrade pip setuptools wheel`,
+     then `pip install -e ".[dev]"`
+   - `test`: runs `pytest tests/ -v`
+   - `lint`: runs `ruff check cogcc_pipeline/ tests/`
+   - `typecheck`: runs `mypy cogcc_pipeline/`
+   - `acquire`, `ingest`, `transform`, `features`: each runs the corresponding pipeline module
+     as `python -m cogcc_pipeline.<stage>`
 
-Dev extras (dev):
-`pytest`, `pytest-mock`, `responses`, `mypy`, `ruff`, `pandas-stubs`, `types-requests`,
-`types-PyYAML`.
+4. **`config.yaml`** — all pipeline configuration in one file:
+   ```
+   acquire:
+     base_url: "https://ecmc.state.co.us/documents/data/downloads/production"
+     data_dict_url: "https://ecmc.state.co.us/documents/data/downloads/production/production_record_data_dictionary.htm"
+     monthly_url: "https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv"
+     start_year: 2020
+     raw_dir: "data/raw"
+     references_dir: "references"
+     max_workers: 5
+     sleep_seconds: 0.5
+     retry_attempts: 3
+     retry_backoff_base: 1
+   ingest:
+     raw_dir: "data/raw"
+     interim_dir: "data/interim"
+     target_start_year: 2020
+     chunk_size: 100000
+   transform:
+     interim_dir: "data/interim"
+     processed_dir: "data/processed"
+   features:
+     processed_dir: "data/processed"
+     output_dir: "data/processed/features"
+   ```
 
-The `[tool.ruff]` section must target Python 3.11 and enable `E`, `F`, `I` rule sets.
-The `[tool.mypy]` section must set `strict = true` and `ignore_missing_imports = true`.
+5. **`.gitignore`** — must include: `data/`, `large_tool_results/`, `conversation_history/`,
+   `.venv/`, `__pycache__/`, `*.pyc`, `*.egg-info/`, `.pytest_cache/`, `.ruff_cache/`, `.mypy_cache/`
 
-### Makefile
+**Error handling:** `pyproject.toml` must be parseable by pip. Config must be loadable by
+`yaml.safe_load`.
 
-Include the following targets:
+**Dependencies:** pyyaml, setuptools
 
-- `env`: creates `.venv` with `python3 -m venv .venv`
-- `install`: activates `.venv`, runs `pip install --upgrade pip setuptools wheel`,
-  then `pip install -e ".[dev]"`
-- `lint`: runs `ruff check cogcc_pipeline/ tests/`
-- `type-check`: runs `mypy cogcc_pipeline/ tests/`
-- `test`: runs `pytest tests/ -v`
-- `test-unit`: runs `pytest tests/ -v -m unit`
-- `test-integration`: runs `pytest tests/ -v -m integration`
-- `pipeline`: runs the full pipeline via `python -m cogcc_pipeline`
+**Test cases:**
+- `@pytest.mark.unit` — Assert that `config.yaml` is loadable with `yaml.safe_load` and contains all
+  required top-level keys: `acquire`, `ingest`, `transform`, `features`.
+- `@pytest.mark.unit` — Assert that `pyproject.toml` specifies `build-backend = "setuptools.build_meta"`.
+- `@pytest.mark.unit` — Assert that the `dev` optional-dependencies in `pyproject.toml` include
+  `pandas-stubs` and `types-requests`.
 
-### .gitignore
-
-Must include: `data/`, `large_tool_results/`, `conversation_history/`, `.venv/`,
-`__pycache__/`, `*.pyc`, `*.egg-info/`, `.mypy_cache/`, `.ruff_cache/`, `logs/`,
-`dist/`, `build/`.
-
-### config/pipeline_config.yaml
-
-Define the following configuration keys:
-
-```
-acquire:
-  base_url_zip: "https://ecmc.state.co.us/documents/data/downloads/production/{year}_prod_reports.zip"
-  base_url_monthly: "https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv"
-  data_dictionary_url: "https://ecmc.state.co.us/documents/data/downloads/production/production_record_data_dictionary.htm"
-  start_year: 2020
-  raw_dir: "data/raw"
-  references_dir: "references"
-  max_workers: 5
-  sleep_seconds: 0.5
-
-ingest:
-  raw_dir: "data/raw"
-  interim_dir: "data/interim"
-  start_year: 2020
-
-transform:
-  interim_dir: "data/interim"
-  processed_dir: "data/processed"
-  cleaned_file: "cogcc_production_cleaned.parquet"
-
-features:
-  processed_dir: "data/processed"
-  cleaned_file: "cogcc_production_cleaned.parquet"
-  features_file: "cogcc_production_features.parquet"
-  quality_report: "data_quality_report.json"
-  rolling_windows: [3, 6, 12]
-
-logging:
-  log_dir: "logs"
-  log_file: "pipeline_run.log"
-  level: "INFO"
-```
-
-### cogcc_pipeline/__init__.py
-
-Empty or minimal; exposes package version string `__version__ = "0.1.0"`.
-
-### requirements.txt
-
-List all third-party runtime packages (without version pins initially) that the project
-imports. This file is generated from the pyproject.toml dependencies for reference but
-`pip install -e ".[dev]"` is the authoritative install mechanism.
-
-**Definition of done:** `pyproject.toml`, `Makefile`, `.gitignore`, `requirements.txt`,
-`cogcc_pipeline/__init__.py`, and `config/pipeline_config.yaml` are created; `pip install
--e ".[dev]"` completes without error; `ruff check` and `mypy` report no errors on an
-empty module; `requirements.txt` updated with all third-party packages imported in this
-task.
+**Definition of done:** All artefacts created, unit tests pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 02: Implement configuration loader utility
-
-**Module:** `cogcc_pipeline/utils.py`
-**Function:** `load_config(config_path: str | Path) -> dict`
-
-**Description:**
-
-Implement a utility function that reads `config/pipeline_config.yaml` using `PyYAML` and
-returns the parsed dictionary. The function must resolve the path relative to the project
-root if a relative path is passed.
-
-Also implement:
-
-**Function:** `get_logger(name: str, log_dir: str, log_file: str, level: str) -> logging.Logger`
-
-Sets up a Python `logging.Logger` that writes simultaneously to stdout (StreamHandler)
-and to a rotating file at `{log_dir}/{log_file}` (RotatingFileHandler, max 10 MB,
-3 backups). Log format: `%(asctime)s | %(name)s | %(levelname)s | %(message)s`.
-Creates `log_dir` if it does not exist. Returns the configured logger.
-
-Both functions must have full type hints and docstrings.
-
-**Dependencies:** `pyyaml`, `pathlib`, `logging`
-
-**Test cases (`tests/test_acquire.py` — unit section):**
-
-- `@pytest.mark.unit` — Given a valid YAML file, assert `load_config` returns a dict with
-  top-level keys `acquire`, `ingest`, `transform`, `features`, `logging`.
-- `@pytest.mark.unit` — Given a non-existent path, assert `load_config` raises
-  `FileNotFoundError`.
-- `@pytest.mark.unit` — Given valid config params, assert `get_logger` returns a
-  `logging.Logger` instance and that it has at least two handlers (stream + file).
-
-**Definition of done:** `cogcc_pipeline/utils.py` implemented; all unit tests pass;
-`ruff` and `mypy` report no errors; `requirements.txt` updated with all third-party
-packages imported in this task.
-
----
-
-## Task 03: Implement data dictionary downloader and parser
+## Task 02: Implement configuration loader
 
 **Module:** `cogcc_pipeline/acquire.py`
-**Function:** `fetch_data_dictionary(url: str, output_path: Path, logger: logging.Logger) -> Path`
+**Function:** `load_config(config_path: str = "config.yaml") -> dict`
 
 **Description:**
+Read `config.yaml` from disk and return the full configuration dictionary. This function is used
+by all stages to access their respective configuration sub-trees.
 
-Use `requests.get` to fetch the HTML page at the ECMC data dictionary URL. Parse the
-first HTML table on the page using `BeautifulSoup` with the `lxml` parser. Convert the
-table into a `pandas.DataFrame` with columns inferred from the `<th>` header row. Write
-the DataFrame to `output_path` as a CSV file using UTF-8 encoding. Return the output path.
+- Accept an optional `config_path` argument defaulting to `"config.yaml"`.
+- Use `yaml.safe_load` to parse the file.
+- Raise a descriptive `FileNotFoundError` if the config file does not exist at the specified path.
+- Raise a `KeyError` with a helpful message if a required top-level key is missing.
+- Return the full config dict (not a sub-tree) so callers can access any section.
 
-If the file already exists at `output_path`, log a skip message and return the path
-without fetching.
+**Error handling:** `FileNotFoundError` for missing config; `ValueError` for YAML parse errors.
 
-If the HTTP response status code is not 200, raise `requests.HTTPError` with a message
-that includes the URL and status code.
+**Dependencies:** pyyaml
 
-If no table is found on the page, raise `ValueError("No table found on data dictionary page")`.
+**Test cases:**
+- `@pytest.mark.unit` — Given a valid `config.yaml` with all required keys, assert the returned dict
+  contains keys `acquire`, `ingest`, `transform`, `features`.
+- `@pytest.mark.unit` — Given a path to a non-existent file, assert `FileNotFoundError` is raised.
+- `@pytest.mark.unit` — Given a YAML file with invalid syntax, assert a `ValueError` is raised.
 
-**Dependencies:** `requests`, `beautifulsoup4`, `lxml`, `pandas`, `pathlib`, `logging`
-
-**Test cases (`tests/test_acquire.py`):**
-
-- `@pytest.mark.unit` — Mock `requests.get` to return a minimal HTML page with one table.
-  Assert the output CSV is written to the expected path and contains the correct columns
-  and at least one row.
-- `@pytest.mark.unit` — Mock `requests.get` to return HTTP 404. Assert `HTTPError` is raised.
-- `@pytest.mark.unit` — Mock `requests.get` to return HTML with no table. Assert
-  `ValueError` is raised.
-- `@pytest.mark.unit` — Given the output file already exists, assert `requests.get` is
-  never called (skip behaviour verified via mock call count = 0).
-- `@pytest.mark.integration` — Call `fetch_data_dictionary` against the real ECMC URL.
-  Assert the returned path exists, the file is non-empty, and the CSV contains at least
-  one column named `Field` or similar. Requires network access.
-
-**Definition of done:** `fetch_data_dictionary` implemented; all tests pass; `ruff` and
-`mypy` report no errors; `requirements.txt` updated with all third-party packages imported
-in this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 04: Implement per-year download functions
+## Task 03: Implement structured logger
 
 **Module:** `cogcc_pipeline/acquire.py`
-
-**Function:** `download_annual_zip(year: int, url_template: str, raw_dir: Path, sleep_seconds: float, logger: logging.Logger) -> Path | None`
-
-**Description:**
-
-Downloads the ZIP archive for the given year from the URL formed by substituting `{year}`
-into `url_template`. Extracts the first `.csv` file found in the ZIP to
-`raw_dir/{year}_prod_reports.csv`. Returns the path to the extracted CSV.
-
-If `raw_dir/{year}_prod_reports.csv` already exists, log a skip message and return the
-path without downloading.
-
-Sleep `sleep_seconds` before issuing the HTTP request.
-
-If the HTTP response status code is not 200, log a warning with the URL and status code
-and return `None`.
-
-If the ZIP contains no CSV file, log a warning and return `None`.
-
-Raise `OSError` if `raw_dir` cannot be created.
-
-**Function:** `download_monthly_csv(url: str, raw_dir: Path, sleep_seconds: float, logger: logging.Logger) -> Path | None`
+**Function:** `get_logger(name: str) -> logging.Logger`
 
 **Description:**
+Create and return a configured `logging.Logger` for use throughout the pipeline. This is a
+shared utility function placed in `acquire.py` and re-used by all other modules.
 
-Downloads the current-year live CSV directly from `url` to
-`raw_dir/monthly_prod.csv`. Returns the path.
+- Configure a `StreamHandler` writing to stdout with the format:
+  `%(asctime)s | %(name)s | %(levelname)s | %(message)s`
+- Set default log level to `INFO`.
+- Do not add duplicate handlers if the logger already exists (check `logger.handlers`).
+- Return the configured logger.
 
-If `raw_dir/monthly_prod.csv` already exists, log a skip message and return the path
-without downloading (idempotency). Note: unlike annual files, the monthly file may be
-updated daily; the skip logic should allow an optional `force_refresh: bool = False`
-parameter that, when `True`, re-downloads even if the file exists.
+**Error handling:** No exceptions expected; this function must not raise.
 
-Sleep `sleep_seconds` before issuing the HTTP request.
+**Dependencies:** logging (stdlib)
 
-If the HTTP response status code is not 200, log a warning and return `None`.
+**Test cases:**
+- `@pytest.mark.unit` — Assert that `get_logger("test")` returns a `logging.Logger` instance.
+- `@pytest.mark.unit` — Assert that calling `get_logger("test")` twice returns a logger with
+  exactly one handler (no duplicate handlers appended).
+- `@pytest.mark.unit` — Assert the logger level is `logging.INFO`.
 
-**Dependencies:** `requests`, `zipfile`, `pathlib`, `time`, `logging`
-
-**Test cases (`tests/test_acquire.py`):**
-
-- `@pytest.mark.unit` — Mock `requests.get` to return a valid ZIP binary containing one
-  CSV file. Assert the extracted CSV is written to the correct path and the function
-  returns that path.
-- `@pytest.mark.unit` — When the target file already exists, assert `requests.get` is
-  not called (skip behaviour) and the existing file path is returned unchanged.
-- `@pytest.mark.unit` — Mock `requests.get` to return HTTP 503. Assert the function
-  returns `None` and logs a warning.
-- `@pytest.mark.unit` — Mock `requests.get` to return a ZIP containing no CSV files.
-  Assert the function returns `None` and logs a warning.
-- `@pytest.mark.unit` — Mock `requests.get` for `download_monthly_csv` to return CSV
-  bytes. Assert the file is written to `monthly_prod.csv`.
-- `@pytest.mark.unit` — `download_monthly_csv` with `force_refresh=True` on an existing
-  file: assert `requests.get` IS called and the file is overwritten.
-- `@pytest.mark.unit` (TR-20) — Simulate two sequential calls to `download_annual_zip`
-  for the same year using mocked HTTP responses. Assert the file count in `raw_dir` after
-  the second call equals the count after the first call — no duplication. Assert the
-  content of the file is identical to after the first run.
-- `@pytest.mark.integration` (TR-20) — Run `download_annual_zip` twice for year 2020
-  against the real ECMC server. Assert no error, same file count, file unchanged.
-  Requires network access.
-
-**Definition of done:** Both functions implemented; all tests pass; `ruff` and `mypy`
-report no errors; `requirements.txt` updated with all third-party packages imported in
-this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 05: Implement parallel download orchestration
+## Task 04: Implement retry-enabled HTTP downloader
 
 **Module:** `cogcc_pipeline/acquire.py`
-**Function:** `run_acquire(config: dict, logger: logging.Logger) -> list[Path]`
+**Function:** `download_with_retry(url: str, dest_path: Path, cfg: dict) -> bool`
 
 **Description:**
+Download a file from `url` and write it to `dest_path`. Implements retry logic with exponential
+back-off. Returns `True` on success, `False` after all retries are exhausted.
 
-This is the top-level entry point for the acquire stage. It performs the following steps:
+- If `dest_path` already exists on disk with size > 0 bytes, log an info message and return `True`
+  immediately without making any network request (idempotency).
+- Make up to `cfg["retry_attempts"]` HTTP GET attempts (default 3).
+- Use `stream=True` to download in chunks (chunk size 8192 bytes) and write incrementally.
+- After each successful chunk write, do not sleep (sleep is applied at the worker level).
+- On `requests.RequestException`: log a warning with the attempt number and URL, wait
+  `cfg["retry_backoff_base"] * (2 ** attempt)` seconds before the next attempt.
+- After all attempts fail: log an error stating the file could not be downloaded and return `False`.
+- Ensure partial files are deleted if a download fails mid-stream (use a try/finally or a temp-file
+  strategy).
+- Do not raise exceptions to the caller — always return `True` or `False`.
 
-1. Read `acquire` section from `config`.
-2. Compute the list of years to download: integers from `start_year` through
-   `current_year - 1` (inclusive) for ZIP downloads, plus the current year for the
-   monthly CSV.
-3. Build a list of download tasks — one `download_annual_zip` call per historical year
-   plus one `download_monthly_csv` call for the current year.
-4. Execute all tasks in parallel using `concurrent.futures.ThreadPoolExecutor` with
-   `max_workers = config["acquire"]["max_workers"]` (capped at 5).
-5. Collect results. Any task that returned `None` is logged as a failed download but does
-   not abort the run.
-6. Call `fetch_data_dictionary` (single-threaded, not parallelised) after all downloads
-   complete.
-7. Return the list of non-None Paths from all download tasks.
+**Error handling:** Catches `requests.RequestException`. Cleans up partial files. Logs all
+attempt failures.
 
-**Dependencies:** `concurrent.futures`, `datetime`, `pathlib`, `logging`
+**Dependencies:** requests, pathlib, time, logging
 
-**Test cases (`tests/test_acquire.py`):**
+**Test cases:**
+- `@pytest.mark.unit` — Given a mock `requests.get` that returns a 200 response with bytes content,
+  assert the function returns `True` and the file is written to `dest_path`.
+- `@pytest.mark.unit` — Given a `dest_path` that already exists with size > 0, assert the function
+  returns `True` immediately and `requests.get` is never called (mock and assert `call_count == 0`).
+- `@pytest.mark.unit` — Given a mock `requests.get` that raises `requests.ConnectionError` on all
+  attempts, assert the function returns `False` and no partial file remains on disk.
+- `@pytest.mark.unit` — Given a mock `requests.get` that fails on the first two attempts then
+  succeeds, assert the function returns `True` (retry recovery works).
 
-- `@pytest.mark.unit` — Mock `download_annual_zip` and `download_monthly_csv` to return
-  known paths. Assert `run_acquire` returns a list of those paths and that worker count
-  does not exceed 5.
-- `@pytest.mark.unit` — When two of the mocked download functions return `None`, assert
-  those are excluded from the returned list and a warning is logged for each.
-- `@pytest.mark.unit` (TR-21) — Mock all download functions. After the mock run, assert
-  every path in the returned list has `stat().st_size > 0`. Use `tmp_path` fixture to
-  write synthetic CSV content into each mocked path before returning it.
-- `@pytest.mark.integration` — Run `run_acquire` against the real ECMC server with
-  years 2020–2021 only (override config). Assert at least two files are written to
-  `data/raw/` and each file size > 0 bytes. Requires network access.
-
-**Definition of done:** `run_acquire` implemented; all tests pass; `ruff` and `mypy`
-report no errors; `requirements.txt` updated with all third-party packages imported in
-this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 06: Implement acquired file integrity validation
+## Task 05: Implement data dictionary fetcher and saver
 
 **Module:** `cogcc_pipeline/acquire.py`
-**Function:** `validate_raw_files(raw_dir: Path, logger: logging.Logger) -> list[str]`
+**Function:** `fetch_data_dictionary(cfg: dict) -> Path`
 
 **Description:**
+Fetch the ECMC production data dictionary HTML page, parse the column table with
+`BeautifulSoup`, and write a Markdown-formatted reference file to
+`references/production-data-dictionary.md`. Return the path to the written file.
 
-After downloading, validate every `.csv` file in `raw_dir`. For each file, check:
+- Fetch the URL at `cfg["data_dict_url"]` using `requests.get`.
+- Parse with `BeautifulSoup(html, "lxml")`.
+- Find the HTML table containing column names and descriptions.
+- Write the output to `references/production-data-dictionary.md` as a Markdown table with columns:
+  `| Column Name | Description |`.
+- If the file already exists, overwrite it unconditionally (data dictionary may be updated).
+- If the fetch fails (network error or non-200 status), log an error and raise
+  `RuntimeError("Failed to fetch data dictionary")`.
+- Create the `references/` directory if it does not exist.
 
-1. File size > 0 bytes.
-2. File is readable as UTF-8 text (attempt `open(path, encoding="utf-8").read(4096)`).
-   If that fails, try `latin-1` encoding. If both fail, record a validation error.
-3. File contains at least one data row beyond a header line (line count >= 2).
+**Error handling:** `RuntimeError` on fetch failure. `OSError` logged and re-raised on write failure.
 
-Return a list of validation error strings (empty list if all files pass). Log one warning
-per failed file.
+**Dependencies:** requests, beautifulsoup4, lxml, pathlib, logging
 
-**Test cases (`tests/test_acquire.py`):**
+**Test cases:**
+- `@pytest.mark.unit` — Given a mock HTTP response containing a minimal HTML table with two rows,
+  assert the function writes a file to `references/production-data-dictionary.md` that contains
+  a Markdown table header `| Column Name | Description |`.
+- `@pytest.mark.unit` — Given a mock HTTP response returning status 404, assert `RuntimeError` is
+  raised.
+- `@pytest.mark.integration` — Run against the live URL; assert the file is written and contains
+  at least 10 rows (i.e., at least 10 known column names from the production schema).
 
-- `@pytest.mark.unit` (TR-21a) — Write a valid multi-line CSV to `tmp_path`. Assert
-  `validate_raw_files` returns an empty error list.
-- `@pytest.mark.unit` (TR-21b) — Write a 0-byte file to `tmp_path`. Assert the error
-  list contains one entry mentioning that file.
-- `@pytest.mark.unit` (TR-21c) — Write a file with only a header line and no data rows.
-  Assert the error list contains one entry for that file.
-- `@pytest.mark.unit` — Write a file with non-UTF-8 bytes that are valid Latin-1. Assert
-  `validate_raw_files` returns an empty error list (fallback encoding succeeded).
-
-**Definition of done:** `validate_raw_files` implemented; all tests pass; `ruff` and
-`mypy` report no errors; `requirements.txt` updated with all third-party packages imported
-in this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`references/production-data-dictionary.md` is written to disk, `requirements.txt` updated with
+all third-party packages imported in this task.
 
 ---
 
-## Task 07: Wire acquire stage as CLI entry point
+## Task 06: Implement annual zip downloader and extractor
 
 **Module:** `cogcc_pipeline/acquire.py`
-**Block:** `if __name__ == "__main__":` guard and `cogcc_pipeline/__main__.py`
+**Function:** `download_annual_zip(year: int, cfg: dict) -> Path | None`
 
 **Description:**
+Download the annual production zip archive for a given year, extract the production CSV file,
+and return the path to the extracted CSV. Used for all years from 2020 through (current year − 1).
 
-Add an `if __name__ == "__main__":` block in `acquire.py` that:
-1. Calls `load_config("config/pipeline_config.yaml")`.
-2. Calls `get_logger(...)` using logging config.
-3. Calls `run_acquire(config, logger)`.
-4. Calls `validate_raw_files(raw_dir, logger)` and logs any errors.
-5. Exits with code 1 if any validation errors were returned; exits with code 0 otherwise.
+- Construct the zip URL as: `{cfg["base_url"]}/{year}_prod_reports.zip`
+- Call `download_with_retry` to download the zip to a temporary path `data/raw/{year}_prod_reports.zip`.
+- If download returns `False`, log an error and return `None`.
+- After a 0.5-second sleep (`cfg["sleep_seconds"]`), open the zip with `zipfile.ZipFile`.
+- Find the CSV member matching `*prod_reports*` (case-insensitive). If none matches, raise
+  `ValueError(f"No CSV found in zip for {year}")`.
+- Extract that CSV to `data/raw/{year}_prod_reports.csv`.
+- Delete the zip file after successful extraction.
+- If the target CSV already exists and has size > 0, skip download and extraction entirely
+  (idempotency), log info, and return the existing path.
+- Return the `Path` to the extracted CSV.
 
-Create `cogcc_pipeline/__main__.py` that imports and calls an `orchestrate()` stub (to be
-completed in a later stage) or directly calls `run_acquire` as a fallback for now.
-The full orchestrator will replace this stub in a later task.
+**Error handling:** Returns `None` on download failure. Raises `ValueError` if zip contains no
+matching CSV. Cleans up zip file in a `finally` block.
 
-**Test cases (`tests/test_acquire.py`):**
+**Dependencies:** requests, zipfile, pathlib, time, logging
 
-- `@pytest.mark.unit` — Mock `run_acquire` and `validate_raw_files`. Invoke the
-  `__main__` guard via `subprocess.run` or by importing and calling the entry-point
-  function. Assert exit code is 0 when no validation errors.
-- `@pytest.mark.unit` — Mock `validate_raw_files` to return one error string. Assert
-  exit code is 1.
+**Test cases:**
+- `@pytest.mark.unit` — Given a mock `download_with_retry` returning `True` and a mock zip archive
+  containing a file named `2022_prod_reports.csv`, assert the function returns a path to
+  `data/raw/2022_prod_reports.csv` and the zip file is deleted.
+- `@pytest.mark.unit` — Given a mock `download_with_retry` returning `False`, assert the function
+  returns `None`.
+- `@pytest.mark.unit` — Given a zip with no file matching `*prod_reports*`, assert `ValueError`
+  is raised.
+- `@pytest.mark.unit` — Given that `data/raw/2022_prod_reports.csv` already exists with size > 0,
+  assert no download is attempted and the existing path is returned.
+- `@pytest.mark.integration` — Download the 2022 zip from the live ECMC URL, assert the extracted
+  CSV exists, has size > 0, and contains a recognisable header row.
 
-**Definition of done:** Entry point implemented; all tests pass; `ruff` and `mypy` report
-no errors; `requirements.txt` updated with all third-party packages imported in this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
+
+---
+
+## Task 07: Implement current-year monthly CSV downloader
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `download_monthly_csv(cfg: dict) -> Path | None`
+
+**Description:**
+Download the live monthly production CSV for the current calendar year from
+`cfg["monthly_url"]`. This file is updated continuously throughout the year by ECMC. Return the
+path to the saved file, or `None` on failure.
+
+- Always re-download this file unconditionally (do NOT skip if it exists) because it is updated
+  daily by the source.
+- Target path: `data/raw/monthly_prod.csv`
+- Apply the 0.5-second sleep after the download completes.
+- Use `download_with_retry` with `skip_if_exists=False` override (pass a modified cfg that sets
+  `retry_attempts` from config).
+- If download fails, log an error and return `None`.
+
+**Error handling:** Returns `None` on failure. Does not raise.
+
+**Dependencies:** requests, pathlib, time, logging
+
+**Test cases:**
+- `@pytest.mark.unit` — Given a mock `download_with_retry` that writes a non-empty file, assert
+  the function returns a `Path` pointing to `data/raw/monthly_prod.csv`.
+- `@pytest.mark.unit` — Given a mock `download_with_retry` returning `False`, assert the function
+  returns `None`.
+- `@pytest.mark.integration` — Download the live monthly CSV; assert the file exists, size > 0,
+  and the first line is a recognisable CSV header matching expected column names.
+
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
+
+---
+
+## Task 08: Implement parallel acquire orchestrator
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `run_acquire(config_path: str = "config.yaml") -> list[Path]`
+
+**Description:**
+Top-level entry point for the acquire stage. Orchestrates all downloads for years 2020 through
+the current year using a `ThreadPoolExecutor` with at most `cfg["max_workers"]` workers (default 5).
+Returns a list of `Path` objects for all successfully downloaded/extracted CSV files.
+
+- Load config via `load_config(config_path)`.
+- Compute `years = range(cfg["acquire"]["start_year"], current_year)` for annual zips.
+- Submit `download_annual_zip(year, cfg["acquire"])` for each historical year to the thread pool.
+- Submit `download_monthly_csv(cfg["acquire"])` as a separate task for the current year.
+- Collect `Future` results; log a summary of how many files were acquired successfully vs. failed.
+- Return only the paths that are not `None`.
+- Also call `fetch_data_dictionary(cfg["acquire"])` once before the parallel downloads (sequential,
+  outside the pool).
+- Create `data/raw/` directory if it does not exist.
+
+**Error handling:** Individual file failures are caught and logged. The function always returns
+(never raises) — a partial list is a valid result.
+
+**Dependencies:** concurrent.futures, pathlib, logging, datetime
+
+**Test cases:**
+- `@pytest.mark.unit` — Given mocked `download_annual_zip` returning valid paths for years 2020–2022
+  and mocked `download_monthly_csv` returning a valid path, assert `run_acquire` returns a list
+  of 4 `Path` objects (3 annual + 1 monthly).
+- `@pytest.mark.unit` — Given mocked `download_annual_zip` returning `None` for one year, assert
+  that year is absent from the returned list and no exception is raised.
+- `@pytest.mark.unit` — Assert that the thread pool respects `max_workers=2` when configured
+  with a patch (mock `ThreadPoolExecutor` and verify it is called with `max_workers=2`).
+- `@pytest.mark.integration` — Run `run_acquire` end-to-end (real network); assert each returned
+  path exists on disk, has size > 0, and is readable as text (TR-21).
+
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
+
+---
+
+## Task 09: Implement acquire idempotency verification (TR-20)
+
+**Module:** `tests/test_acquire.py`
+
+**Description:**
+Dedicated test suite verifying acquire idempotency per TR-20. These tests must be separate from
+the unit tests in Task 08 to make the TR-20 coverage explicit and auditable.
+
+**Test cases:**
+- `@pytest.mark.unit` — Simulate a first acquire run writing a file to a tmp directory. Then call
+  the relevant download function again. Assert file count in the directory is the same as after the
+  first run (not doubled).
+- `@pytest.mark.unit` — Simulate a first acquire run writing known content to a file. Then call the
+  download function again with the same dest_path. Assert the file content is unchanged.
+- `@pytest.mark.unit` — Assert no exception is raised when `download_with_retry` is called with
+  a `dest_path` that already exists.
+
+**Definition of done:** Tests implemented and passing, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
+
+---
+
+## Task 10: Implement acquire file integrity verification (TR-21)
+
+**Module:** `tests/test_acquire.py`
+
+**Description:**
+Dedicated test suite verifying acquired file integrity per TR-21.
+
+**Test cases:**
+- `@pytest.mark.integration` — After running `run_acquire` against real or mocked download
+  output, assert every file in `data/raw/` has size > 0 bytes.
+- `@pytest.mark.integration` — Assert every file in `data/raw/` is readable as UTF-8 text without
+  a `UnicodeDecodeError`.
+- `@pytest.mark.integration` — Assert every file in `data/raw/` contains at least 2 lines
+  (a header plus at least one data row).
+
+**Definition of done:** Tests implemented and passing, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
+
+---
+
+## Module-level entry point
+
+**Module:** `cogcc_pipeline/acquire.py`
+
+Add a `if __name__ == "__main__":` block that calls `run_acquire()` so the stage can be executed
+via `python -m cogcc_pipeline.acquire`.

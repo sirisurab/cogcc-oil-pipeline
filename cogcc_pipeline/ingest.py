@@ -1,30 +1,32 @@
-"""Ingest stage: read raw CSVs, normalise columns, write interim Parquet."""
+"""Ingest stage — load raw CSVs into interim Parquet via Dask."""
 
 from __future__ import annotations
 
-import logging
+from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import dask.dataframe as dd
 import pandas as pd
-from dask import delayed
+
+from cogcc_pipeline.acquire import get_logger, load_config
+
+_log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Canonical schema
+# Required schema columns
 # ---------------------------------------------------------------------------
 
-CANONICAL_COLUMNS: list[str] = [
-    "APICountyCode",
-    "APISeqNum",
+REQUIRED_COLUMNS: list[str] = [
+    "ApiCountyCode",
+    "ApiSequenceNumber",
     "ReportYear",
     "ReportMonth",
     "OilProduced",
-    "OilSold",
+    "OilSales",
     "GasProduced",
-    "GasSold",
-    "GasFlared",
-    "GasUsed",
+    "GasSales",
+    "FlaredVented",
+    "GasUsedOnLease",
     "WaterProduced",
     "DaysProduced",
     "Well",
@@ -33,309 +35,195 @@ CANONICAL_COLUMNS: list[str] = [
     "DocNum",
 ]
 
-# Dtypes for canonical columns
-CANONICAL_DTYPES: dict[str, Any] = {
-    "APICountyCode": pd.StringDtype(),
-    "APISeqNum": pd.StringDtype(),
-    "ReportYear": pd.Int32Dtype(),
-    "ReportMonth": pd.Int32Dtype(),
-    "OilProduced": pd.Float64Dtype(),
-    "OilSold": pd.Float64Dtype(),
-    "GasProduced": pd.Float64Dtype(),
-    "GasSold": pd.Float64Dtype(),
-    "GasFlared": pd.Float64Dtype(),
-    "GasUsed": pd.Float64Dtype(),
-    "WaterProduced": pd.Float64Dtype(),
-    "DaysProduced": pd.Float64Dtype(),
-    "Well": pd.StringDtype(),
-    "OpName": pd.StringDtype(),
-    "OpNum": pd.StringDtype(),
-    "DocNum": pd.StringDtype(),
+# Dtype map for standardise_dtypes
+_DTYPE_MAP: dict[str, object] = {
+    "ReportYear": "int32",
+    "ReportMonth": "int32",
+    "OilProduced": "float64",
+    "OilSales": "float64",
+    "GasProduced": "float64",
+    "GasSales": "float64",
+    "FlaredVented": "float64",
+    "GasUsedOnLease": "float64",
+    "WaterProduced": "float64",
+    "DaysProduced": "float64",
 }
 
+_STRING_COLS = {"ApiCountyCode", "ApiSequenceNumber", "Well", "OpName", "OpNum", "DocNum"}
+
+
 # ---------------------------------------------------------------------------
-# Column name variants mapping
+# Task 01 — single-file reader
 # ---------------------------------------------------------------------------
 
-COLUMN_MAP: dict[str, str] = {
-    # APICountyCode
-    "API_County_Code": "APICountyCode",
-    "Api_County_Code": "APICountyCode",
-    "apicountycode": "APICountyCode",
-    "api_county_code": "APICountyCode",
-    "APICOUNTYCODE": "APICountyCode",
-    # APISeqNum
-    "API_Seq_Num": "APISeqNum",
-    "Api_Seq_Num": "APISeqNum",
-    "apiseqnum": "APISeqNum",
-    "api_seq_num": "APISeqNum",
-    "APISEQNUM": "APISeqNum",
-    # ReportYear
-    "Report_Year": "ReportYear",
-    "report_year": "ReportYear",
-    "REPORTYEAR": "ReportYear",
-    "reportyear": "ReportYear",
-    # ReportMonth
-    "Report_Month": "ReportMonth",
-    "report_month": "ReportMonth",
-    "REPORTMONTH": "ReportMonth",
-    "reportmonth": "ReportMonth",
-    # OilProduced
-    "Oil_Produced": "OilProduced",
-    "oil_produced": "OilProduced",
-    "OILPRODUCED": "OilProduced",
-    "oilproduced": "OilProduced",
-    # OilSold
-    "Oil_Sold": "OilSold",
-    "oil_sold": "OilSold",
-    "OILSOLD": "OilSold",
-    "oilsold": "OilSold",
-    # GasProduced
-    "Gas_Produced": "GasProduced",
-    "gas_produced": "GasProduced",
-    "GASPRODUCED": "GasProduced",
-    "gasproduced": "GasProduced",
-    # GasSold
-    "Gas_Sold": "GasSold",
-    "gas_sold": "GasSold",
-    "GASSOLD": "GasSold",
-    "gassold": "GasSold",
-    # GasFlared
-    "Gas_Flared": "GasFlared",
-    "gas_flared": "GasFlared",
-    "GASFLARED": "GasFlared",
-    "gasflared": "GasFlared",
-    # GasUsed
-    "Gas_Used": "GasUsed",
-    "gas_used": "GasUsed",
-    "GASUSED": "GasUsed",
-    "gasused": "GasUsed",
-    # WaterProduced
-    "Water_Produced": "WaterProduced",
-    "water_produced": "WaterProduced",
-    "WATERPRODUCED": "WaterProduced",
-    "waterproduced": "WaterProduced",
-    # DaysProduced
-    "Days_Produced": "DaysProduced",
-    "days_produced": "DaysProduced",
-    "DAYSPRODUCED": "DaysProduced",
-    "daysproduced": "DaysProduced",
-    # Well — no common variants; keep as-is
-    "well": "Well",
-    "WELL": "Well",
-    # OpName
-    "Op_Name": "OpName",
-    "op_name": "OpName",
-    "OPNAME": "OpName",
-    "opname": "OpName",
-    # OpNum
-    "Op_Num": "OpNum",
-    "op_num": "OpNum",
-    "OPNUM": "OpNum",
-    "opnum": "OpNum",
-    # DocNum
-    "Doc_Num": "DocNum",
-    "doc_num": "DocNum",
-    "DOCNUM": "DocNum",
-    "docnum": "DocNum",
-}
 
+def read_csv_file(csv_path: Path, cfg: dict) -> dd.DataFrame:
+    """Read a single raw production CSV into a Dask DataFrame.
 
-def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename raw ECMC column variants to canonical names and enforce dtypes.
-
-    Unknown columns are dropped. Missing canonical columns are added as nulls.
-
-    Args:
-        df: Raw pandas DataFrame with any column naming convention.
-
-    Returns:
-        DataFrame with exactly the 16 canonical columns in canonical order.
+    Raises FileNotFoundError for missing files; ValueError for empty files.
     """
-    # Strip whitespace from column names
-    df = df.rename(columns=lambda c: c.strip())
-    # Apply variant mapping
-    df = df.rename(columns=COLUMN_MAP)
-    # Drop non-canonical columns
-    extra = [c for c in df.columns if c not in CANONICAL_COLUMNS]
-    df = df.drop(columns=extra)
-    # Add missing canonical columns as null with correct dtype
-    for col in CANONICAL_COLUMNS:
-        if col not in df.columns:
-            df[col] = pd.array([pd.NA] * len(df), dtype=CANONICAL_DTYPES[col])
-    # Coerce dtypes
-    for col in CANONICAL_COLUMNS:
-        try:
-            df[col] = df[col].astype(CANONICAL_DTYPES[col])
-        except (ValueError, TypeError):
-            df[col] = pd.array([pd.NA] * len(df), dtype=CANONICAL_DTYPES[col])
-    # Return in canonical column order
-    return df[CANONICAL_COLUMNS]
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+    if csv_path.stat().st_size == 0:
+        raise ValueError(f"Empty file: {csv_path}")
 
-
-def read_raw_csv(path: Path, logger: logging.Logger) -> pd.DataFrame:
-    """Read a single ECMC production CSV into a normalised pandas DataFrame.
-
-    Tries UTF-8 encoding first, falls back to Latin-1 on decode error. Applies
-    :func:`normalise_columns` and filters to ``ReportYear >= 2020``.
-
-    Args:
-        path: Path to the raw CSV file.
-        logger: Configured logger instance.
-
-    Returns:
-        Normalised and filtered pandas DataFrame.
-
-    Raises:
-        ValueError: If the file cannot be parsed as a CSV.
-    """
-    try:
-        try:
-            df = pd.read_csv(path, encoding="utf-8", low_memory=False)
-        except UnicodeDecodeError:
-            logger.warning("UTF-8 decode failed for %s, retrying with latin-1", path)
-            df = pd.read_csv(path, encoding="latin-1", low_memory=False)
-    except Exception as exc:
-        raise ValueError(f"Cannot parse {path} as CSV: {exc}") from exc
-
-    raw_count = len(df)
-
-    # Strip whitespace from string values
-    str_cols = df.select_dtypes(include="object").columns
-    df[str_cols] = df[str_cols].apply(lambda s: s.str.strip())
-
-    df = normalise_columns(df)
-
-    # Filter to ReportYear >= 2020
-    year_col = df["ReportYear"]
-    # Convert to numeric for comparison (handles NA)
-    mask = pd.to_numeric(year_col, errors="coerce").ge(2020).fillna(False)
-    df = df.loc[mask].reset_index(drop=True)
-
-    logger.info("Read %s: %d raw rows → %d rows after 2020 filter", path.name, raw_count, len(df))
-    return df
-
-
-def _build_meta() -> pd.DataFrame:
-    """Build an empty meta DataFrame for Dask with canonical schema."""
-    return pd.DataFrame(
-        {col: pd.array([], dtype=CANONICAL_DTYPES[col]) for col in CANONICAL_COLUMNS}
-    )
-
-
-def ingest_raw_files(raw_dir: Path, logger: logging.Logger) -> dd.DataFrame:
-    """Discover raw CSVs and return a lazy Dask DataFrame.
-
-    Wraps :func:`read_raw_csv` with ``dask.delayed`` for parallel execution.
-    Does **not** call ``.compute()``.
-
-    Args:
-        raw_dir: Directory containing raw ECMC CSV files.
-        logger: Configured logger instance.
-
-    Returns:
-        Lazy :class:`dask.dataframe.DataFrame` with canonical schema.
-
-    Raises:
-        FileNotFoundError: If no matching CSV files are found in raw_dir.
-    """
-    patterns = ["*_prod_reports.csv", "monthly_prod.csv"]
-    csv_paths: list[Path] = []
-    for pat in patterns:
-        csv_paths.extend(sorted(raw_dir.glob(pat)))
-
-    if not csv_paths:
-        raise FileNotFoundError(f"No CSV files found in {raw_dir}")
-
-    logger.info("Found %d CSV file(s) in %s", len(csv_paths), raw_dir)
-    meta = _build_meta()
-
-    delayed_dfs = [delayed(read_raw_csv)(p, logger) for p in csv_paths]
-    ddf = dd.from_delayed(delayed_dfs, meta=meta)
+    ddf = dd.read_csv(str(csv_path), blocksize="64MB", assume_missing=True)
+    before = ddf.npartitions
+    ddf = ddf.repartition(npartitions=min(ddf.npartitions, 50))
+    _log.info("read_csv_file: %s | partitions %d→%d", csv_path, before, ddf.npartitions)
     return ddf
+
+
+# ---------------------------------------------------------------------------
+# Task 02 — year-range filter
+# ---------------------------------------------------------------------------
+
+
+def filter_by_year(ddf: dd.DataFrame, start_year: int) -> dd.DataFrame:
+    """Filter rows where ReportYear >= start_year using map_partitions."""
+    if "ReportYear" not in ddf.columns:
+        raise KeyError("ReportYear column not found in DataFrame")
+
+    _log.info("filter_by_year: %d partitions, start_year=%d", ddf.npartitions, start_year)
+
+    def _filter(pdf: pd.DataFrame) -> pd.DataFrame:
+        return pdf[pdf["ReportYear"].astype(int) >= start_year]
+
+    return ddf.map_partitions(_filter, meta=ddf._meta)
+
+
+# ---------------------------------------------------------------------------
+# Task 03 — schema validator
+# ---------------------------------------------------------------------------
+
+
+def validate_schema(ddf: dd.DataFrame) -> list[str]:
+    """Return list of required columns absent from *ddf*. Empty list = OK."""
+    missing = [col for col in REQUIRED_COLUMNS if col not in ddf.columns]
+    for col in missing:
+        _log.warning("Schema validation: missing column '%s'", col)
+    return missing
+
+
+# ---------------------------------------------------------------------------
+# Task 04 — multi-file loader
+# ---------------------------------------------------------------------------
+
+
+def load_all_raw_files(raw_dir: Path, cfg: dict) -> dd.DataFrame:
+    """Load all CSVs from *raw_dir*, concatenate, filter, and validate."""
+    csv_files = sorted(raw_dir.glob("*.csv"))
+    if not csv_files:
+        raise RuntimeError("No raw CSV files could be loaded")
+
+    loaded: list[dd.DataFrame] = []
+    for f in csv_files:
+        try:
+            loaded.append(read_csv_file(f, cfg))
+        except (FileNotFoundError, ValueError, Exception) as exc:
+            _log.error("Failed to load %s: %s", f, exc)
+
+    if not loaded:
+        raise RuntimeError("No raw CSV files could be loaded")
+
+    combined = dd.concat(loaded, axis=0)
+    combined = combined.repartition(npartitions=min(combined.npartitions, 50))
+
+    start_year = int(cfg.get("target_start_year", 2020))
+    combined = filter_by_year(combined, start_year)
+
+    missing = validate_schema(combined)
+    if missing:
+        _log.warning("Combined DataFrame missing columns: %s", missing)
+
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Task 05 — dtype standardiser
+# ---------------------------------------------------------------------------
+
+
+def standardise_dtypes(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Apply stable dtype assignments to required columns via map_partitions."""
+
+    # Build meta with correct dtypes
+    meta_dict: dict[str, object] = {}
+    for col in ddf.columns:
+        if col in _DTYPE_MAP:
+            meta_dict[col] = _DTYPE_MAP[col]
+        elif col in _STRING_COLS:
+            meta_dict[col] = pd.StringDtype()
+        else:
+            meta_dict[col] = ddf._meta[col].dtype
+
+    meta = pd.DataFrame({col: pd.Series(dtype=dt) for col, dt in meta_dict.items()})  # type: ignore[call-overload]
+
+    def _cast(pdf: pd.DataFrame) -> pd.DataFrame:
+        out = pdf.copy()
+        for col, target_dtype in _DTYPE_MAP.items():
+            if col in out.columns:
+                try:
+                    out[col] = pd.to_numeric(out[col], errors="coerce").astype(target_dtype)  # type: ignore[call-overload]
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("Cannot cast %s to %s: %s", col, target_dtype, exc)
+        for col in _STRING_COLS:
+            if col in out.columns:
+                try:
+                    out[col] = out[col].astype(pd.StringDtype())
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("Cannot cast %s to StringDtype: %s", col, exc)
+        return out
+
+    return ddf.map_partitions(_cast, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Task 06 — interim Parquet writer
+# ---------------------------------------------------------------------------
 
 
 def write_interim_parquet(
     ddf: dd.DataFrame,
     interim_dir: Path,
-    logger: logging.Logger,
-) -> Path:
-    """Repartition and write the Dask DataFrame to Parquet.
-
-    Args:
-        ddf: Dask DataFrame to write.
-        interim_dir: Directory for the Parquet dataset.
-        logger: Configured logger instance.
-
-    Returns:
-        Path to the written Parquet dataset directory.
-    """
+    total_rows_estimate: int,
+) -> None:
+    """Write *ddf* to *interim_dir* as consolidated Parquet files."""
+    npartitions = max(1, min(total_rows_estimate // 500_000, 50))
     interim_dir.mkdir(parents=True, exist_ok=True)
-    output_path = interim_dir / "cogcc_production_interim.parquet"
-
-    # Estimate partition count
-    n_parts = max(1, ddf.npartitions)
-    target_partitions = n_parts
-
-    logger.info(
-        "Writing interim Parquet to %s with %d partition(s)", output_path, target_partitions
+    _log.info("write_interim_parquet: npartitions=%d → %s", npartitions, interim_dir)
+    ddf.repartition(npartitions=npartitions).to_parquet(
+        str(interim_dir), write_index=False, overwrite=True
     )
-    ddf.repartition(npartitions=target_partitions).to_parquet(
-        str(output_path),
-        write_index=False,
-        engine="pyarrow",
-        overwrite=True,
-    )
-    logger.info("Interim Parquet write complete: %s", output_path)
-    return output_path
+    _log.info("Interim Parquet written to %s", interim_dir)
 
 
-def validate_interim_schema(
-    interim_parquet_path: Path,
-    logger: logging.Logger,
-) -> list[str]:
-    """Check that sampled Parquet partitions contain all 16 canonical columns.
-
-    Args:
-        interim_parquet_path: Path to the Parquet dataset directory.
-        logger: Configured logger instance.
-
-    Returns:
-        List of validation error strings; empty if all sampled partitions pass.
-    """
-    parquet_files = sorted(interim_parquet_path.glob("*.parquet"))
-    sample = parquet_files[:3] if len(parquet_files) >= 3 else parquet_files
-
-    errors: list[str] = []
-    for pf in sample:
-        df = pd.read_parquet(pf)
-        for col in CANONICAL_COLUMNS:
-            if col not in df.columns:
-                msg = f"{pf.name}: missing column '{col}'"
-                logger.warning(msg)
-                errors.append(msg)
-    return errors
+# ---------------------------------------------------------------------------
+# Task 07 — ingest orchestrator
+# ---------------------------------------------------------------------------
 
 
-def run_ingest(config: dict[str, Any], logger: logging.Logger) -> Path:
-    """Top-level entry point for the ingest stage.
+def run_ingest(config_path: str = "config.yaml") -> dd.DataFrame:
+    """Run the full ingest stage: CSV → interim Parquet."""
+    t0 = datetime.now()
+    _log.info("Ingest stage started")
 
-    Reads all raw CSVs, writes interim Parquet, and validates the output schema.
+    cfg = load_config(config_path)
+    raw_dir = Path(cfg["ingest"]["raw_dir"])
+    interim_dir = Path(cfg["ingest"]["interim_dir"])
 
-    Args:
-        config: Pipeline configuration dictionary (top-level).
-        logger: Configured logger instance.
+    ddf = load_all_raw_files(raw_dir, cfg["ingest"])
+    ddf = standardise_dtypes(ddf)
 
-    Returns:
-        Path to the interim Parquet dataset directory.
-    """
-    icfg = config["ingest"]
-    raw_dir = Path(icfg["raw_dir"])
-    interim_dir = Path(icfg["interim_dir"])
+    total_rows_estimate: int = int(ddf.shape[0].compute())
+    _log.info("Total rows estimate: %d", total_rows_estimate)
 
-    ddf = ingest_raw_files(raw_dir, logger)
-    interim_path = write_interim_parquet(ddf, interim_dir, logger)
-    errors = validate_interim_schema(interim_path, logger)
-    for err in errors:
-        logger.warning("Schema validation: %s", err)
-    return interim_path
+    write_interim_parquet(ddf, interim_dir, total_rows_estimate)
+
+    elapsed = (datetime.now() - t0).total_seconds()
+    _log.info("Ingest stage complete in %.1fs", elapsed)
+    return ddf
+
+
+if __name__ == "__main__":
+    run_ingest()

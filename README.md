@@ -1,30 +1,58 @@
-# COGCC Production Data Pipeline
+# COGCC Oil & Gas Production Data Pipeline
 
-A production-grade Python pipeline for downloading, ingesting, cleaning, and feature-engineering COGCC/ECMC oil and gas production data.
+A Python data pipeline for downloading, ingesting, cleaning, and engineering ML-ready features
+from Colorado ECMC (Energy and Carbon Management Commission) oil and gas production data.
 
-## Stages
+## Pipeline Stages
 
-1. **Acquire** — Downloads annual ZIP archives and the live monthly CSV from the ECMC public portal.
-2. **Ingest** — Reads raw CSVs, normalises column names, writes interim Parquet via Dask.
-3. **Transform** — Cleans data: replaces sentinels, constructs well IDs and production dates, validates physical bounds, removes duplicates, writes cleaned Parquet.
-4. **Features** — Engineers ML features: cumulative production, GOR, water cut, decline rate, rolling averages, lag features, well age, categorical encoding, numeric scaling.
+| Stage | Module | Description |
+|-------|--------|-------------|
+| Acquire | `cogcc_pipeline/acquire.py` | Download ECMC production CSVs/zips for 2020–present |
+| Ingest | `cogcc_pipeline/ingest.py` | Load raw CSVs → interim Parquet via Dask |
+| Transform | `cogcc_pipeline/transform.py` | Clean, enrich, validate → processed Parquet |
+| Features | `cogcc_pipeline/features.py` | Engineer ML features → features Parquet |
 
-## Quick Start
+## Setup
 
 ```bash
-make env
-make install
-make pipeline
+make env        # Create .venv
+make install    # Install dependencies
 ```
 
-## Run Tests
+## Running the Pipeline
 
 ```bash
-make test
-# Unit tests only
-make test-unit
+make acquire    # Download raw data
+make ingest     # Ingest to interim Parquet
+make transform  # Clean and enrich
+make features   # Engineer ML features
+```
+
+## Testing
+
+```bash
+make test       # Run all unit tests
+pytest tests/ -v -m unit          # Unit tests only
+pytest tests/ -v -m integration   # Integration tests (requires data)
 ```
 
 ## Configuration
 
-All pipeline settings live in `config/pipeline_config.yaml`.
+All pipeline parameters are in `config.yaml`:
+- `acquire.base_url` — ECMC data download base URL
+- `acquire.start_year` — First year to download (default 2020)
+- `acquire.max_workers` — Parallel download workers (default 5)
+- `ingest.target_start_year` — Filter rows before this year
+- `features.rolling_windows` — Month windows for rolling averages
+
+## Data Directory Structure
+
+```
+data/
+├── raw/          ← Downloaded CSVs (acquire stage)
+├── interim/      ← Raw Parquet (ingest stage)
+├── processed/    ← Cleaned Parquet (transform stage)
+│   └── features/ ← ML-ready Parquet (features stage)
+references/
+└── production-data-dictionary.md
+```

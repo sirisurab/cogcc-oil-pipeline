@@ -2,330 +2,385 @@
 
 ## Overview
 
-The ingest stage reads all raw CSV files produced by the acquire stage from `data/raw/`,
-applies minimal structural normalization (column name standardisation, data-type coercion,
-date range filtering), and writes the result as consolidated Parquet files to
-`data/interim/`. Dask is used for parallel reading and writing. No cleaning, outlier
-removal, or feature engineering happens here — those are transform and features stage
-concerns.
+The ingest stage reads all raw CSV files produced by the acquire stage from `data/raw/`, applies
+minimal structural normalisation (correct dtypes, filter to target year range), consolidates the
+data into a small number of Parquet files in `data/interim/`, and makes the data available as a
+Dask DataFrame for downstream stages.
 
-The pipeline package is named `cogcc_pipeline`. All source modules live under
-`cogcc_pipeline/`. All test files live under `tests/`.
+The ingest stage must NOT perform substantive data cleaning (that is the transform stage's
+responsibility). It must only: read, validate column presence, set dtypes, filter by year, and
+write consolidated Parquet files.
 
----
-
-## Raw Data Description (ECMC Production CSV Schema)
-
-The ECMC production CSV files contain the following columns (as documented in
-`references/production-data-dictionary.csv`):
-
-| Column | Type | Description |
-|---|---|---|
-| `APICountyCode` | str/int | 5-digit FIPS county code component of the well API number |
-| `APISeqNum` | str/int | 5-digit sequence number component of the well API number |
-| `ReportYear` | int | Year of the production report |
-| `ReportMonth` | int | Month of the production report (1–12) |
-| `OilProduced` | float | Oil produced in BBL |
-| `OilSold` | float | Oil sold in BBL |
-| `GasProduced` | float | Gas produced in MCF |
-| `GasSold` | float | Gas sold in MCF |
-| `GasFlared` | float | Gas flared in MCF |
-| `GasUsed` | float | Gas used on-site in MCF |
-| `WaterProduced` | float | Water produced in BBL |
-| `DaysProduced` | float | Number of days the well produced in the month |
-| `Well` | str | Well name/identifier string |
-| `OpName` | str | Operator name |
-| `OpNum` | str/int | Operator number |
-| `DocNum` | str/int | Document number |
-
-Note: Some historical files may contain additional or differently-named columns. Column
-name normalisation maps all encountered variants to the canonical names above.
+**Package:** `cogcc_pipeline`
+**Module:** `cogcc_pipeline/ingest.py`
+**Test file:** `tests/test_ingest.py`
 
 ---
 
-## Component Architecture
+## Raw Schema (Authoritative Column Names)
 
-### Modules and files produced by this stage
+The following column names come from the ECMC production data dictionary and the raw CSV header.
+These are the exact names as they appear in the raw files and must be used verbatim throughout
+this stage. Do not rename, alias, or snake_case these column names during ingest — renaming is
+handled by the transform stage.
 
-| Artefact | Purpose |
-|---|---|
-| `cogcc_pipeline/ingest.py` | All ingestion logic |
-| `data/interim/cogcc_production_interim.parquet/` | Parquet dataset directory (Dask output) |
-| `tests/test_ingest.py` | Pytest unit and integration tests |
+| Column Name        | Description                                      |
+|--------------------|--------------------------------------------------|
+| ApiCountyCode      | API county code (2-digit numeric string)         |
+| ApiSequenceNumber  | API sequence number (5-digit numeric string)     |
+| ReportYear         | 4-digit year of the production report            |
+| ReportMonth        | 2-digit month of the production report           |
+| OilProduced        | Oil produced (BBL)                               |
+| OilSales           | Oil sold (BBL)                                   |
+| GasProduced        | Gas produced (MCF)                               |
+| GasSales           | Gas sold (MCF)                                   |
+| FlaredVented       | Gas flared or vented (MCF)                       |
+| GasUsedOnLease     | Gas used on lease (MCF)                          |
+| WaterProduced      | Water produced (BBL)                             |
+| DaysProduced       | Number of days well produced in the month        |
+| Well               | Well name / identifier string                    |
+| OpName             | Operator name                                    |
+| OpNum              | Operator number                                  |
+| DocNum             | Document number (unique report identifier)       |
 
----
-
-## Design Decisions and Constraints
-
-- **Dask for parallelism**: Use `dask.dataframe` to read and process files in parallel.
-  Do not call `.compute()` inside any pipeline function — return `dask.dataframe.DataFrame`
-  objects. (TR-17)
-- **Parquet output file count**: Target `npartitions = max(1, total_rows // 500_000)`.
-  Always call `ddf.repartition(npartitions=N).to_parquet(...)` before writing.
-  Never write one file per source CSV or per well.
-- **Post-read repartition**: After reading any Parquet dataset in downstream stages,
-  immediately repartition to `min(npartitions, 50)` before any transformations.
-- **String dtype in meta**: All `map_partitions` meta DataFrames must use
-  `pd.StringDtype()` for string columns. Never use `"object"` dtype in any `meta=`
-  argument.
-- **Date range filter**: After reading each raw file, filter rows to `ReportYear >= 2020`
-  to exclude pre-2020 history that may appear in annual files.
-- **Column name normalisation**: A canonical mapping dict must handle at least the
-  following known ECMC variant spellings and apply them uniformly across all files.
-- **Encoding**: Try UTF-8 first; fall back to Latin-1 if `UnicodeDecodeError` is raised.
-- **Schema completeness**: Every interim Parquet partition must contain all 16 canonical
-  columns listed above. Missing columns in a source file must be added as null columns of
-  the correct dtype.
-- **Logging**: Log file name, row count read, row count after filtering, and any encoding
-  fallback for each file processed.
-- **Type hints and docstrings**: All public functions and classes.
+Additional columns may be present in some files. They must be retained as-is and not dropped
+during ingest (downstream stages will decide what to use).
 
 ---
 
-## Task 08: Implement column name normalisation
+## Design Decisions & Constraints
+
+- Use `dask.dataframe` for all reading and writing operations.
+- Read CSVs with Dask using `dask.dataframe.read_csv` with `blocksize="64MB"` and
+  `assume_missing=True` (source files may have inconsistent nullability).
+- After reading, immediately repartition to `min(current_npartitions, 50)` before any operations.
+- Filter rows to `ReportYear >= cfg["target_start_year"]` (default 2020) using `map_partitions`
+  (not direct `.str` or series accessors — see non-negotiable Dask constraints).
+- Target output: `npartitions = max(1, total_rows // 500_000)` consolidated Parquet files under
+  `data/interim/`. Never write one file per source entity. Always repartition before writing.
+- Write with `ddf.repartition(npartitions=N).to_parquet("data/interim/", write_index=False)`.
+- Use `pd.StringDtype()` for all string-typed columns in any `meta=` argument passed to
+  `map_partitions`. Never use `"object"` as a dtype value in a `meta=` argument.
+- All functions that return Dask DataFrames must NOT call `.compute()` internally (TR-17). They
+  must return `dask.dataframe.DataFrame`.
+- Logging must use Python's `logging` module. No `print()` statements.
+- Parallel CSV reading: use Dask's built-in parallelism — do not manually spawn additional processes.
+- Error handling: if a single CSV file cannot be read (corrupt, empty, wrong schema), log an error
+  and continue with remaining files. Do not abort the full ingest.
+- All configurable values must be read from `config.yaml` (passed in as a dict `cfg`).
+
+---
+
+## Task 01: Implement single-file CSV reader
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `normalise_columns(df: pd.DataFrame) -> pd.DataFrame`
+**Function:** `read_csv_file(csv_path: Path, cfg: dict) -> dask.dataframe.DataFrame`
 
 **Description:**
+Read a single raw production CSV file into a Dask DataFrame, applying only minimal structural
+operations: correct blocksize, `assume_missing=True`, and a repartition to at most 50 partitions.
 
-Define a `COLUMN_MAP` dictionary at module level that maps known ECMC column name variants
-to the canonical column names defined in the schema table above. Examples of variants to
-handle:
+- Use `dask.dataframe.read_csv(str(csv_path), blocksize="64MB", assume_missing=True)`.
+- After reading, repartition to `min(ddf.npartitions, 50)`.
+- Log the file path, number of partitions before and after, at INFO level.
+- If the file does not exist at `csv_path`, raise `FileNotFoundError` with a descriptive message.
+- If the file is empty (0 bytes), raise `ValueError(f"Empty file: {csv_path}")`.
+- Return the Dask DataFrame without calling `.compute()`.
 
-- `"API_County_Code"`, `"Api_County_Code"`, `"apicountycode"` → `"APICountyCode"`
-- `"API_Seq_Num"`, `"Api_Seq_Num"`, `"apiseqnum"` → `"APISeqNum"`
-- `"Report_Year"`, `"report_year"`, `"REPORTYEAR"` → `"ReportYear"`
-- `"Report_Month"`, `"report_month"`, `"REPORTMONTH"` → `"ReportMonth"`
-- `"Oil_Produced"`, `"oil_produced"`, `"OILPRODUCED"` → `"OilProduced"`
-- `"Oil_Sold"`, `"oil_sold"` → `"OilSold"`
-- `"Gas_Produced"`, `"gas_produced"` → `"GasProduced"`
-- `"Gas_Sold"`, `"gas_sold"` → `"GasSold"`
-- `"Gas_Flared"`, `"gas_flared"` → `"GasFlared"`
-- `"Gas_Used"`, `"gas_used"` → `"GasUsed"`
-- `"Water_Produced"`, `"water_produced"`, `"WATERPRODUCED"` → `"WaterProduced"`
-- `"Days_Produced"`, `"days_produced"`, `"DAYSPRODUCED"` → `"DaysProduced"`
-- `"Op_Name"`, `"op_name"`, `"OPNAME"` → `"OpName"`
-- `"Op_Num"`, `"op_num"` → `"OpNum"`
-- `"Doc_Num"`, `"doc_num"` → `"DocNum"`
+**Error handling:** `FileNotFoundError` for missing file; `ValueError` for empty file;
+`dask.dataframe.errors` wrapped and logged for CSV parse errors.
 
-The function strips leading/trailing whitespace from all column names before applying the
-mapping. Unmapped columns are kept as-is (they will be dropped later).
+**Dependencies:** dask[dataframe], pathlib, logging
 
-After renaming, add any canonical column that is missing as a null column with the correct
-dtype:
-- `APICountyCode`, `APISeqNum`, `Well`, `OpName`, `OpNum`, `DocNum` → `pd.StringDtype()`
-- `ReportYear`, `ReportMonth` → `Int32` (nullable integer)
-- `OilProduced`, `OilSold`, `GasProduced`, `GasSold`, `GasFlared`, `GasUsed`,
-  `WaterProduced`, `DaysProduced` → `Float64` (nullable float)
+**Test cases:**
+- `@pytest.mark.unit` — Given a small synthetic CSV written to a tmp directory with the correct
+  column names, assert the function returns a `dask.dataframe.DataFrame` (not `pandas.DataFrame`).
+- `@pytest.mark.unit` — Assert the returned Dask DataFrame has `npartitions <= 50`.
+- `@pytest.mark.unit` — Given a path to a non-existent file, assert `FileNotFoundError` is raised.
+- `@pytest.mark.unit` — Given a path to an empty (0-byte) file, assert `ValueError` is raised.
+- `@pytest.mark.unit` — Assert the function does not call `.compute()` internally — verify the
+  return type is `dask.dataframe.DataFrame` (TR-17).
 
-Return only the 16 canonical columns in the fixed order listed in the schema table.
-
-**Dependencies:** `pandas`
-
-**Test cases (`tests/test_ingest.py`):**
-
-- `@pytest.mark.unit` — Given a DataFrame with canonical column names already correct,
-  assert the returned DataFrame has the same 16 columns in canonical order and no data
-  loss.
-- `@pytest.mark.unit` — Given a DataFrame using underscore-separated variant names
-  (e.g. `Oil_Produced`), assert all columns are correctly renamed.
-- `@pytest.mark.unit` — Given a DataFrame missing `GasFlared` and `GasUsed`, assert those
-  columns are added as null `Float64` columns in the result.
-- `@pytest.mark.unit` — Given a DataFrame with extra non-canonical columns, assert they
-  are dropped from the result.
-- `@pytest.mark.unit` — Given column names with leading/trailing whitespace, assert they
-  are still mapped correctly.
-
-**Definition of done:** `normalise_columns` implemented with `COLUMN_MAP`; all unit tests
-pass; `ruff` and `mypy` report no errors; `requirements.txt` updated with all third-party
-packages imported in this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 09: Implement single-file CSV reader
+## Task 02: Implement year-range filter
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `read_raw_csv(path: Path, logger: logging.Logger) -> pd.DataFrame`
+**Function:** `filter_by_year(ddf: dask.dataframe.DataFrame, start_year: int) -> dask.dataframe.DataFrame`
 
 **Description:**
+Filter a Dask DataFrame to rows where `ReportYear >= start_year`. This handles the fact that
+ECMC raw files may contain historical production data going back decades, regardless of which
+year's zip was downloaded.
 
-Read a single ECMC production CSV file into a pandas DataFrame. Apply the following steps:
+- Use `map_partitions` with an inner Pandas function (not a direct Dask `.str` accessor or series
+  comparison that may fail after repartition/astype operations):
+  ```
+  def _filter(pdf):
+      pdf = pdf[pdf["ReportYear"].astype(int) >= start_year]
+      return pdf
+  ddf = ddf.map_partitions(_filter, meta=ddf._meta)
+  ```
+- The `meta=` argument must be `ddf._meta` (which is an empty Pandas DataFrame with the correct
+  schema).
+- Log at INFO level: how many partitions are being filtered and the target start year.
+- Do not call `.compute()`. Return the filtered Dask DataFrame.
+- The `ReportYear` column may be read as a string or integer from CSV — handle both: cast to int
+  inside the inner `_filter` function before comparison.
 
-1. Attempt to read with `encoding="utf-8"`. On `UnicodeDecodeError`, re-read with
-   `encoding="latin-1"` and log a warning identifying the file and fallback encoding.
-2. Strip leading/trailing whitespace from all string column values.
-3. Call `normalise_columns(df)` to standardise column names and dtypes.
-4. Filter rows to `ReportYear >= 2020`. Use `.loc` with an integer comparison — do not
-   use string operations here.
-5. Log: file path, raw row count, row count after date filtering.
-6. Return the filtered DataFrame.
+**Error handling:** If `ReportYear` column is missing from the DataFrame, raise
+`KeyError("ReportYear column not found in DataFrame")`.
 
-If the file cannot be parsed as CSV (e.g. it is binary or malformed), raise `ValueError`
-with a descriptive message including the file path.
+**Dependencies:** dask[dataframe], pandas, logging
 
-**Dependencies:** `pandas`, `pathlib`, `logging`
+**Test cases:**
+- `@pytest.mark.unit` — Given a synthetic Dask DataFrame with `ReportYear` values [2018, 2019,
+  2020, 2021], assert that after `filter_by_year(ddf, 2020)`, calling `.compute()` yields only
+  rows with `ReportYear` in [2020, 2021].
+- `@pytest.mark.unit` — Assert the return type is `dask.dataframe.DataFrame`.
+- `@pytest.mark.unit` — Given a DataFrame where `ReportYear` is stored as a string column
+  ("2020", "2019"), assert the filter still correctly excludes pre-2020 rows.
+- `@pytest.mark.unit` — Given a DataFrame missing the `ReportYear` column, assert `KeyError`
+  is raised.
 
-**Test cases (`tests/test_ingest.py`):**
-
-- `@pytest.mark.unit` — Given a valid CSV `tmp_path` file with rows for years 2019, 2020,
-  2021, assert the returned DataFrame contains only the 2020 and 2021 rows.
-- `@pytest.mark.unit` — Given a CSV with UTF-8 encoding, assert it is read without
-  warning.
-- `@pytest.mark.unit` — Given a CSV with Latin-1 encoded special characters (e.g.
-  accented operator names), assert the fallback encoding is used and a warning is logged.
-- `@pytest.mark.unit` — Given an empty CSV (header only), assert the returned DataFrame
-  has 0 rows and the correct 16 columns.
-- `@pytest.mark.unit` — Given a binary file that cannot be parsed as CSV, assert
-  `ValueError` is raised.
-
-**Definition of done:** `read_raw_csv` implemented; all tests pass; `ruff` and `mypy`
-report no errors; `requirements.txt` updated with all third-party packages imported in
-this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 10: Implement parallel multi-file ingestion with Dask
+## Task 03: Implement schema validator
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `ingest_raw_files(raw_dir: Path, logger: logging.Logger) -> dask.dataframe.DataFrame`
+**Function:** `validate_schema(ddf: dask.dataframe.DataFrame) -> list[str]`
 
 **Description:**
+Check that all required columns are present in the Dask DataFrame. Returns a list of missing
+column names (empty list if all are present). This is a lightweight structural check — it does not
+inspect data values.
 
-Discover all CSV files in `raw_dir` matching the patterns `*_prod_reports.csv` and
-`monthly_prod.csv`. For each file, use `dask.delayed` to wrap `read_raw_csv` so that
-reading happens lazily and in parallel when `.compute()` is eventually called by the
-caller. Construct a `dask.dataframe.DataFrame` from the list of delayed pandas DataFrames
-using `dask.dataframe.from_delayed`.
+Required columns (must all be present):
+`ApiCountyCode`, `ApiSequenceNumber`, `ReportYear`, `ReportMonth`, `OilProduced`, `OilSales`,
+`GasProduced`, `GasSales`, `FlaredVented`, `GasUsedOnLease`, `WaterProduced`, `DaysProduced`,
+`Well`, `OpName`, `OpNum`, `DocNum`
 
-The meta for `from_delayed` must be constructed using the canonical 16-column schema with
-correct dtypes (`pd.StringDtype()` for string columns, `pd.Int32Dtype()` for integer
-columns, `pd.Float64Dtype()` for float columns). Never use `"object"` dtype in meta.
+- Check `ddf.columns` (no `.compute()` needed — column names are available from the metadata).
+- Return the list of column names that are absent.
+- Log a WARNING for each missing column.
+- Do not raise — return the list so the caller can decide how to respond.
 
-Do not call `.compute()` inside this function.
+**Error handling:** No exceptions raised. Missing columns are returned in the list.
 
-Return the Dask DataFrame. The caller is responsible for triggering computation and
-writing output.
+**Dependencies:** dask[dataframe], logging
 
-If no CSV files are found in `raw_dir`, raise `FileNotFoundError` with a message
-including the directory path.
+**Test cases:**
+- `@pytest.mark.unit` — Given a Dask DataFrame with all 16 required columns present, assert
+  `validate_schema` returns an empty list.
+- `@pytest.mark.unit` — Given a Dask DataFrame missing `OilProduced` and `GasProduced`, assert
+  the returned list contains exactly those two names.
+- `@pytest.mark.unit` — Assert the function does not call `.compute()` (return type inspection
+  only).
 
-**Dependencies:** `dask`, `dask.dataframe`, `dask.delayed`, `pandas`, `pathlib`, `logging`
-
-**Test cases (`tests/test_ingest.py`):**
-
-- `@pytest.mark.unit` (TR-17) — Assert the return type of `ingest_raw_files` is
-  `dask.dataframe.DataFrame`, not `pandas.DataFrame`.
-- `@pytest.mark.unit` — Given `tmp_path` with two synthetic CSV files, assert the
-  returned Dask DataFrame has the correct meta schema (16 canonical columns, correct
-  dtypes). Do not call `.compute()` in this assertion — check `ddf._meta` instead.
-- `@pytest.mark.unit` — Given an empty `raw_dir`, assert `FileNotFoundError` is raised.
-- `@pytest.mark.integration` (TR-18) — Given the real `data/raw/` directory (populated
-  by acquire), call `ingest_raw_files`, then `.compute()`, then write to a tmp Parquet
-  path and re-read with `pd.read_parquet`. Assert the re-read DataFrame is non-empty
-  and contains all 16 canonical columns.
-
-**Definition of done:** `ingest_raw_files` implemented; all tests pass; `ruff` and `mypy`
-report no errors; `requirements.txt` updated with all third-party packages imported in
-this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 11: Implement interim Parquet writer
+## Task 04: Implement multi-file ingestion loader
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `write_interim_parquet(ddf: dask.dataframe.DataFrame, interim_dir: Path, logger: logging.Logger) -> Path`
+**Function:** `load_all_raw_files(raw_dir: Path, cfg: dict) -> dask.dataframe.DataFrame`
 
 **Description:**
+Load all CSV files found in `raw_dir`, concatenate them into a single Dask DataFrame, apply the
+year filter, and validate schema. Returns the combined Dask DataFrame without writing to disk.
 
-Compute target partition count: `max(1, estimated_rows // 500_000)` where
-`estimated_rows` is approximated from the Dask DataFrame's known divisions or a quick
-`len()` call after a `.persist()`. If divisions are not known, default to
-`npartitions = max(1, ddf.npartitions)`.
+- Find all CSV files in `raw_dir` matching `*.csv` using `glob` (or `Path.glob`).
+- For each file: call `read_csv_file`. If it raises, log the error and continue to the next file
+  (graceful per-file failure).
+- If no files are successfully loaded, raise `RuntimeError("No raw CSV files could be loaded")`.
+- Concatenate all successfully loaded Dask DataFrames using `dask.dataframe.concat(ddfs, axis=0)`.
+- Repartition to `min(combined.npartitions, 50)` after concatenation.
+- Call `filter_by_year(combined_ddf, cfg["target_start_year"])`.
+- Call `validate_schema(combined_ddf)`. If any required column is missing, log a WARNING listing
+  the missing columns (do not abort).
+- Return the final Dask DataFrame without calling `.compute()`.
 
-Call `ddf.repartition(npartitions=N).to_parquet(str(interim_dir / "cogcc_production_interim.parquet"), write_index=False, engine="pyarrow", overwrite=True)`.
+**Error handling:** Per-file errors are caught, logged, and skipped. `RuntimeError` if no files
+load successfully.
 
-Log the output directory, target partition count, and completion status.
+**Dependencies:** dask[dataframe], pathlib, logging
 
-Return `interim_dir / "cogcc_production_interim.parquet"` as a `Path`.
+**Test cases:**
+- `@pytest.mark.unit` — Given a tmp directory with two synthetic CSV files, assert the function
+  returns a `dask.dataframe.DataFrame` with rows from both files.
+- `@pytest.mark.unit` — Given a tmp directory where one CSV is empty and one is valid, assert
+  the function returns a Dask DataFrame from the valid file and logs an error for the empty one.
+- `@pytest.mark.unit` — Given an empty directory, assert `RuntimeError` is raised.
+- `@pytest.mark.unit` — Assert the return type is `dask.dataframe.DataFrame` (TR-17).
+- `@pytest.mark.integration` — Given the real `data/raw/` directory after an acquire run, assert
+  the function returns a non-empty Dask DataFrame with all required columns present (TR-22).
 
-**Dependencies:** `dask.dataframe`, `pathlib`, `logging`
-
-**Test cases (`tests/test_ingest.py`):**
-
-- `@pytest.mark.unit` — Given a small synthetic Dask DataFrame (< 500,000 rows), assert
-  the function writes to the expected directory, returns the correct Path, and the
-  partition count is at least 1.
-- `@pytest.mark.unit` (TR-18) — After `write_interim_parquet` completes on a synthetic
-  DataFrame, read the written Parquet with `pd.read_parquet` and assert it is non-empty
-  and contains all 16 canonical columns.
-- `@pytest.mark.unit` — Assert the function does not raise when `interim_dir` does not
-  yet exist (it must be created).
-
-**Definition of done:** `write_interim_parquet` implemented; all tests pass; `ruff` and
-`mypy` report no errors; `requirements.txt` updated with all third-party packages imported
-in this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 12: Implement schema completeness validator for interim output
+## Task 05: Implement dtype standardiser
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `validate_interim_schema(interim_parquet_path: Path, logger: logging.Logger) -> list[str]`
+**Function:** `standardise_dtypes(ddf: dask.dataframe.DataFrame) -> dask.dataframe.DataFrame`
 
 **Description:**
+Apply correct dtype assignments to the Dask DataFrame columns before writing to Parquet. This
+ensures Parquet files have a stable, queryable schema.
 
-Read a sample of at least 3 Parquet partition files from the interim output directory
-(use `glob` to list `*.parquet` files). For each sampled partition, check that all 16
-canonical columns are present. Collect and return a list of validation error strings
-describing any missing columns per file. Log one warning per error. Return empty list
-if all sampled partitions pass.
+Apply the following dtype mappings:
+- `ApiCountyCode`: `pd.StringDtype()`
+- `ApiSequenceNumber`: `pd.StringDtype()`
+- `ReportYear`: `int32`
+- `ReportMonth`: `int32`
+- `OilProduced`: `float64`
+- `OilSales`: `float64`
+- `GasProduced`: `float64`
+- `GasSales`: `float64`
+- `FlaredVented`: `float64`
+- `GasUsedOnLease`: `float64`
+- `WaterProduced`: `float64`
+- `DaysProduced`: `float64`
+- `Well`: `pd.StringDtype()`
+- `OpName`: `pd.StringDtype()`
+- `OpNum`: `pd.StringDtype()`
+- `DocNum`: `pd.StringDtype()`
 
-**Test cases (`tests/test_ingest.py`):**
+- Apply dtype assignments using `map_partitions` with an explicit `meta=` argument constructed
+  as an empty `pd.DataFrame` with the above types. Do not use `ddf.astype({...})` directly on
+  string columns (use `map_partitions` for string columns to avoid the `object` dtype issue).
+- For any column not in the list above that is present in the DataFrame, leave it unchanged.
+- Do not call `.compute()`. Return the typed Dask DataFrame.
 
-- `@pytest.mark.unit` (TR-22) — Write 3 synthetic Parquet files to `tmp_path`, each
-  containing all 16 canonical columns. Assert `validate_interim_schema` returns an empty
-  error list.
-- `@pytest.mark.unit` (TR-22) — Write 3 synthetic Parquet files where one is missing
-  `GasFlared`. Assert the error list contains one entry naming that file and column.
-- `@pytest.mark.unit` (TR-22) — Write only 1 Parquet file. Assert the function does not
-  raise (graceful handling when fewer than 3 partitions exist).
+**Error handling:** If a column cannot be cast to its target dtype (e.g., non-numeric string in a
+float column), log a WARNING and leave the column as-is rather than raising.
 
-**Definition of done:** `validate_interim_schema` implemented; all tests pass; `ruff` and
-`mypy` report no errors; `requirements.txt` updated with all third-party packages imported
-in this task.
+**Dependencies:** dask[dataframe], pandas, logging
+
+**Test cases:**
+- `@pytest.mark.unit` — Given a synthetic Dask DataFrame with all required columns as object/str
+  dtype, assert that after `standardise_dtypes`, the `OilProduced` column dtype is `float64`.
+- `@pytest.mark.unit` — Assert that `ApiCountyCode` dtype is `pd.StringDtype()` (not `object`).
+- `@pytest.mark.unit` — Assert `ReportYear` dtype is `int32`.
+- `@pytest.mark.unit` — Assert the return type is `dask.dataframe.DataFrame`.
+- `@pytest.mark.unit` — Assert `meta=` arguments to `map_partitions` use `pd.StringDtype()` for
+  string columns and never use `"object"` as a dtype value.
+
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task 13: Implement top-level ingest entry point
+## Task 06: Implement interim Parquet writer
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `run_ingest(config: dict, logger: logging.Logger) -> Path`
+**Function:** `write_interim_parquet(ddf: dask.dataframe.DataFrame, interim_dir: Path, total_rows_estimate: int) -> None`
 
 **Description:**
+Write the consolidated Dask DataFrame to `data/interim/` as a set of Parquet files. The number
+of output files must be proportional to data volume — never write one file per source entity,
+and never write more than 200 files total.
 
-Top-level entry point for the ingest stage. Performs the following steps in order:
+- Compute `npartitions = max(1, total_rows_estimate // 500_000)`.
+- Cap at 50 partitions: `npartitions = min(npartitions, 50)`.
+- Repartition: `ddf = ddf.repartition(npartitions=npartitions)`.
+- Write: `ddf.to_parquet(str(interim_dir), write_index=False, overwrite=True)`.
+- Create `interim_dir` if it does not exist.
+- Log the target `npartitions` and `interim_dir` at INFO level before writing.
+- After writing, log a confirmation message at INFO level.
+- Do NOT use `partition_on=` with high-cardinality columns.
 
-1. Read `ingest` section from `config`.
-2. Call `ingest_raw_files(raw_dir, logger)` to obtain a Dask DataFrame.
-3. Call `write_interim_parquet(ddf, interim_dir, logger)` to write the output.
-4. Call `validate_interim_schema(interim_parquet_path, logger)` to validate output.
-5. If validation errors exist, log each error as a warning (do not raise — a partial
-   schema is recoverable in transform).
-6. Return the interim Parquet path.
+**Error handling:** Propagate `OSError` or `pyarrow` write errors after logging.
 
-**Test cases (`tests/test_ingest.py`):**
+**Dependencies:** dask[dataframe], pyarrow, pathlib, logging
 
-- `@pytest.mark.unit` (TR-17) — Mock `ingest_raw_files` to return a synthetic Dask
-  DataFrame. Assert `run_ingest` returns a Path and does not call `.compute()` internally
-  (verify by checking the mock return type is still a Dask DataFrame before write).
-- `@pytest.mark.unit` — Mock `validate_interim_schema` to return two error strings.
-  Assert `run_ingest` still returns the interim path (does not raise) and logs two
-  warnings.
-- `@pytest.mark.integration` — Run `run_ingest` against real `data/raw/` files. Assert
-  the returned Path exists, is a directory containing `.parquet` files, and at least one
-  file is readable by `pd.read_parquet`. Requires data files on disk.
+**Test cases:**
+- `@pytest.mark.unit` — Given a synthetic 5-partition Dask DataFrame and `total_rows_estimate=50_000`,
+  assert `npartitions` is set to 1 (50_000 // 500_000 = 0, max(1, 0) = 1).
+- `@pytest.mark.unit` — Given `total_rows_estimate=2_500_000`, assert `npartitions = 5`.
+- `@pytest.mark.unit` — Given `total_rows_estimate=30_000_000`, assert `npartitions = 50`
+  (capped at 50).
+- `@pytest.mark.integration` — Write a synthetic Dask DataFrame to a tmp directory, then read
+  back with `dask.dataframe.read_parquet` and assert the row count matches (TR-18).
+- `@pytest.mark.integration` — Assert the number of Parquet files written is <= 50.
 
-**Definition of done:** `run_ingest` implemented; all tests pass; `ruff` and `mypy`
-report no errors; `requirements.txt` updated with all third-party packages imported in
-this task.
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
+
+---
+
+## Task 07: Implement ingest orchestrator
+
+**Module:** `cogcc_pipeline/ingest.py`
+**Function:** `run_ingest(config_path: str = "config.yaml") -> dask.dataframe.DataFrame`
+
+**Description:**
+Top-level entry point for the ingest stage. Loads all raw CSV files, standardises dtypes, writes
+interim Parquet files, and returns the Dask DataFrame for optional chaining.
+
+- Load config via `load_config(config_path)`.
+- Resolve `raw_dir = Path(cfg["ingest"]["raw_dir"])` and `interim_dir = Path(cfg["ingest"]["interim_dir"])`.
+- Call `load_all_raw_files(raw_dir, cfg["ingest"])`.
+- Call `standardise_dtypes(ddf)`.
+- Estimate total rows: call `.shape[0].compute()` once (this single `.compute()` call is permitted
+  in the orchestrator to size the output partitions). Store as `total_rows_estimate`.
+- Call `write_interim_parquet(ddf, interim_dir, total_rows_estimate)`.
+- Return the Dask DataFrame (post-repartition, pre-compute) for optional downstream use.
+- Log a start and end message with elapsed time.
+
+**Error handling:** Propagate `RuntimeError` from `load_all_raw_files` if no files load. All other
+errors are logged and re-raised.
+
+**Dependencies:** dask[dataframe], pathlib, logging, datetime
+
+**Test cases:**
+- `@pytest.mark.unit` — Given mocked `load_all_raw_files` returning a synthetic Dask DataFrame
+  and mocked `write_interim_parquet`, assert `run_ingest` completes without error and returns a
+  `dask.dataframe.DataFrame`.
+- `@pytest.mark.integration` — Run `run_ingest` against real `data/raw/` (post-acquire); assert
+  Parquet files exist in `data/interim/`, are readable, and have all required columns (TR-22).
+
+**Definition of done:** Function implemented, test cases pass, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
+
+---
+
+## Task 08: Implement schema completeness test (TR-22)
+
+**Module:** `tests/test_ingest.py`
+
+**Description:**
+Dedicated test suite verifying schema completeness across interim Parquet partitions per TR-22.
+
+**Test cases:**
+- `@pytest.mark.integration` — After running `run_ingest`, read at least 3 interim Parquet
+  partition files from `data/interim/`. For each, assert that all of the following columns are
+  present: `ApiCountyCode`, `ApiSequenceNumber`, `ReportYear`, `ReportMonth`, `OilProduced`,
+  `OilSales`, `GasProduced`, `GasSales`, `FlaredVented`, `GasUsedOnLease`, `WaterProduced`,
+  `DaysProduced`, `Well`, `OpName`, `OpNum`, `DocNum`. Assert no column is missing or renamed
+  in any sampled partition.
+- `@pytest.mark.integration` — Assert that all sampled partitions have the same set of column
+  names (schema is identical across partitions).
+- `@pytest.mark.integration` — Read the interim Parquet dataset with `pandas.read_parquet` and
+  assert it does not raise (TR-18 — parquet readability).
+
+**Definition of done:** Tests implemented and passing, `ruff` and `mypy` report no errors,
+`requirements.txt` updated with all third-party packages imported in this task.
+
+---
+
+## Module-level entry point
+
+**Module:** `cogcc_pipeline/ingest.py`
+
+Add a `if __name__ == "__main__":` block that calls `run_ingest()` so the stage can be executed
+via `python -m cogcc_pipeline.ingest`.

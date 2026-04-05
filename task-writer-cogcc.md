@@ -1,5 +1,20 @@
 <project>cogcc</project>
 
+<pre-task-instructions>
+	<instruction>Before writing any task spec, you must establish the exact column names from the
+	raw data. Follow these steps in order:
+	1. Use fetch_url to retrieve the data dictionary page:
+	   https://ecmc.state.co.us/documents/data/downloads/production/production_record_data_dictionary.htm
+	   Extract all column names and descriptions from the HTML table.
+	2. Use write_file to save the dictionary as `references/production-data-dictionary.md`.
+	3. Use fetch_url to retrieve the header row of the monthly CSV:
+	   https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv
+	   Read the first line only to confirm the exact column names as they appear in the raw files.
+	4. Use these exact column names throughout all task specs.
+	   Do not invent or guess column names — the data dictionary and CSV header are authoritative.
+	</instruction>
+</pre-task-instructions>
+
 <datasets>
 	<dataset>
 		<name>{year}_prod_reports.zip</name>
@@ -13,8 +28,6 @@
 			 2. Use the zip-file-path to download the zip file for the year
 			 3. Unzip the zip file and extract the csv file
 			 4. Place the resulting csv file in the `./data/raw` folder
-			</instruction>
-			<instruction>The data file is in .csv format. The data dictionary for the data file needs to be constructed from the html table at the page linked in the data-dictionary element. Use BeautifulSoup to parse the html table into `production-data-dictionary.csv` file and place it under `./references/`
 			</instruction>
 			<instruction>Rate-limit parallel downloads to a maximum of 5 concurrent workers via
 			Dask. Add a 0.5 second sleep per download worker to avoid overloading the server.
@@ -36,5 +49,5 @@ Data files:
     - data/raw/{year}_prod_reports.csv  <- annual production CSVs
     - data/raw/monthly_prod.csv         <- current year monthly
 Reference files in references/:
-    - production-data-dictionary.csv
+    - production-data-dictionary.md
 </context>

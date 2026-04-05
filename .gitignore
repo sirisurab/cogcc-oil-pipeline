@@ -5,11 +5,7 @@ conversation_history/
 __pycache__/
 *.pyc
 *.egg-info/
-.mypy_cache/
-.ruff_cache/
 .pytest_cache/
-.deepeval/
-logs/
-dist/
-build/
-.DS_Store
+.ruff_cache/
+.mypy_cache/
+*.DS_Store
