@@ -1,277 +1,362 @@
-"""Acquire stage — download COGCC/ECMC production data files."""
+"""Acquire stage: download COGCC annual production ZIP/CSV files."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO
 
+import dask
 import requests
 import yaml
-from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+REQUIRED_CONFIG_SECTIONS = ["acquire", "ingest", "transform", "features", "dask", "logging"]
 
 
 # ---------------------------------------------------------------------------
-# Logging
+# A-02: Logging setup
 # ---------------------------------------------------------------------------
 
-def get_logger(name: str) -> logging.Logger:
-    """Return a configured logger with a single StreamHandler (no duplicates)."""
-    logger = logging.getLogger(name)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
-        )
-        logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    return logger
+def setup_logging(config: dict) -> logging.Logger:
+    """Configure root logger writing to stdout and a log file.
 
+    Args:
+        config: Full config dict loaded from config.yaml.
 
-_log = get_logger(__name__)
+    Returns:
+        Configured Logger instance.
+
+    Raises:
+        OSError: If the logs directory cannot be created.
+    """
+    log_cfg = config["logging"]
+    log_file = Path(log_cfg["log_file"])
+    level_str: str = log_cfg.get("level", "INFO")
+    level = getattr(logging, level_str.upper(), logging.INFO)
+
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise OSError(f"Cannot create logs directory {log_file.parent}: {exc}") from exc
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s")
+
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+               for h in root.handlers):
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
+
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) ==
+               str(log_file.resolve()) for h in root.handlers):
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+    return logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# A-03: Configuration loader
 # ---------------------------------------------------------------------------
 
-_REQUIRED_KEYS = {"acquire", "ingest", "transform", "features"}
+def load_config(config_path: Path) -> dict:
+    """Load config.yaml and validate required sections exist.
 
+    Args:
+        config_path: Path to config.yaml.
 
-def load_config(config_path: str = "config.yaml") -> dict:
-    """Load and return the full pipeline configuration from *config_path*."""
-    path = Path(config_path)
-    if not path.exists():
+    Returns:
+        Dict with full configuration.
+
+    Raises:
+        FileNotFoundError: If file does not exist.
+        ValueError: On YAML parse error.
+        KeyError: If a required section is missing.
+    """
+    if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     try:
-        with path.open() as fh:
-            cfg = yaml.safe_load(fh)
+        with config_path.open() as f:
+            cfg: dict = yaml.safe_load(f)
     except yaml.YAMLError as exc:
         raise ValueError(f"YAML parse error in {config_path}: {exc}") from exc
-    missing = _REQUIRED_KEYS - set(cfg or {})
-    if missing:
-        raise KeyError(f"Config missing required top-level keys: {missing}")
+
+    for section in REQUIRED_CONFIG_SECTIONS:
+        if section not in cfg:
+            raise KeyError(f"Missing required config section: '{section}'")
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# HTTP downloader with retry
+# A-04: MD5 checksum
 # ---------------------------------------------------------------------------
 
-def download_with_retry(url: str, dest_path: Path, cfg: dict) -> bool:
-    """Download *url* to *dest_path* with exponential back-off retry.
+def compute_md5(file_path: Path) -> str:
+    """Compute MD5 hexdigest of a file using 8 KB chunks.
 
-    Returns True on success, False after all retries are exhausted.
-    If *dest_path* already exists and has size > 0, skip download (idempotent).
+    Args:
+        file_path: Path to the file.
+
+    Returns:
+        Lowercase hex MD5 string.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
     """
-    if dest_path.exists() and dest_path.stat().st_size > 0:
-        _log.info("Skip (exists): %s", dest_path)
-        return True
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    h = hashlib.md5()
+    with file_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    attempts = int(cfg.get("retry_attempts", 3))
-    backoff_base = float(cfg.get("retry_backoff_base", 1))
 
-    for attempt in range(attempts):
+# ---------------------------------------------------------------------------
+# A-05: HTTP file downloader with retry
+# ---------------------------------------------------------------------------
+
+def download_file(
+    url: str,
+    dest_path: Path,
+    retry_max_attempts: int,
+    retry_backoff_factor: float,
+) -> Path:
+    """Download a file from url to dest_path with exponential backoff retry.
+
+    Args:
+        url: HTTP URL to download.
+        dest_path: Local path where file will be written.
+        retry_max_attempts: Maximum number of download attempts.
+        retry_backoff_factor: Base multiplier for exponential backoff.
+
+    Returns:
+        dest_path after successful write.
+
+    Raises:
+        RuntimeError: If all attempts fail or HTTP status >= 400 on final attempt.
+    """
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    last_exc: Exception = RuntimeError("No attempts made")
+
+    for attempt in range(retry_max_attempts):
         try:
             resp = requests.get(url, stream=True, timeout=60)
-            resp.raise_for_status()
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                with dest_path.open("wb") as fh:
-                    _write_stream(resp, fh)
-            except Exception:
-                if dest_path.exists():
-                    dest_path.unlink(missing_ok=True)
-                raise
-            _log.info("Downloaded: %s → %s", url, dest_path)
-            return True
-        except requests.RequestException as exc:
-            wait = backoff_base * (2**attempt)
-            _log.warning("Attempt %d/%d failed for %s: %s — retrying in %.1fs",
-                         attempt + 1, attempts, url, exc, wait)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code} for {url}")
+            with dest_path.open("wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            time.sleep(0.5)
+            logger.info("Downloaded %s → %s", url, dest_path)
+            return dest_path
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            wait = retry_backoff_factor * (2 ** attempt)
+            logger.warning("Attempt %d/%d failed for %s: %s. Retrying in %.1fs",
+                           attempt + 1, retry_max_attempts, url, exc, wait)
             time.sleep(wait)
 
-    _log.error("Could not download %s after %d attempts", url, attempts)
-    if dest_path.exists():
-        dest_path.unlink(missing_ok=True)
-    return False
-
-
-def _write_stream(resp: requests.Response, fh: IO[bytes]) -> None:
-    for chunk in resp.iter_content(chunk_size=8192):
-        if chunk:
-            fh.write(chunk)
+    raise RuntimeError(f"All {retry_max_attempts} attempts failed for {url}: {last_exc}")
 
 
 # ---------------------------------------------------------------------------
-# Data dictionary
+# A-06: ZIP extractor
 # ---------------------------------------------------------------------------
 
-def fetch_data_dictionary(cfg: dict) -> Path:
-    """Fetch the ECMC data dictionary HTML and write a Markdown reference file."""
-    url = cfg["data_dict_url"]
-    refs_dir = Path(cfg.get("references_dir", "references"))
-    refs_dir.mkdir(parents=True, exist_ok=True)
-    out_path = refs_dir / "production-data-dictionary.md"
+def extract_csv_from_zip(zip_path: Path, dest_dir: Path) -> Path:
+    """Extract the first CSV file from a ZIP archive, then delete the ZIP.
 
-    try:
-        resp = requests.get(url, timeout=30)
-        if resp.status_code != 200:
-            raise requests.HTTPError(f"HTTP {resp.status_code}")
-    except requests.RequestException as exc:
-        _log.error("Failed to fetch data dictionary from %s: %s", url, exc)
-        raise RuntimeError("Failed to fetch data dictionary") from exc
+    Args:
+        zip_path: Path to the ZIP file.
+        dest_dir: Directory where the CSV should be placed.
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    table = soup.find("table")
+    Returns:
+        Path to the extracted CSV file.
 
-    lines = ["# COGCC Production Data Dictionary\n",
-             "| Column Name | Description |\n",
-             "|-------------|-------------|\n"]
-
-    if table:
-        for row in table.find_all("tr"):
-            cols = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-            if len(cols) >= 2:
-                lines.append(f"| {cols[0]} | {cols[1]} |\n")
-
-    with out_path.open("w", encoding="utf-8") as fh:
-        fh.writelines(lines)
-
-    _log.info("Data dictionary written to %s", out_path)
-    return out_path
-
-
-# ---------------------------------------------------------------------------
-# Annual zip downloader
-# ---------------------------------------------------------------------------
-
-def download_annual_zip(year: int, cfg: dict) -> Path | None:
-    """Download and extract annual production zip for *year*.
-
-    Returns path to extracted CSV, or None on failure.
+    Raises:
+        ValueError: If the ZIP contains no CSV files.
+        zipfile.BadZipFile: If the ZIP is corrupted.
     """
-    raw_dir = Path(cfg["raw_dir"])
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csv_names:
+            raise ValueError(f"No CSV file found in ZIP: {zip_path.name}")
+        csv_name = csv_names[0]
+        zf.extract(csv_name, dest_dir)
+        extracted = dest_dir / csv_name
 
-    csv_path = raw_dir / f"{year}_prod_reports.csv"
-    if csv_path.exists() and csv_path.stat().st_size > 0:
-        _log.info("Skip (exists): %s", csv_path)
-        return csv_path
-
-    zip_url = f"{cfg['base_url']}/{year}_prod_reports.zip"
-    zip_path = raw_dir / f"{year}_prod_reports.zip"
-
-    success = download_with_retry(zip_url, zip_path, cfg)
-    if not success:
-        _log.error("Failed to download zip for year %d", year)
-        return None
-
-    time.sleep(float(cfg.get("sleep_seconds", 0.5)))
-
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            csv_member = _find_csv_member(zf, year)
-            zf.extract(csv_member, raw_dir)
-            extracted = raw_dir / csv_member
-            if extracted != csv_path:
-                extracted.rename(csv_path)
-        _log.info("Extracted CSV for year %d → %s", year, csv_path)
-    except (zipfile.BadZipFile, ValueError) as exc:
-        _log.error("Zip extraction failed for year %d: %s", year, exc)
-        return None
-    finally:
-        if zip_path.exists():
-            zip_path.unlink(missing_ok=True)
-
-    return csv_path
-
-
-def _find_csv_member(zf: zipfile.ZipFile, year: int) -> str:
-    """Return the name of the CSV member matching *prod_reports* (case-insensitive)."""
-    matches = [
-        m for m in zf.namelist()
-        if m.lower().endswith(".csv") and "prod_reports" in m.lower()
-    ]
-    if not matches:
-        raise ValueError(f"No CSV found in zip for {year}")
-    return matches[0]
+    zip_path.unlink()
+    logger.info("Extracted %s from %s", extracted, zip_path.name)
+    return extracted
 
 
 # ---------------------------------------------------------------------------
-# Monthly CSV downloader (current year)
+# A-07: Download manifest writer
 # ---------------------------------------------------------------------------
 
-def download_monthly_csv(cfg: dict) -> Path | None:
-    """Download the live monthly production CSV (always re-downloaded)."""
-    raw_dir = Path(cfg["raw_dir"])
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    dest = raw_dir / "monthly_prod.csv"
+def update_manifest(manifest_path: Path, entry: dict) -> None:
+    """Read the manifest JSON, upsert entry by filename, and write back.
 
-    # Force re-download by temporarily removing the file
-    if dest.exists():
-        dest.unlink()
+    Args:
+        manifest_path: Path to the JSON manifest file.
+        entry: Dict containing url, filename, size_bytes, download_timestamp, md5_checksum.
+    """
+    manifest: dict = {}
+    if manifest_path.exists():
+        try:
+            with manifest_path.open() as f:
+                manifest = json.load(f)
+        except json.JSONDecodeError:
+            logger.warning("Corrupt manifest at %s — overwriting.", manifest_path)
+            manifest = {}
 
-    success = download_with_retry(cfg["monthly_url"], dest, cfg)
-    if not success:
-        _log.error("Failed to download monthly CSV")
-        return None
-
-    time.sleep(float(cfg.get("sleep_seconds", 0.5)))
-    return dest
+    manifest[entry["filename"]] = entry
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w") as f:
+        json.dump(manifest, f, indent=2)
+    logger.debug("Manifest updated: %s", manifest_path)
 
 
 # ---------------------------------------------------------------------------
-# Parallel orchestrator
+# A-08: Per-year acquire worker
 # ---------------------------------------------------------------------------
 
-def run_acquire(config_path: str = "config.yaml") -> list[Path]:
-    """Download all ECMC production files in parallel. Returns list of CSV paths."""
-    cfg = load_config(config_path)
-    acq = cfg["acquire"]
+def acquire_year(year: int, config: dict) -> dict:
+    """Acquire production data for a single calendar year.
 
-    raw_dir = Path(acq["raw_dir"])
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    Skips download if the target CSV already exists (idempotent).
 
-    # Fetch data dictionary first (sequential, once)
-    try:
-        fetch_data_dictionary(acq)
-    except RuntimeError as exc:
-        _log.warning("Data dictionary fetch failed: %s — continuing", exc)
+    Args:
+        year: The year to acquire.
+        config: Full config dict.
 
-    current_year = datetime.now().year
-    historical_years = list(range(int(acq["start_year"]), current_year))
-    max_workers = int(acq.get("max_workers", 5))
+    Returns:
+        Manifest entry dict.
+    """
+    current_year = datetime.now(tz=timezone.utc).year
+    acfg = config["acquire"]
+    raw_dir = Path(acfg["raw_dir"])
+    manifest_path = raw_dir / "download_manifest.json"
 
-    results: list[Path] = []
+    if year == current_year:
+        url: str = acfg["monthly_url"]
+        dest_csv = raw_dir / "monthly_prod.csv"
+    else:
+        url = acfg["zip_url_template"].format(year=year)
+        dest_csv = raw_dir / f"{year}_prod_reports.csv"
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(download_annual_zip, yr, acq): yr
-            for yr in historical_years
+    filename = dest_csv.name
+
+    if dest_csv.exists():
+        logger.info("Skipping %s, already exists", filename)
+        return {
+            "url": url,
+            "filename": filename,
+            "size_bytes": dest_csv.stat().st_size,
+            "download_timestamp": None,
+            "md5_checksum": None,
+            "skipped": True,
         }
-        futures[pool.submit(download_monthly_csv, acq)] = current_year
 
-        for fut in as_completed(futures):
-            yr = futures[fut]
-            try:
-                path = fut.result()
-                if path is not None:
-                    results.append(path)
-                    _log.info("Acquired: %s (year %s)", path, yr)
-                else:
-                    _log.warning("Acquire returned None for year %s", yr)
-            except Exception as exc:  # noqa: BLE001
-                _log.error("Acquire failed for year %s: %s", yr, exc)
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
-    _log.info("Acquire complete: %d/%d files acquired",
-              len(results), len(historical_years) + 1)
-    return results
+    try:
+        if year == current_year:
+            download_file(
+                url, dest_csv,
+                acfg["retry_max_attempts"],
+                acfg["retry_backoff_factor"],
+            )
+        else:
+            zip_dest = raw_dir / f"{year}_prod_reports.zip"
+            download_file(
+                url, zip_dest,
+                acfg["retry_max_attempts"],
+                acfg["retry_backoff_factor"],
+            )
+            dest_csv = extract_csv_from_zip(zip_dest, raw_dir)
+            filename = dest_csv.name
+    except Exception:
+        logger.exception("Failed to acquire year %d", year)
+        raise
+
+    md5 = compute_md5(dest_csv)
+    entry = {
+        "url": url,
+        "filename": filename,
+        "size_bytes": dest_csv.stat().st_size,
+        "download_timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "md5_checksum": md5,
+        "skipped": False,
+    }
+    update_manifest(manifest_path, entry)
+    time.sleep(0.5)
+    return entry
 
 
-if __name__ == "__main__":
-    run_acquire()
+# ---------------------------------------------------------------------------
+# A-09: Acquire stage runner
+# ---------------------------------------------------------------------------
+
+def run_acquire(config: dict) -> list[dict]:
+    """Run the acquire stage for all years from year_start to current year.
+
+    Uses Dask threaded scheduler for parallel downloads.
+
+    Args:
+        config: Full config dict.
+
+    Returns:
+        List of manifest entry dicts (one per year).
+    """
+    acfg = config["acquire"]
+    current_year = datetime.now(tz=timezone.utc).year
+    years = list(range(acfg["year_start"], current_year + 1))
+    max_workers = min(int(acfg["max_workers"]), 5)
+
+    raw_dir = Path(acfg["raw_dir"])
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    delayed_tasks = [dask.delayed(acquire_year)(yr, config) for yr in years]
+
+    logger.info("Acquiring %d year(s): %s … %s", len(years), years[0], years[-1])
+    results_tuple = dask.compute(
+        *delayed_tasks,
+        scheduler="threads",
+        num_workers=max_workers,
+    )
+
+    entries: list[dict] = []
+    failed: list[int] = []
+    skipped = 0
+    downloaded = 0
+
+    for yr, result in zip(years, results_tuple):
+        if isinstance(result, Exception):
+            logger.error("Year %d failed: %s", yr, result)
+            failed.append(yr)
+        else:
+            entries.append(result)
+            if result.get("skipped"):
+                skipped += 1
+            else:
+                downloaded += 1
+
+    logger.info(
+        "Acquire complete: %d attempted, %d downloaded, %d skipped, %d failed",
+        len(years), downloaded, skipped, len(failed),
+    )
+    return entries

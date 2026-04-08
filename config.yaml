@@ -1,25 +1,36 @@
 acquire:
-  base_url: "https://ecmc.state.co.us/documents/data/downloads/production"
-  data_dict_url: "https://ecmc.state.co.us/documents/data/downloads/production/production_record_data_dictionary.htm"
-  monthly_url: "https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv"
-  start_year: 2020
-  raw_dir: "data/raw"
-  references_dir: "references"
+  year_start: 2020
   max_workers: 5
-  sleep_seconds: 0.5
-  retry_attempts: 3
-  retry_backoff_base: 1
+  retry_max_attempts: 3
+  retry_backoff_factor: 1.0
+  zip_url_template: "https://ecmc.state.co.us/documents/data/downloads/production/{year}_prod_reports.zip"
+  monthly_url: "https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv"
+  raw_dir: "data/raw"
 
 ingest:
   raw_dir: "data/raw"
   interim_dir: "data/interim"
-  target_start_year: 2020
-  chunk_size: 100000
+  year_start: 2020
 
 transform:
   interim_dir: "data/interim"
   processed_dir: "data/processed"
+  date_start: "2020-01-01"
 
 features:
+  interim_dir: "data/interim"
   processed_dir: "data/processed"
-  output_dir: "data/processed/features"
+  rolling_windows: [3, 6]
+  decline_rate_clip_min: -1.0
+  decline_rate_clip_max: 10.0
+
+dask:
+  scheduler: "local"
+  n_workers: 2
+  threads_per_worker: 2
+  memory_limit: "3GB"
+  dashboard_port: 8787
+
+logging:
+  log_file: "logs/pipeline.log"
+  level: "INFO"

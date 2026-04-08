@@ -3,19 +3,18 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cogcc-pipeline"
+name = "cogcc_pipeline"
 version = "0.1.0"
+description = "COGCC oil and gas production data pipeline"
 requires-python = ">=3.11"
 dependencies = [
-    "pandas",
-    "pyarrow",
-    "dask[dataframe]",
     "requests",
-    "tqdm",
-    "scikit-learn",
+    "pandas>=2.0",
+    "pyarrow",
+    "dask[distributed]",
+    "bokeh",
     "pyyaml",
-    "beautifulsoup4",
-    "lxml",
+    "scikit-learn",
     "numpy",
 ]
 
@@ -23,27 +22,36 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-mock",
-    "ruff",
     "mypy",
+    "ruff",
     "pandas-stubs",
     "types-requests",
 ]
 
+[project.scripts]
+cogcc-pipeline = "cogcc_pipeline.pipeline:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-markers = [
-    "unit: fast unit tests with mocks",
-    "integration: tests that require real data or network",
-]
+include = ["cogcc_pipeline*"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
 [tool.mypy]
 python_version = "3.11"
-ignore_missing_imports = true
 warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: unit tests (no external dependencies)",
+    "integration: integration tests (require data files or network)",
+]
+testpaths = ["tests"]

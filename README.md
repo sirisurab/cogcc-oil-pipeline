@@ -1,58 +1,78 @@
 # COGCC Oil & Gas Production Data Pipeline
 
-A Python data pipeline for downloading, ingesting, cleaning, and engineering ML-ready features
-from Colorado ECMC (Energy and Carbon Management Commission) oil and gas production data.
+End-to-end data pipeline for Colorado Oil and Gas Conservation Commission (COGCC / ECMC) production data. Stages: **acquire → ingest → transform → features**.
+
+## Quick Start
+
+```bash
+# Create virtualenv and install
+make env
+source .venv/bin/activate
+make install
+
+# Run full pipeline
+make pipeline
+
+# Run individual stages
+make acquire
+make ingest
+make transform
+make features
+
+# Tests, lint, type-check
+make test
+make lint
+make typecheck
+```
 
 ## Pipeline Stages
 
 | Stage | Module | Description |
 |-------|--------|-------------|
-| Acquire | `cogcc_pipeline/acquire.py` | Download ECMC production CSVs/zips for 2020–present |
-| Ingest | `cogcc_pipeline/ingest.py` | Load raw CSVs → interim Parquet via Dask |
-| Transform | `cogcc_pipeline/transform.py` | Clean, enrich, validate → processed Parquet |
-| Features | `cogcc_pipeline/features.py` | Engineer ML features → features Parquet |
-
-## Setup
-
-```bash
-make env        # Create .venv
-make install    # Install dependencies
-```
-
-## Running the Pipeline
-
-```bash
-make acquire    # Download raw data
-make ingest     # Ingest to interim Parquet
-make transform  # Clean and enrich
-make features   # Engineer ML features
-```
-
-## Testing
-
-```bash
-make test       # Run all unit tests
-pytest tests/ -v -m unit          # Unit tests only
-pytest tests/ -v -m integration   # Integration tests (requires data)
-```
+| Acquire | `cogcc_pipeline/acquire.py` | Download annual ZIP / monthly CSV files from ECMC |
+| Ingest | `cogcc_pipeline/ingest.py` | Read CSVs, validate schema, write `data/interim/cogcc_raw.parquet` |
+| Transform | `cogcc_pipeline/transform.py` | Clean, deduplicate, flag, and index production data |
+| Features | `cogcc_pipeline/features.py` | Engineer ML-ready features, encode categoricals |
 
 ## Configuration
 
-All pipeline parameters are in `config.yaml`:
-- `acquire.base_url` — ECMC data download base URL
-- `acquire.start_year` — First year to download (default 2020)
-- `acquire.max_workers` — Parallel download workers (default 5)
-- `ingest.target_start_year` — Filter rows before this year
-- `features.rolling_windows` — Month windows for rolling averages
+All settings in `config.yaml`. Key sections:
 
-## Data Directory Structure
+- `acquire` — URLs, year range, retry settings, worker count
+- `ingest` — raw/interim directories, year filter
+- `transform` — interim/processed directories, date filter
+- `features` — rolling windows, decline rate clip bounds
+- `dask` — LocalCluster settings
+- `logging` — log level and file path
+
+## Output Files
+
+| File | Description |
+|------|-------------|
+| `data/raw/*.csv` | Raw production CSVs |
+| `data/raw/download_manifest.json` | Download metadata |
+| `data/interim/cogcc_raw.parquet` | Ingested, year-filtered data |
+| `data/interim/cogcc_cleaned.parquet` | Cleaned, indexed by well_id |
+| `data/interim/cleaning_report.json` | Cleaning statistics |
+| `data/processed/cogcc_features.parquet` | Full feature dataset |
+| `data/processed/encoder_mappings.json` | Label encoder mappings |
+| `data/processed/pipeline_run_report.json` | Run report with timings |
+
+## Project Structure
 
 ```
-data/
-├── raw/          ← Downloaded CSVs (acquire stage)
-├── interim/      ← Raw Parquet (ingest stage)
-├── processed/    ← Cleaned Parquet (transform stage)
-│   └── features/ ← ML-ready Parquet (features stage)
-references/
-└── production-data-dictionary.md
+cogcc_pipeline/
+  acquire.py      — download, MD5, retry, manifest
+  ingest.py       — dtype map, CSV reader, Dask ingestion
+  transform.py    — cleaning, dedup, flags, set_index
+  features.py     — rolling, cumulative, ratios, encoders
+  pipeline.py     — orchestrator, CLI (cogcc-pipeline)
+tests/
+  conftest.py
+  test_acquire.py
+  test_ingest.py
+  test_transform.py
+  test_features.py
+  test_pipeline.py
+config.yaml
 ```

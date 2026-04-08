@@ -1,16 +1,17 @@
-pandas
-pyarrow
-dask[dataframe]
+# Runtime dependencies
 requests
-tqdm
-scikit-learn
+pandas>=2.0
+pyarrow
+dask[distributed]
+bokeh
 pyyaml
-beautifulsoup4
-lxml
+scikit-learn
 numpy
+
+# Dev / test dependencies
 pytest
 pytest-mock
-ruff
 mypy
+ruff
 pandas-stubs
 types-requests

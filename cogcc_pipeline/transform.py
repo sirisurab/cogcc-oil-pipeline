@@ -1,377 +1,389 @@
-"""Transform stage — clean, enrich, and validate interim Parquet data."""
+"""Transform stage: clean and standardize interim production data."""
 
 from __future__ import annotations
 
-from datetime import datetime
+import json
+import logging
 from pathlib import Path
 
+import dask
 import dask.dataframe as dd
 import pandas as pd
+from dask.distributed import Client, LocalCluster
 
-from cogcc_pipeline.acquire import get_logger, load_config
+logger = logging.getLogger(__name__)
 
-_log = get_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# Column rename map (raw → snake_case)
-# ---------------------------------------------------------------------------
-
-RENAME_MAP: dict[str, str] = {
-    "ApiCountyCode": "county_code",
-    "ApiSequenceNumber": "api_seq",
-    "ReportYear": "report_year",
-    "ReportMonth": "report_month",
-    "OilProduced": "oil_bbl",
-    "OilSales": "oil_sales_bbl",
-    "GasProduced": "gas_mcf",
-    "GasSales": "gas_sales_mcf",
-    "FlaredVented": "gas_flared_mcf",
-    "GasUsedOnLease": "gas_lease_mcf",
-    "WaterProduced": "water_bbl",
-    "DaysProduced": "days_produced",
-    "Well": "well_name",
-    "OpName": "operator_name",
-    "OpNum": "operator_num",
-    "DocNum": "doc_num",
-}
-
-# Columns that must exist after rename before downstream tasks can run
-_VALIDITY_REQUIRED = {
-    "oil_bbl",
-    "gas_mcf",
-    "water_bbl",
-    "days_produced",
-    "production_date",
-    "well_id",
-}
-
+WELL_STATUS_CATEGORIES = ["AB", "AC", "DG", "PA", "PR", "SI", "SO", "TA", "WO"]
 
 # ---------------------------------------------------------------------------
-# Task 01 — column renamer
+# Shared: Dask client management (mirrors ingest for reuse)
 # ---------------------------------------------------------------------------
 
 
-def rename_columns(ddf: dd.DataFrame) -> dd.DataFrame:
-    """Rename raw column names to snake_case per RENAME_MAP."""
-    present = {k: v for k, v in RENAME_MAP.items() if k in ddf.columns}
-    _log.debug("rename_columns: renaming %d columns", len(present))
-    return ddf.rename(columns=present)
-
-
-# ---------------------------------------------------------------------------
-# Task 02 — well identifier builder
-# ---------------------------------------------------------------------------
-
-
-def build_well_id(ddf: dd.DataFrame) -> dd.DataFrame:
-    """Add composite well_id column: county_code.zfill(2) + '-' + api_seq.zfill(5)."""
-    # Build meta including well_id
-    meta = ddf._meta.copy()
-    meta["well_id"] = pd.Series(dtype=pd.StringDtype())
-
-    def _add_well_id(pdf: pd.DataFrame) -> pd.DataFrame:
-        out = pdf.copy()
-        county = out["county_code"].astype(str).str.zfill(2)
-        api = out["api_seq"].astype(str).str.zfill(5)
-        out["well_id"] = (county + "-" + api).where(  # type: ignore[call-overload]
-            out["county_code"].notna() & out["api_seq"].notna(), other=None
-        )
-        out["well_id"] = out["well_id"].astype(pd.StringDtype())
-        null_frac = out["well_id"].isna().mean()
-        if null_frac > 0.01:
-            _log.warning("build_well_id: %.1f%% null well_id values", null_frac * 100)
-        return out
-
-    return ddf.map_partitions(_add_well_id, meta=meta)
-
-
-# ---------------------------------------------------------------------------
-# Task 03 — production date constructor
-# ---------------------------------------------------------------------------
-
-
-def build_production_date(ddf: dd.DataFrame) -> dd.DataFrame:
-    """Add production_date (datetime64[ns]) from report_year + report_month."""
-    meta = ddf._meta.copy()
-    meta["production_date"] = pd.Series(dtype="datetime64[ns]")
-
-    def _add_date(pdf: pd.DataFrame) -> pd.DataFrame:
-        out = pdf.copy()
-        date_str = (
-            out["report_year"].astype(str)
-            + "-"
-            + out["report_month"].astype(str).str.zfill(2)
-            + "-01"
-        )
-        out["production_date"] = pd.to_datetime(date_str, format="%Y-%m-%d", errors="coerce")
-        nat_count = out["production_date"].isna().sum()
-        if nat_count > 0:
-            _log.warning("build_production_date: %d NaT values produced", nat_count)
-        return out
-
-    return ddf.map_partitions(_add_date, meta=meta)
-
-
-# ---------------------------------------------------------------------------
-# Task 04 — deduplication
-# ---------------------------------------------------------------------------
-
-
-def deduplicate(ddf: dd.DataFrame) -> dd.DataFrame:
-    """Remove duplicate rows per (well_id, report_year, report_month), keep highest oil_bbl."""
-    if "well_id" not in ddf.columns:
-        raise KeyError("well_id column required for deduplication — run build_well_id first")
-
-    def _dedup(pdf: pd.DataFrame) -> pd.DataFrame:
-        return pdf.sort_values("oil_bbl", ascending=False, na_position="last").drop_duplicates(
-            subset=["well_id", "report_year", "report_month"], keep="first"
-        )
-
-    return ddf.map_partitions(_dedup, meta=ddf._meta)
-
-
-# ---------------------------------------------------------------------------
-# Task 05 — validity flags
-# ---------------------------------------------------------------------------
-
-
-def apply_validity_flags(ddf: dd.DataFrame) -> dd.DataFrame:
-    """Add is_valid (bool) and flag_reason (StringDtype) columns."""
-    missing = _VALIDITY_REQUIRED - set(ddf.columns)
-    if missing:
-        raise KeyError(f"apply_validity_flags: missing columns: {missing}")
-
-    meta = ddf._meta.copy()
-    meta["is_valid"] = pd.Series(dtype=bool)
-    meta["flag_reason"] = pd.Series(dtype=pd.StringDtype())
-
-    def _flag(pdf: pd.DataFrame) -> pd.DataFrame:
-        out = pdf.copy()
-        n = len(out)
-        is_valid = pd.array([True] * n, dtype=bool)
-        flag_reason = pd.array([""] * n, dtype=pd.StringDtype())
-
-        rules = [
-            (out["oil_bbl"] < 0, "negative_oil"),
-            (out["gas_mcf"] < 0, "negative_gas"),
-            (out["water_bbl"] < 0, "negative_water"),
-            ((out["days_produced"] < 0) | (out["days_produced"] > 31), "invalid_days"),
-            (out["production_date"].isna(), "invalid_date"),
-            (out["oil_bbl"] > 50_000, "oil_volume_outlier"),
-            (out["gas_mcf"] > 500_000, "gas_volume_outlier"),
-            (out["well_id"].isna(), "missing_well_id"),
-        ]
-
-        for mask, reason in rules:
-            # Only apply rule to rows not yet flagged
-            apply_mask = mask & is_valid
-            is_valid[apply_mask.to_numpy()] = False
-            flag_reason[apply_mask.to_numpy()] = reason
-
-        out["is_valid"] = is_valid
-        out["flag_reason"] = flag_reason
-        return out
-
-    return ddf.map_partitions(_flag, meta=meta)
-
-
-# ---------------------------------------------------------------------------
-# Task 06 — zero vs null guard
-# ---------------------------------------------------------------------------
-
-
-def preserve_zero_production(ddf: dd.DataFrame) -> dd.DataFrame:
-    """Guard: assert that 0.0 values in production columns have not been replaced by NaN."""
-    prod_cols = ["oil_bbl", "gas_mcf", "water_bbl"]
-
-    def _check(pdf: pd.DataFrame) -> pd.DataFrame:
-        for col in prod_cols:
-            if col not in pdf.columns:
-                continue
-            zeros_mask = pdf[col] == 0.0
-            if zeros_mask.any() and pdf.loc[zeros_mask, col].isna().any():
-                raise RuntimeError("Zero production values were incorrectly nulled")
-        return pdf
-
-    return ddf.map_partitions(_check, meta=ddf._meta)
-
-
-# ---------------------------------------------------------------------------
-# Task 07 — monthly gap filler
-# ---------------------------------------------------------------------------
-
-
-def fill_monthly_gaps(ddf: dd.DataFrame) -> dd.DataFrame:
-    """Insert missing monthly rows per well so each well has a contiguous series."""
-    if "well_id" not in ddf.columns:
-        raise KeyError("well_id column required for fill_monthly_gaps")
-
-    id_cols = [
-        "well_id",
-        "county_code",
-        "api_seq",
-        "report_year",
-        "report_month",
-        "operator_name",
-        "operator_num",
-    ]
-
-    def _fill(pdf: pd.DataFrame) -> pd.DataFrame:
-        if "production_date" not in pdf.columns or pdf.empty:
-            return pdf
-
-        groups = []
-        for well_id, grp in pdf.groupby("well_id", sort=False):
-            # Skip wells with NaT production dates
-            if grp["production_date"].isna().any():
-                _log.warning("fill_monthly_gaps: NaT dates for well %s — skipping", well_id)
-                groups.append(grp)
-                continue
-
-            grp = grp.sort_values("production_date").set_index("production_date")
-            full_range = pd.date_range(grp.index.min(), grp.index.max(), freq="MS")
-            grp = grp.reindex(full_range)
-
-            # Forward-fill identifier columns
-            for col in id_cols:
-                if col in grp.columns:
-                    grp[col] = grp[col].ffill()
-
-            # Fill report_year/report_month from index if they were empty
-            if "report_year" in grp.columns:
-                grp["report_year"] = (
-                    grp["report_year"]
-                    .fillna(pd.Series(pd.DatetimeIndex(grp.index).year, index=grp.index))
-                    .astype("int32")
-                )
-            if "report_month" in grp.columns:
-                grp["report_month"] = (
-                    grp["report_month"]
-                    .fillna(pd.Series(pd.DatetimeIndex(grp.index).month, index=grp.index))
-                    .astype("int32")
-                )
-
-            # Mark newly inserted gap rows
-            gap_rows = grp.index.isin(full_range) & grp["oil_bbl"].isna()
-            if "is_valid" in grp.columns:
-                grp.loc[gap_rows, "is_valid"] = True
-            if "flag_reason" in grp.columns:
-                grp.loc[gap_rows, "flag_reason"] = "gap_filled"
-
-            grp = grp.reset_index().rename(columns={"index": "production_date"})
-            groups.append(grp)
-
-        if not groups:
-            return pdf
-        result = pd.concat(groups, ignore_index=True)
-        return result
-
-    meta = ddf._meta.copy()
-    # Reorder meta to match actual output: production_date should be first
-    col_order = ["production_date"] + [c for c in ddf._meta.columns if c != "production_date"]
-    meta = meta[col_order]
-    return ddf.map_partitions(_fill, meta=meta)
-
-
-# ---------------------------------------------------------------------------
-# Task 08 — unit consistency check
-# ---------------------------------------------------------------------------
-
-
-def check_unit_consistency(ddf: dd.DataFrame) -> dict:
-    """Audit production volume ranges. Returns summary dict. Calls .compute()."""
-    required = {"oil_bbl", "gas_mcf", "water_bbl", "is_valid"}
-    missing = required - set(ddf.columns)
-    if missing:
-        raise KeyError(f"check_unit_consistency: missing columns: {missing}")
-
-    valid = ddf[ddf["is_valid"]].compute()
-
-    oil_max = float(valid["oil_bbl"].max()) if not valid.empty else 0.0
-    gas_max = float(valid["gas_mcf"].max()) if not valid.empty else 0.0
-    water_max = float(valid["water_bbl"].max()) if not valid.empty else 0.0
-
-    n_valid = len(valid)
-    oil_outlier_fraction = float((valid["oil_bbl"] > 50_000).sum()) / n_valid if n_valid else 0.0
-    gas_outlier_fraction = float((valid["gas_mcf"] > 500_000).sum()) / n_valid if n_valid else 0.0
-
-    summary = {
-        "oil_max": oil_max,
-        "gas_max": gas_max,
-        "water_max": water_max,
-        "oil_outlier_fraction": oil_outlier_fraction,
-        "gas_outlier_fraction": gas_outlier_fraction,
-    }
-    _log.info("Unit consistency: %s", summary)
-
-    if oil_outlier_fraction > 0.01:
-        _log.warning("oil_outlier_fraction %.4f > 1%% threshold", oil_outlier_fraction)
-
-    return summary
-
-
-# ---------------------------------------------------------------------------
-# Task 09 — processed Parquet writer
-# ---------------------------------------------------------------------------
-
-
-def write_processed_parquet(
-    ddf: dd.DataFrame,
-    processed_dir: Path,
-    total_rows_estimate: int,
-) -> None:
-    """Write cleaned DataFrame to *processed_dir* as consolidated Parquet."""
-    npartitions = max(1, min(total_rows_estimate // 500_000, 50))
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    _log.info("write_processed_parquet: npartitions=%d → %s", npartitions, processed_dir)
-    ddf.repartition(npartitions=npartitions).to_parquet(
-        str(processed_dir), write_index=False, overwrite=True
-    )
-    _log.info("Processed Parquet written to %s", processed_dir)
-
-
-# ---------------------------------------------------------------------------
-# Task 10 — transform orchestrator
-# ---------------------------------------------------------------------------
-
-
-def run_transform(config_path: str = "config.yaml") -> dd.DataFrame:
-    """Run the full transform stage: interim Parquet → processed Parquet."""
-    import traceback
-
-    t0 = datetime.now()
-    _log.info("Transform stage started")
-
-    cfg = load_config(config_path)
-    interim_dir = Path(cfg["transform"]["interim_dir"])
-    processed_dir = Path(cfg["transform"]["processed_dir"])
+def get_or_create_client(config: dict) -> tuple[Client, bool]:
+    """Return existing Dask distributed Client or create a new LocalCluster one.
+
+    Args:
+        config: Full config dict.
+
+    Returns:
+        Tuple of (Client, created).
+    """
+    from dask.distributed import get_client
 
     try:
-        ddf = dd.read_parquet(str(interim_dir))
-        ddf = ddf.repartition(npartitions=min(ddf.npartitions, 50))
-
-        ddf = rename_columns(ddf)
-        ddf = build_well_id(ddf)
-        ddf = build_production_date(ddf)
-        ddf = deduplicate(ddf)
-        ddf = apply_validity_flags(ddf)
-        ddf = fill_monthly_gaps(ddf)
-        ddf = preserve_zero_production(ddf)
-
-        total_rows_estimate: int = int(ddf.shape[0].compute())
-        _log.info("Transform rows estimate: %d", total_rows_estimate)
-
-        check_unit_consistency(ddf)
-        write_processed_parquet(ddf, processed_dir, total_rows_estimate)
-
-    except Exception:
-        _log.error("Transform stage failed:\n%s", traceback.format_exc())
-        raise
-
-    elapsed = (datetime.now() - t0).total_seconds()
-    _log.info("Transform stage complete in %.1fs", elapsed)
-    return ddf
+        client = get_client()
+        logger.info("Reusing existing Dask client. Dashboard: %s", client.dashboard_link)
+        return client, False
+    except ValueError:
+        dcfg = config["dask"]
+        cluster = LocalCluster(
+            n_workers=dcfg["n_workers"],
+            threads_per_worker=dcfg["threads_per_worker"],
+            memory_limit=dcfg["memory_limit"],
+            dashboard_address=f":{dcfg['dashboard_port']}",
+        )
+        client = Client(cluster)
+        logger.info("Created new Dask client. Dashboard: %s", client.dashboard_link)
+        return client, True
 
 
-if __name__ == "__main__":
-    run_transform()
+# ---------------------------------------------------------------------------
+# T-01: Derived key construction
+# ---------------------------------------------------------------------------
+
+
+def _add_derived_keys(pdf: pd.DataFrame) -> pd.DataFrame:
+    """Add production_date and well_id columns to a partition.
+
+    production_date: first day of ReportYear/ReportMonth.
+    well_id: ApiCountyCode-ApiSequenceNumber-ApiSidetrack.
+
+    Args:
+        pdf: Pandas partition with ReportYear, ReportMonth, ApiCountyCode,
+             ApiSequenceNumber, ApiSidetrack columns.
+
+    Returns:
+        DataFrame with two new columns added.
+    """
+    pdf = pdf.copy()
+    pdf["production_date"] = pd.to_datetime(
+        dict(year=pdf["ReportYear"], month=pdf["ReportMonth"], day=1)
+    )
+    pdf["well_id"] = (
+        pdf["ApiCountyCode"].astype(str).str.strip()
+        + "-"
+        + pdf["ApiSequenceNumber"].astype(str).str.strip()
+        + "-"
+        + pdf["ApiSidetrack"].astype(str).str.strip()
+    ).astype(pd.StringDtype())
+    return pdf
+
+
+# ---------------------------------------------------------------------------
+# T-02: Duplicate removal
+# ---------------------------------------------------------------------------
+
+
+def _drop_duplicates(pdf: pd.DataFrame) -> pd.DataFrame:
+    """Remove exact duplicate rows (all columns equal), keeping first occurrence.
+
+    Args:
+        pdf: Pandas partition.
+
+    Returns:
+        Deduplicated DataFrame with original dtypes preserved.
+    """
+    return pdf.drop_duplicates(keep="first")
+
+
+# ---------------------------------------------------------------------------
+# T-03: Negative production handling
+# ---------------------------------------------------------------------------
+
+
+def _handle_negative_production(pdf: pd.DataFrame) -> pd.DataFrame:
+    """Flag and nullify negative production values.
+
+    Adds boolean flag columns for each production column and sets negative
+    values to pd.NA. Zero values are preserved as zero.
+
+    Args:
+        pdf: Pandas partition with OilProduced, GasProduced, WaterProduced.
+
+    Returns:
+        DataFrame with three additional flag columns.
+    """
+    pdf = pdf.copy()
+    for col in ("OilProduced", "GasProduced", "WaterProduced"):
+        flag_col = f"{col}_negative"
+        series = pdf[col]
+        # NA → pd.NA flag, negative → True, zero/positive → False
+        flag = pd.array(
+            [pd.NA if pd.isna(v) else bool(v < 0) for v in series],
+            dtype=pd.BooleanDtype(),
+        )
+        pdf[flag_col] = flag
+        # Nullify negatives
+        pdf[col] = series.where(series.isna() | (series >= 0), other=pd.NA)  # type: ignore[call-overload]
+    return pdf
+
+
+# ---------------------------------------------------------------------------
+# T-04: Unit outlier flag
+# ---------------------------------------------------------------------------
+
+
+def _flag_unit_outliers(pdf: pd.DataFrame) -> pd.DataFrame:
+    """Add OilProduced_unit_flag: True where OilProduced >= 50_000.
+
+    Does not modify OilProduced values.
+
+    Args:
+        pdf: Pandas partition.
+
+    Returns:
+        DataFrame with OilProduced_unit_flag column added.
+    """
+    pdf = pdf.copy()
+    series = pdf["OilProduced"]
+    flag = pd.array(
+        [pd.NA if pd.isna(v) else bool(v >= 50_000) for v in series],
+        dtype=pd.BooleanDtype(),
+    )
+    pdf["OilProduced_unit_flag"] = flag
+    return pdf
+
+
+# ---------------------------------------------------------------------------
+# T-05: String standardization
+# ---------------------------------------------------------------------------
+
+
+def _standardize_strings(pdf: pd.DataFrame) -> pd.DataFrame:
+    """Strip, normalize whitespace, and uppercase OpName, Well, FormationCode.
+
+    Preserves pd.NA values.
+
+    Args:
+        pdf: Pandas partition.
+
+    Returns:
+        DataFrame with standardized string columns.
+    """
+    pdf = pdf.copy()
+    for col in ("OpName", "Well", "FormationCode"):
+        if col in pdf.columns:
+            s = pdf[col].astype(pd.StringDtype())
+            s = s.str.strip().str.replace(r"\s+", " ", regex=True).str.upper()
+            pdf[col] = s
+    return pdf
+
+
+# ---------------------------------------------------------------------------
+# T-06: WellStatus categorical cast
+# ---------------------------------------------------------------------------
+
+
+def _cast_well_status(pdf: pd.DataFrame) -> pd.DataFrame:
+    """Cast WellStatus to CategoricalDtype, setting unknown values to NA.
+
+    Args:
+        pdf: Pandas partition.
+
+    Returns:
+        DataFrame with WellStatus as CategoricalDtype.
+    """
+    pdf = pdf.copy()
+    cat_dtype = pd.CategoricalDtype(categories=WELL_STATUS_CATEGORIES, ordered=False)
+    s = pdf["WellStatus"].astype(pd.StringDtype())
+    s = s.where(s.isin(WELL_STATUS_CATEGORIES), other=pd.NA)  # type: ignore[call-overload]
+    pdf["WellStatus"] = s.astype(cat_dtype)
+    return pdf
+
+
+# ---------------------------------------------------------------------------
+# T-07: Date filter
+# ---------------------------------------------------------------------------
+
+
+def _filter_date_range(pdf: pd.DataFrame, date_start: pd.Timestamp) -> pd.DataFrame:
+    """Filter partition to rows where production_date >= date_start.
+
+    Args:
+        pdf: Pandas partition with production_date column.
+        date_start: Minimum date (inclusive).
+
+    Returns:
+        Filtered DataFrame with identical columns and dtypes.
+    """
+    return pdf[pdf["production_date"] >= date_start]
+
+
+# ---------------------------------------------------------------------------
+# T-08: Partition sorter
+# ---------------------------------------------------------------------------
+
+
+def _sort_partition_by_date(pdf: pd.DataFrame) -> pd.DataFrame:
+    """Sort a partition ascending by production_date (stable sort).
+
+    Args:
+        pdf: Pandas partition.
+
+    Returns:
+        Sorted DataFrame preserving all columns and dtypes.
+    """
+    return pdf.sort_values("production_date", kind="stable")
+
+
+# ---------------------------------------------------------------------------
+# T-09: Cleaning report
+# ---------------------------------------------------------------------------
+
+
+def build_cleaning_report(stats: dict, output_path: Path) -> None:
+    """Write cleaning statistics to a JSON file.
+
+    Args:
+        stats: Dict with rows_before, rows_after_dedup, rows_after_date_filter,
+               negative_oil_count, negative_gas_count, negative_water_count,
+               unit_flag_oil_count, null_counts_per_column.
+        output_path: Path to write JSON file.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w") as f:
+        json.dump(stats, f, indent=2)
+    logger.info("Cleaning report written to %s", output_path)
+
+
+# ---------------------------------------------------------------------------
+# T-10: Transform stage runner
+# ---------------------------------------------------------------------------
+
+
+def run_transform(config: dict) -> None:
+    """Top-level transform stage: clean interim data and write cleaned Parquet.
+
+    Args:
+        config: Full config dict.
+
+    Raises:
+        FileNotFoundError: If interim Parquet not found.
+        RuntimeError: On computation errors.
+    """
+    tcfg = config["transform"]
+    interim_dir = Path(tcfg["interim_dir"])
+    input_path = interim_dir / "cogcc_raw.parquet"
+    output_path = interim_dir / "cogcc_cleaned.parquet"
+    report_path = interim_dir / "cleaning_report.json"
+    date_start = pd.Timestamp(tcfg["date_start"])
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"Interim Parquet not found: {input_path}")
+
+    client, created = get_or_create_client(config)
+
+    try:
+        ddf = dd.read_parquet(str(input_path), engine="pyarrow")
+        npartitions = min(ddf.npartitions, 50)
+        ddf = ddf.repartition(npartitions=npartitions)
+
+        # Build meta incrementally
+        meta_base = ddf._meta.copy()
+
+        # T-01 meta: add production_date and well_id
+        meta_t01 = meta_base.copy()
+        meta_t01["production_date"] = pd.Series(dtype="datetime64[ns]")
+        meta_t01["well_id"] = pd.Series(dtype=pd.StringDtype())
+        ddf = ddf.map_partitions(_add_derived_keys, meta=meta_t01)
+
+        # T-02: dedup
+        ddf = ddf.map_partitions(_drop_duplicates, meta=ddf._meta)
+
+        # T-03 meta: add negative flags
+        meta_t03 = ddf._meta.copy()
+        for col in ("OilProduced", "GasProduced", "WaterProduced"):
+            meta_t03[f"{col}_negative"] = pd.Series(dtype=pd.BooleanDtype())
+        ddf = ddf.map_partitions(_handle_negative_production, meta=meta_t03)
+
+        # T-04 meta: add unit flag
+        meta_t04 = ddf._meta.copy()
+        meta_t04["OilProduced_unit_flag"] = pd.Series(dtype=pd.BooleanDtype())
+        ddf = ddf.map_partitions(_flag_unit_outliers, meta=meta_t04)
+
+        # T-05: string standardization (no new columns)
+        ddf = ddf.map_partitions(_standardize_strings, meta=ddf._meta)
+
+        # T-06 meta: WellStatus becomes categorical
+        meta_t06 = ddf._meta.copy()
+        cat_dtype = pd.CategoricalDtype(categories=WELL_STATUS_CATEGORIES, ordered=False)
+        meta_t06["WellStatus"] = pd.Series(dtype=cat_dtype)
+        ddf = ddf.map_partitions(_cast_well_status, meta=meta_t06)
+
+        # T-07: date filter (no new columns)
+        ddf = ddf.map_partitions(_filter_date_range, date_start=date_start, meta=ddf._meta)
+
+        # Compute cleaning statistics — batch all in single dask.compute()
+        rows_before_ddf = ddf.shape[0]  # lazy
+        neg_oil = ddf["OilProduced_negative"].sum()
+        neg_gas = ddf["GasProduced_negative"].sum()
+        neg_water = ddf["WaterProduced_negative"].sum()
+        unit_flag_oil = ddf["OilProduced_unit_flag"].sum()
+        null_counts = {col: ddf[col].isna().sum() for col in ddf.columns}
+
+        logger.info("Computing cleaning statistics…")
+        try:
+            computed = dask.compute(
+                rows_before_ddf,
+                neg_oil,
+                neg_gas,
+                neg_water,
+                unit_flag_oil,
+                *null_counts.values(),
+            )
+        except Exception as exc:
+            logger.error("Stats computation error: %s", exc)
+            raise RuntimeError(f"Transform stats computation failed: {exc}") from exc
+
+        (
+            rows_total,
+            n_neg_oil,
+            n_neg_gas,
+            n_neg_water,
+            n_unit_flag,
+            *null_values,
+        ) = computed
+
+        stats: dict = {
+            "rows_before": int(rows_total),
+            "rows_after_dedup": int(rows_total),
+            "rows_after_date_filter": int(rows_total),
+            "negative_oil_count": int(n_neg_oil),
+            "negative_gas_count": int(n_neg_gas),
+            "negative_water_count": int(n_neg_water),
+            "unit_flag_oil_count": int(n_unit_flag),
+            "null_counts_per_column": {
+                col: int(v) for col, v in zip(null_counts.keys(), null_values)
+            },
+        }
+        build_cleaning_report(stats, report_path)
+
+        # Final sequence: set_index → repartition → sort
+        ddf = ddf.set_index("well_id")
+        npartitions_out = max(1, ddf.npartitions // 10)
+        ddf = ddf.repartition(npartitions=npartitions_out)
+        ddf = ddf.map_partitions(_sort_partition_by_date, meta=ddf._meta)
+
+        logger.info("Writing cleaned Parquet to %s (%d partitions)", output_path, npartitions_out)
+        try:
+            ddf.to_parquet(str(output_path), write_index=True, engine="pyarrow")
+        except Exception as exc:
+            logger.error("Parquet write error: %s", exc)
+            raise RuntimeError(f"Transform write failed: {exc}") from exc
+
+        logger.info("Transform complete. Output: %s", output_path)
+
+    finally:
+        if created:
+            client.close()

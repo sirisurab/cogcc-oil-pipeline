@@ -1,11 +1,15 @@
 data/
+logs/
 large_tool_results/
 conversation_history/
 .venv/
 __pycache__/
-*.pyc
 *.egg-info/
+.DS_Store
+*.pyc
+*.pyo
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-*.DS_Store
+dist/
+build/
