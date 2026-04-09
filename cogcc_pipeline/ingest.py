@@ -25,7 +25,7 @@ def build_dtype_map() -> dict[str, Any]:
         Dict mapping column names to pandas dtypes for use in pd.read_csv dtype=.
     """
     return {
-        "DocNum": "int64",
+        "DocNum": pd.Int64Dtype(),
         "ReportMonth": "int64",
         "ReportYear": "int64",
         "DaysProduced": pd.Int64Dtype(),

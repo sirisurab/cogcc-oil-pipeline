@@ -414,7 +414,7 @@ def run_features(config: dict) -> None:
 
     try:
         ddf = dd.read_parquet(str(input_path), engine="pyarrow")
-        npartitions = min(ddf.npartitions, 50)
+        npartitions = max(10, min(ddf.npartitions, 50))
         ddf = ddf.repartition(npartitions=npartitions)
 
         # F-01: Time features meta
@@ -423,13 +423,8 @@ def run_features(config: dict) -> None:
             meta[col] = pd.Series(dtype=pd.Int64Dtype())
         ddf = ddf.map_partitions(_add_time_features, meta=meta)
 
-        # F-02: Rolling features meta
-        meta = ddf._meta.copy()
-        prod_prefix = [("OilProduced", "oil"), ("GasProduced", "gas"), ("WaterProduced", "water")]
-        for w in windows:
-            for _, prefix in prod_prefix:
-                meta[f"{prefix}_roll{w}_mean"] = pd.Series(dtype=pd.Float64Dtype())
-                meta[f"{prefix}_roll{w}_std"] = pd.Series(dtype=pd.Float64Dtype())
+        # F-02: Rolling features meta — derived by calling function on empty meta frame
+        meta = _add_rolling_features(ddf._meta.copy(), windows=windows)
         ddf = ddf.map_partitions(_add_rolling_features, windows=windows, meta=meta)
 
         # F-03: Cumulative features meta
@@ -470,7 +465,7 @@ def run_features(config: dict) -> None:
         processed_dir.mkdir(parents=True, exist_ok=True)
         save_encoder_mappings(mappings, encoder_path)
 
-        npartitions_out = max(1, ddf.npartitions // 10)
+        npartitions_out = max(10, min(ddf.npartitions, 50))
 
         logger.info("Writing feature Parquet to %s (%d partitions)", output_path, npartitions_out)
         try:

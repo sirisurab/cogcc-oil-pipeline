@@ -286,7 +286,7 @@ def run_transform(config: dict) -> None:
 
     try:
         ddf = dd.read_parquet(str(input_path), engine="pyarrow")
-        npartitions = min(ddf.npartitions, 50)
+        npartitions = max(10, min(ddf.npartitions, 50))
         ddf = ddf.repartition(npartitions=npartitions)
 
         # Build meta incrementally
@@ -371,7 +371,7 @@ def run_transform(config: dict) -> None:
 
         # Final sequence: set_index → repartition → sort
         ddf = ddf.set_index("well_id")
-        npartitions_out = max(1, ddf.npartitions // 10)
+        npartitions_out = max(10, min(ddf.npartitions, 50))
         ddf = ddf.repartition(npartitions=npartitions_out)
         ddf = ddf.map_partitions(_sort_partition_by_date, meta=ddf._meta)
 

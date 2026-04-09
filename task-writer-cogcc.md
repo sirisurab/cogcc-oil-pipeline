@@ -3,14 +3,12 @@
 <pre-task-instructions>
 	<instruction>Before writing any task spec, you must establish the exact column names from the
 	raw data. Follow these steps in order:
-	1. Use fetch_url to retrieve the data dictionary page:
-	   https://ecmc.state.co.us/documents/data/downloads/production/production_record_data_dictionary.htm
-	   Extract all column names and descriptions from the HTML table.
-	2. Use write_file to save the dictionary as `references/production-data-dictionary.md`.
-	3. Use fetch_url to retrieve the header row of the monthly CSV:
+	1. Use read_file to read `references/production-data-dictionary.csv` — this is the
+	   authoritative source for column names, descriptions, dtypes, and nullability.
+	2. Use fetch_url to retrieve the header row of the monthly CSV:
 	   https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv
 	   Read the first line only to confirm the exact column names as they appear in the raw files.
-	4. Use these exact column names throughout all task specs.
+	3. Use these exact column names throughout all task specs.
 	   Do not invent or guess column names — the data dictionary and CSV header are authoritative.
 	</instruction>
 </pre-task-instructions>
@@ -42,6 +40,15 @@
 	</constraint>
 </data-filtering>
 
+<data-dictionaries>
+  <file>references/production-data-dictionary.csv</file>
+  <description>Has columns: column, description, dtype, nullable.
+  This is the authoritative dtype source for all ingest, transform, and features
+  task specs. dtype and nullable values must be mapped to pandas types per the
+  rules in task-writer.md &lt;dtypes&gt; section.
+  </description>
+</data-dictionaries>
+
 <context>
 The pipeline package is named `cogcc_pipeline`.
 All test files must be under `tests/`.
@@ -49,5 +56,6 @@ Data files:
     - data/raw/{year}_prod_reports.csv  <- annual production CSVs
     - data/raw/monthly_prod.csv         <- current year monthly
 Reference files in references/:
+    - production-data-dictionary.csv
     - production-data-dictionary.md
 </context>
