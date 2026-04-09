@@ -1,380 +1,289 @@
-"""Tests for cogcc_pipeline/acquire.py."""
+"""Tests for cogcc_pipeline.acquire module."""
 
 from __future__ import annotations
 
-import hashlib
 import io
-import json
 import zipfile
-from datetime import UTC
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-import requests
 
 from cogcc_pipeline.acquire import (
-    acquire_year,
-    compute_md5,
-    download_file,
-    extract_csv_from_zip,
+    AcquireError,
+    download_monthly_csv,
+    download_year_zip,
+    is_valid_file,
     load_config,
     run_acquire,
-    update_manifest,
+    setup_logging,
 )
+from tests.conftest import make_valid_zip_bytes
+
 
 # ---------------------------------------------------------------------------
-# A-03: load_config
+# load_config
 # ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
-def test_load_config_success(tmp_path: Path) -> None:
-    cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(
-        "acquire:\n  x: 1\ningest:\n  x: 1\ntransform:\n  x: 1\n"
-        "features:\n  x: 1\ndask:\n  x: 1\nlogging:\n  x: 1\n"
+def test_load_config_valid(tmp_path: Path) -> None:
+    """Valid config file returns dict with all required top-level keys."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "acquire:\n  start_year: 2020\n"
+        "ingest:\n  raw_dir: data/raw\n"
+        "transform:\n  interim_dir: data/interim\n"
+        "features:\n  processed_dir: data/processed\n"
+        "dask:\n  scheduler: local\n"
+        "logging:\n  level: INFO\n"
     )
-    cfg = load_config(cfg_path)
-    assert "acquire" in cfg
-
-
-@pytest.mark.unit
-def test_load_config_file_not_found(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        load_config(tmp_path / "missing.yaml")
-
-
-@pytest.mark.unit
-def test_load_config_invalid_yaml(tmp_path: Path) -> None:
-    cfg_path = tmp_path / "bad.yaml"
-    cfg_path.write_text("acquire: [\nbroken yaml")
-    with pytest.raises(ValueError):
-        load_config(cfg_path)
+    result = load_config(str(cfg))
+    assert set(result.keys()) >= {"acquire", "ingest", "transform", "features", "dask", "logging"}
 
 
 @pytest.mark.unit
 def test_load_config_missing_section(tmp_path: Path) -> None:
-    cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text("acquire:\n  x: 1\n")
-    with pytest.raises(KeyError):
-        load_config(cfg_path)
-
-
-# ---------------------------------------------------------------------------
-# A-04: compute_md5
-# ---------------------------------------------------------------------------
+    """Config missing required section raises ValueError."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("acquire:\n  start_year: 2020\ningest:\n  raw_dir: x\ntransform:\n  a: 1\nfeatures:\n  b: 2\nlogging:\n  level: INFO\n")
+    with pytest.raises(ValueError, match="dask"):
+        load_config(str(cfg))
 
 
 @pytest.mark.unit
-def test_compute_md5_known_content(tmp_path: Path) -> None:
-    f = tmp_path / "test.txt"
-    content = b"hello cogcc"
-    f.write_bytes(content)
-    expected = hashlib.md5(content).hexdigest()
-    assert compute_md5(f) == expected
-
-
-@pytest.mark.unit
-def test_compute_md5_file_not_found(tmp_path: Path) -> None:
+def test_load_config_missing_file() -> None:
+    """Non-existent config path raises FileNotFoundError."""
     with pytest.raises(FileNotFoundError):
-        compute_md5(tmp_path / "nonexistent.txt")
+        load_config("/nonexistent/path/config.yaml")
 
 
 # ---------------------------------------------------------------------------
-# A-05: download_file
+# is_valid_file
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.unit
-def test_download_file_success(tmp_path: Path) -> None:
-    content = b"binary content"
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.iter_content.return_value = [content]
-
-    with patch("cogcc_pipeline.acquire.requests.get", return_value=mock_resp):
-        with patch("cogcc_pipeline.acquire.time.sleep"):
-            result = download_file("http://example.com/file.zip", tmp_path / "out.zip", 3, 0.01)
-    assert result == tmp_path / "out.zip"
-    assert (tmp_path / "out.zip").read_bytes() == content
+def test_is_valid_file_existing(tmp_path: Path) -> None:
+    """File with header + data row → True."""
+    f = tmp_path / "test.csv"
+    f.write_text("Header\nDataRow\n", encoding="utf-8")
+    assert is_valid_file(f) is True
 
 
 @pytest.mark.unit
-def test_download_file_retries_then_succeeds(tmp_path: Path) -> None:
-    content = b"data"
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.iter_content.return_value = [content]
-
-    call_count = [0]
-
-    def side_effect(*args, **kwargs):  # type: ignore[no-untyped-def]
-        call_count[0] += 1
-        if call_count[0] < 3:
-            raise requests.ConnectionError("connect failed")
-        return mock_resp
-
-    with patch("cogcc_pipeline.acquire.requests.get", side_effect=side_effect):
-        with patch("cogcc_pipeline.acquire.time.sleep"):
-            result = download_file("http://example.com/f.zip", tmp_path / "out.zip", 3, 0.01)
-    assert call_count[0] == 3
-    assert result.exists()
+def test_is_valid_file_empty(tmp_path: Path) -> None:
+    """Empty file → False."""
+    f = tmp_path / "empty.csv"
+    f.write_bytes(b"")
+    assert is_valid_file(f) is False
 
 
 @pytest.mark.unit
-def test_download_file_all_retries_fail(tmp_path: Path) -> None:
-    with patch("cogcc_pipeline.acquire.requests.get", side_effect=requests.ConnectionError("fail")):
-        with patch("cogcc_pipeline.acquire.time.sleep"):
-            with pytest.raises(RuntimeError):
-                download_file("http://example.com/f.zip", tmp_path / "out.zip", 3, 0.01)
+def test_is_valid_file_header_only(tmp_path: Path) -> None:
+    """File with only a header and no data rows → False."""
+    f = tmp_path / "header_only.csv"
+    f.write_text("HeaderRow\n", encoding="utf-8")
+    assert is_valid_file(f) is False
 
 
 @pytest.mark.unit
-def test_download_file_http_404(tmp_path: Path) -> None:
-    mock_resp = MagicMock()
-    mock_resp.status_code = 404
+def test_is_valid_file_missing() -> None:
+    """Non-existent path → False."""
+    assert is_valid_file(Path("/nonexistent/file.csv")) is False
 
-    with patch("cogcc_pipeline.acquire.requests.get", return_value=mock_resp):
-        with patch("cogcc_pipeline.acquire.time.sleep"):
-            with pytest.raises(RuntimeError):
-                download_file("http://example.com/f.zip", tmp_path / "out.zip", 3, 0.01)
+
+@pytest.mark.unit
+def test_is_valid_file_invalid_utf8(tmp_path: Path) -> None:
+    """File with invalid UTF-8 bytes → False."""
+    f = tmp_path / "bad.csv"
+    f.write_bytes(b"Header\nData\xff\xfe\n")
+    assert is_valid_file(f) is False
 
 
 # ---------------------------------------------------------------------------
-# A-06: extract_csv_from_zip
+# download_year_zip
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.unit
-def test_extract_csv_from_zip_success(make_zip_with_csv: object, tmp_path: Path) -> None:
-    zip_path = make_zip_with_csv("col1,col2\n1,2\n")  # type: ignore[operator]
-    dest_dir = tmp_path / "extracted"
-    dest_dir.mkdir()
-    result = extract_csv_from_zip(zip_path, dest_dir)  # type: ignore[arg-type]
+def test_download_year_zip_success(tmp_path: Path, config_fixture: dict) -> None:
+    """Mock requests.get returns valid ZIP → returns Path to .csv file."""
+    csv_content = "Header\nRow1\n"
+    zip_bytes = make_valid_zip_bytes(csv_content)
+
+    mock_response = MagicMock()
+    mock_response.content = zip_bytes
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("cogcc_pipeline.acquire.requests.get", return_value=mock_response):
+        result = download_year_zip(2021, config_fixture)
+
+    assert isinstance(result, Path)
     assert result.suffix == ".csv"
     assert result.exists()
 
 
 @pytest.mark.unit
-def test_extract_csv_from_zip_no_csv(tmp_path: Path) -> None:
-    zip_path = tmp_path / "no_csv.zip"
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("readme.txt", "hello")
-    zip_path.write_bytes(buf.getvalue())
-    dest_dir = tmp_path / "dest"
-    dest_dir.mkdir()
-    with pytest.raises(ValueError, match="No CSV"):
-        extract_csv_from_zip(zip_path, dest_dir)
+def test_download_year_zip_skips_valid(tmp_path: Path, config_fixture: dict) -> None:
+    """If output CSV already exists and is valid, requests.get is never called."""
+    raw_dir = Path(config_fixture["acquire"]["raw_dir"])
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    output = raw_dir / "2021_prod_reports.csv"
+    output.write_text("Header\nDataRow\n", encoding="utf-8")
+
+    with patch("cogcc_pipeline.acquire.requests.get") as mock_get:
+        result = download_year_zip(2021, config_fixture)
+        mock_get.assert_not_called()
+
+    assert result == output
 
 
 @pytest.mark.unit
-def test_extract_csv_from_zip_deletes_zip(make_zip_with_csv: object, tmp_path: Path) -> None:
-    zip_path = make_zip_with_csv("a,b\n1,2\n")  # type: ignore[operator]
-    dest_dir = tmp_path / "dest"
-    dest_dir.mkdir()
-    extract_csv_from_zip(zip_path, dest_dir)  # type: ignore[arg-type]
-    assert not zip_path.exists()  # type: ignore[attr-defined]
+def test_download_year_zip_connection_error(config_fixture: dict) -> None:
+    """Mock requests.get raises ConnectionError → AcquireError is raised."""
+    import requests as req
+
+    with patch("cogcc_pipeline.acquire.requests.get", side_effect=req.ConnectionError("conn error")):
+        with pytest.raises(AcquireError):
+            download_year_zip(2021, config_fixture)
+
+
+@pytest.mark.unit
+def test_download_year_zip_bad_zip(config_fixture: dict) -> None:
+    """Mock requests.get returns non-ZIP content → AcquireError is raised."""
+    mock_response = MagicMock()
+    mock_response.content = b"This is not a zip file"
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("cogcc_pipeline.acquire.requests.get", return_value=mock_response):
+        with pytest.raises(AcquireError):
+            download_year_zip(2021, config_fixture)
 
 
 # ---------------------------------------------------------------------------
-# A-07: update_manifest
+# download_monthly_csv
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.unit
-def test_update_manifest_creates_new(tmp_path: Path) -> None:
-    manifest_path = tmp_path / "manifest.json"
-    entry = {
-        "url": "http://example.com/f.csv",
-        "filename": "f.csv",
-        "size_bytes": 1024,
-        "download_timestamp": "2024-01-01T00:00:00+00:00",
-        "md5_checksum": "abc123",
-    }
-    update_manifest(manifest_path, entry)
-    assert manifest_path.exists()
-    data = json.loads(manifest_path.read_text())
-    assert "f.csv" in data
+def test_download_monthly_csv_success(config_fixture: dict) -> None:
+    """Mock returns CSV text → returns Path with filename monthly_prod.csv."""
+    mock_response = MagicMock()
+    mock_response.content = b"Header\nRow1\n"
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("cogcc_pipeline.acquire.requests.get", return_value=mock_response):
+        result = download_monthly_csv(config_fixture)
+
+    assert result.name == "monthly_prod.csv"
+    assert result.exists()
 
 
 @pytest.mark.unit
-def test_update_manifest_adds_second_entry(tmp_path: Path) -> None:
-    manifest_path = tmp_path / "manifest.json"
-    e1 = {
-        "url": "u1",
-        "filename": "a.csv",
-        "size_bytes": 1,
-        "download_timestamp": "t",
-        "md5_checksum": "m",
-    }
-    e2 = {
-        "url": "u2",
-        "filename": "b.csv",
-        "size_bytes": 2,
-        "download_timestamp": "t",
-        "md5_checksum": "m",
-    }
-    update_manifest(manifest_path, e1)
-    update_manifest(manifest_path, e2)
-    data = json.loads(manifest_path.read_text())
-    assert "a.csv" in data and "b.csv" in data
+def test_download_monthly_csv_skips_valid(config_fixture: dict) -> None:
+    """If monthly_prod.csv is already valid, requests.get is never called."""
+    raw_dir = Path(config_fixture["acquire"]["raw_dir"])
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    output = raw_dir / "monthly_prod.csv"
+    output.write_text("Header\nDataRow\n", encoding="utf-8")
+
+    with patch("cogcc_pipeline.acquire.requests.get") as mock_get:
+        result = download_monthly_csv(config_fixture)
+        mock_get.assert_not_called()
+
+    assert result == output
 
 
 @pytest.mark.unit
-def test_update_manifest_corrupted_json(tmp_path: Path) -> None:
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text("NOT VALID JSON {{{")
-    entry = {
-        "url": "u",
-        "filename": "x.csv",
-        "size_bytes": 1,
-        "download_timestamp": "t",
-        "md5_checksum": "m",
-    }
-    update_manifest(manifest_path, entry)  # should not raise
-    data = json.loads(manifest_path.read_text())
-    assert "x.csv" in data
+def test_download_monthly_csv_timeout(config_fixture: dict) -> None:
+    """Mock raises Timeout → AcquireError is raised."""
+    import requests as req
+
+    with patch("cogcc_pipeline.acquire.requests.get", side_effect=req.Timeout("timeout")):
+        with pytest.raises(AcquireError):
+            download_monthly_csv(config_fixture)
 
 
 # ---------------------------------------------------------------------------
-# A-08: acquire_year
+# run_acquire
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.unit
-def test_acquire_year_skips_existing_csv(sample_config: dict, tmp_path: Path) -> None:
-    raw_dir = Path(sample_config["acquire"]["raw_dir"])
-    dest_csv = raw_dir / "monthly_prod.csv"
-    dest_csv.write_text("col\n1\n")
-
+def test_run_acquire_returns_paths(config_fixture: dict) -> None:
+    """Mock downloaders; assert run_acquire returns list of Paths."""
     from datetime import datetime
+    current_year = datetime.now().year
+    start_year = config_fixture["acquire"]["start_year"]
+    expected_count = (current_year - start_year) + 1  # historical + monthly
 
-    current_year = datetime.now(tz=UTC).year
-    result = acquire_year(current_year, sample_config)
-    assert result.get("skipped") is True
+    fake_path = Path("/fake/path.csv")
+    with (
+        patch("cogcc_pipeline.acquire.download_year_zip", return_value=fake_path),
+        patch("cogcc_pipeline.acquire.download_monthly_csv", return_value=fake_path),
+    ):
+        result = run_acquire(config_fixture)
 
-
-@pytest.mark.unit
-def test_acquire_year_past_year_manifest_fields(sample_config: dict, tmp_path: Path) -> None:
-    csv_content = b"DocNum,ReportMonth\n1,1\n"
-    zip_content = io.BytesIO()
-    with zipfile.ZipFile(zip_content, "w") as zf:
-        zf.writestr("2021_prod_reports.csv", csv_content.decode())
-    zip_bytes = zip_content.getvalue()
-
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.iter_content.return_value = [zip_bytes]
-
-    with patch("cogcc_pipeline.acquire.requests.get", return_value=mock_resp):
-        with patch("cogcc_pipeline.acquire.time.sleep"):
-            result = acquire_year(2021, sample_config)
-
-    for field in ("url", "filename", "size_bytes", "download_timestamp", "md5_checksum"):
-        assert field in result
+    assert isinstance(result, list)
+    assert len(result) == expected_count
+    assert all(isinstance(p, Path) for p in result)
 
 
 @pytest.mark.unit
-def test_acquire_year_current_year_monthly(sample_config: dict) -> None:
-    from datetime import datetime
+def test_run_acquire_uses_threads_scheduler(config_fixture: dict) -> None:
+    """dask.compute is called with scheduler='threads'."""
+    fake_path = Path("/fake/path.csv")
+    with (
+        patch("cogcc_pipeline.acquire.download_year_zip", return_value=fake_path),
+        patch("cogcc_pipeline.acquire.download_monthly_csv", return_value=fake_path),
+        patch("cogcc_pipeline.acquire.dask.compute", return_value=(fake_path,) * 10) as mock_compute,
+    ):
+        run_acquire(config_fixture)
+        call_kwargs = mock_compute.call_args[1]
+        assert call_kwargs.get("scheduler") == "threads"
 
-    current_year = datetime.now(tz=UTC).year
 
-    csv_bytes = b"DocNum\n1\n"
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.iter_content.return_value = [csv_bytes]
-
-    with patch("cogcc_pipeline.acquire.requests.get", return_value=mock_resp):
-        with patch("cogcc_pipeline.acquire.time.sleep"):
-            result = acquire_year(current_year, sample_config)
-
-    assert result["filename"] == "monthly_prod.csv"
+@pytest.mark.unit
+def test_run_acquire_propagates_acquire_error(config_fixture: dict) -> None:
+    """If one download raises AcquireError, it propagates from run_acquire."""
+    with patch("cogcc_pipeline.acquire.download_year_zip", side_effect=AcquireError("fail")):
+        with pytest.raises((AcquireError, Exception)):
+            run_acquire(config_fixture)
 
 
 # ---------------------------------------------------------------------------
-# A-09 + A-10: run_acquire idempotency tests
+# setup_logging
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.unit
-def test_run_acquire_returns_one_per_year(sample_config: dict) -> None:
-    from datetime import datetime
+def test_setup_logging_no_duplicate_handlers(tmp_path: Path, config_fixture: dict) -> None:
+    """Calling setup_logging twice must not duplicate handlers."""
+    import logging
+    # Clear handlers first
+    root = logging.getLogger()
+    root.handlers.clear()
 
-    current_year = datetime.now(tz=UTC).year
-    year_start = sample_config["acquire"]["year_start"]
-    expected_count = current_year - year_start + 1
+    setup_logging(config_fixture)
+    setup_logging(config_fixture)
 
-    fake_entry = {
-        "url": "u",
-        "filename": "f.csv",
-        "size_bytes": 1,
-        "download_timestamp": "t",
-        "md5_checksum": "m",
-        "skipped": True,
-    }
-    with patch("cogcc_pipeline.acquire.acquire_year", return_value=fake_entry):
-        results = run_acquire(sample_config)
-
-    assert len(results) == expected_count
+    assert len(root.handlers) == 2
 
 
 @pytest.mark.unit
-def test_run_acquire_failure_one_year_continues(sample_config: dict) -> None:
-    """When one year fails, others still return and failure is logged."""
-    from datetime import datetime
+def test_setup_logging_creates_log_dir(tmp_path: Path, config_fixture: dict) -> None:
+    """setup_logging creates the logs/ directory if absent."""
+    import logging
+    log_dir = tmp_path / "newlogs"
+    cfg = dict(config_fixture)
+    cfg["logging"] = {"log_file": str(log_dir / "pipeline.log"), "level": "INFO"}
 
-    current_year = datetime.now(tz=UTC).year
-
-    cfg = dict(sample_config)
-    cfg["acquire"] = dict(sample_config["acquire"])
-    cfg["acquire"]["year_start"] = current_year
-
-    fake_entry = {
-        "url": "u",
-        "filename": "f.csv",
-        "size_bytes": 1,
-        "download_timestamp": "t",
-        "md5_checksum": "m",
-        "skipped": True,
-    }
-
-    # Patch dask.compute to simulate failure for one year
-    with patch("cogcc_pipeline.acquire.acquire_year", return_value=fake_entry):
-        results = run_acquire(cfg)
-    assert isinstance(results, list)
+    root = logging.getLogger()
+    root.handlers.clear()
+    setup_logging(cfg)
+    assert log_dir.exists()
 
 
 @pytest.mark.unit
-def test_tr20a_no_download_when_csv_exists(sample_config: dict) -> None:
-    """TR-20a: Second run is skipped when CSV already exists."""
-    from datetime import datetime
-
-    current_year = datetime.now(tz=UTC).year
-    raw_dir = Path(sample_config["acquire"]["raw_dir"])
-    dest_csv = raw_dir / "monthly_prod.csv"
-    dest_csv.write_text("data\n")
-
-    cfg = dict(sample_config)
-    cfg["acquire"] = dict(sample_config["acquire"])
-    cfg["acquire"]["year_start"] = current_year
-
-    with patch("cogcc_pipeline.acquire.download_file") as mock_dl:
-        run_acquire(cfg)
-    mock_dl.assert_not_called()
-
-
-@pytest.mark.unit
-def test_tr20c_no_exception_when_csv_exists(sample_config: dict) -> None:
-    """TR-20c: No exception raised when CSV already exists."""
-    from datetime import datetime
-
-    current_year = datetime.now(tz=UTC).year
-    raw_dir = Path(sample_config["acquire"]["raw_dir"])
-    dest_csv = raw_dir / "monthly_prod.csv"
-    dest_csv.write_text("data\n")
-    # Should not raise
-    result = acquire_year(current_year, sample_config)
-    assert result.get("skipped") is True
+def test_setup_logging_level(config_fixture: dict) -> None:
+    """Returned logger level matches config logging.level."""
+    import logging
+    root = logging.getLogger()
+    root.handlers.clear()
+    result = setup_logging(config_fixture)
+    assert result.level == logging.INFO

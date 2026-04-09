@@ -1,467 +1,520 @@
-"""Tests for cogcc_pipeline/transform.py."""
+"""Tests for cogcc_pipeline.transform module."""
 
 from __future__ import annotations
 
-import json
+import logging
 from pathlib import Path
 
+import dask.dataframe as dd
+import numpy as np
 import pandas as pd
 import pytest
 
 from cogcc_pipeline.transform import (
     WELL_STATUS_CATEGORIES,
-    _add_derived_keys,
+    _build_production_date,
+    _build_well_id,
     _cast_well_status,
-    _drop_duplicates,
-    _filter_date_range,
-    _flag_unit_outliers,
-    _handle_negative_production,
-    _sort_partition_by_date,
-    _standardize_strings,
-    build_cleaning_report,
+    _clean_production_volumes,
+    _deduplicate,
+    _transform_partition,
+    check_data_integrity,
+    check_well_completeness,
 )
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def make_partition(**kwargs) -> pd.DataFrame:  # type: ignore[no-untyped-def]
-    """Helper to build a minimal partition for transform functions."""
-    defaults = {
-        "DocNum": pd.array([1], dtype="int64"),
-        "ReportMonth": pd.array([3], dtype="int64"),
-        "ReportYear": pd.array([2021], dtype="int64"),
-        "DaysProduced": pd.array([31], dtype=pd.Int64Dtype()),
-        "AcceptedDate": pd.to_datetime(["2021-04-01"]),
-        "Revised": pd.array([False], dtype=pd.BooleanDtype()),
-        "OpName": pd.array(["CHEVRON USA"], dtype=pd.StringDtype()),
-        "OpNumber": pd.array([100], dtype=pd.Int64Dtype()),
-        "FacilityId": pd.array([10], dtype=pd.Int64Dtype()),
-        "ApiCountyCode": pd.array(["05"], dtype=pd.StringDtype()),
-        "ApiSequenceNumber": pd.array(["00123"], dtype=pd.StringDtype()),
+
+def _minimal_df(**overrides: object) -> pd.DataFrame:
+    """Return a minimal DataFrame with all required columns for transform tests."""
+    base = {
+        "ApiCountyCode": pd.array(["01"], dtype=pd.StringDtype()),
+        "ApiSequenceNumber": pd.array(["12345"], dtype=pd.StringDtype()),
         "ApiSidetrack": pd.array(["00"], dtype=pd.StringDtype()),
-        "Well": pd.array(["WELL A"], dtype=pd.StringDtype()),
-        "WellStatus": pd.array(["PR"], dtype=pd.StringDtype()),
-        "FormationCode": pd.array(["NIO"], dtype=pd.StringDtype()),
+        "Well": pd.array(["TestWell"], dtype=pd.StringDtype()),
+        "ReportYear": pd.array([2021], dtype="int64"),
+        "ReportMonth": pd.array([6], dtype="int64"),
+        "AcceptedDate": pd.to_datetime(["2021-06-15"]),
+        "DaysProduced": pd.array([28], dtype=pd.Int64Dtype()),
         "OilProduced": pd.array([100.0], dtype=pd.Float64Dtype()),
         "GasProduced": pd.array([500.0], dtype=pd.Float64Dtype()),
-        "WaterProduced": pd.array([50.0], dtype=pd.Float64Dtype()),
-        "OilSales": pd.array([95.0], dtype=pd.Float64Dtype()),
+        "WaterProduced": pd.array([200.0], dtype=pd.Float64Dtype()),
+        "WellStatus": pd.array(["AC"], dtype=pd.StringDtype()),
+        "DocNum": pd.array([1], dtype=pd.Int64Dtype()),
+        "Revised": pd.array([False], dtype=pd.BooleanDtype()),
+        "OpName": pd.array(["Op"], dtype=pd.StringDtype()),
+        "OpNumber": pd.array([100], dtype=pd.Int64Dtype()),
+        "FacilityId": pd.array([200], dtype=pd.Int64Dtype()),
+        "FormationCode": pd.array(["NIOBRARA"], dtype=pd.StringDtype()),
+        "OilSales": pd.array([90.0], dtype=pd.Float64Dtype()),
         "OilAdjustment": pd.array([0.0], dtype=pd.Float64Dtype()),
-        "OilGravity": pd.array([35.0], dtype=pd.Float64Dtype()),
-        "GasSales": pd.array([480.0], dtype=pd.Float64Dtype()),
-        "GasBtuSales": pd.array([480000.0], dtype=pd.Float64Dtype()),
-        "GasUsedOnLease": pd.array([20.0], dtype=pd.Float64Dtype()),
-        "GasShrinkage": pd.array([0.0], dtype=pd.Float64Dtype()),
-        "GasPressureTubing": pd.array([100.0], dtype=pd.Float64Dtype()),
-        "GasPressureCasing": pd.array([95.0], dtype=pd.Float64Dtype()),
+        "OilGravity": pd.array([40.0], dtype=pd.Float64Dtype()),
+        "GasSales": pd.array([450.0], dtype=pd.Float64Dtype()),
+        "GasBtuSales": pd.array([1000.0], dtype=pd.Float64Dtype()),
+        "GasUsedOnLease": pd.array([10.0], dtype=pd.Float64Dtype()),
+        "GasShrinkage": pd.array([5.0], dtype=pd.Float64Dtype()),
+        "GasPressureTubing": pd.array([200.0], dtype=pd.Float64Dtype()),
+        "GasPressureCasing": pd.array([100.0], dtype=pd.Float64Dtype()),
         "WaterPressureTubing": pd.array([50.0], dtype=pd.Float64Dtype()),
-        "WaterPressureCasing": pd.array([45.0], dtype=pd.Float64Dtype()),
-        "FlaredVented": pd.array([0.0], dtype=pd.Float64Dtype()),
-        "BomInvent": pd.array([0.0], dtype=pd.Float64Dtype()),
-        "EomInvent": pd.array([0.0], dtype=pd.Float64Dtype()),
+        "WaterPressureCasing": pd.array([30.0], dtype=pd.Float64Dtype()),
+        "FlaredVented": pd.array([2.0], dtype=pd.Float64Dtype()),
+        "BomInvent": pd.array([10.0], dtype=pd.Float64Dtype()),
+        "EomInvent": pd.array([5.0], dtype=pd.Float64Dtype()),
     }
-    defaults.update(kwargs)
-    return pd.DataFrame(defaults)
+    base.update(overrides)
+    return pd.DataFrame(base)
 
 
 # ---------------------------------------------------------------------------
-# T-01: _add_derived_keys
+# _build_well_id
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_add_derived_keys_production_date() -> None:
-    pdf = make_partition(
-        ReportYear=pd.array([2021], dtype="int64"), ReportMonth=pd.array([3], dtype="int64")
+def test_build_well_id_basic() -> None:
+    """well_id matches '05-{county}-{seq}-{sidetrack}'."""
+    df = _minimal_df()
+    result = _build_well_id(df)
+    assert result.iloc[0] == "05-01-12345-00"
+
+
+@pytest.mark.unit
+def test_build_well_id_null_sidetrack() -> None:
+    """Null ApiSidetrack → '00' sidetrack component."""
+    df = _minimal_df(ApiSidetrack=pd.array([pd.NA], dtype=pd.StringDtype()))
+    result = _build_well_id(df)
+    assert result.iloc[0].endswith("-00")
+
+
+@pytest.mark.unit
+def test_build_well_id_vectorised(tmp_path: Path) -> None:
+    """100-row DataFrame produces same result without a Python loop."""
+    n = 100
+    df = pd.DataFrame(
+        {
+            "ApiCountyCode": pd.array(["01"] * n, dtype=pd.StringDtype()),
+            "ApiSequenceNumber": pd.array([f"{i:05d}" for i in range(n)], dtype=pd.StringDtype()),
+            "ApiSidetrack": pd.array(["00"] * n, dtype=pd.StringDtype()),
+        }
     )
-    result = _add_derived_keys(pdf)
-    assert result["production_date"].iloc[0] == pd.Timestamp("2021-03-01")
+    result = _build_well_id(df)
+    assert len(result) == n
+    for i, val in enumerate(result):
+        assert val == f"05-01-{i:05d}-00"
 
 
 @pytest.mark.unit
-def test_add_derived_keys_well_id_format() -> None:
-    pdf = make_partition(
-        ApiCountyCode=pd.array(["05"], dtype=pd.StringDtype()),
-        ApiSequenceNumber=pd.array(["00123"], dtype=pd.StringDtype()),
-        ApiSidetrack=pd.array(["00"], dtype=pd.StringDtype()),
-    )
-    result = _add_derived_keys(pdf)
-    assert result["well_id"].iloc[0] == "05-00123-00"
-
-
-@pytest.mark.unit
-def test_add_derived_keys_production_date_dtype() -> None:
-    pdf = make_partition()
-    result = _add_derived_keys(pdf)
-    assert result["production_date"].dtype in ("datetime64[ns]", "datetime64[us]")
-
-
-@pytest.mark.unit
-def test_add_derived_keys_well_id_dtype() -> None:
-    pdf = make_partition()
-    result = _add_derived_keys(pdf)
-    assert result["well_id"].dtype == pd.StringDtype()
+def test_build_well_id_dtype() -> None:
+    """Return dtype is pd.StringDtype()."""
+    df = _minimal_df()
+    result = _build_well_id(df)
+    assert isinstance(result.dtype, pd.StringDtype)
 
 
 # ---------------------------------------------------------------------------
-# T-02: _drop_duplicates
+# _build_production_date
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_drop_duplicates_removes_one() -> None:
-    pdf = make_partition()
-    pdf_dup = pd.concat(
-        [pdf, pdf, pdf.assign(DocNum=pd.array([99], dtype="int64"))], ignore_index=True
+def test_build_production_date_june() -> None:
+    """ReportYear=2021, ReportMonth=6 → Timestamp('2021-06-01')."""
+    df = _minimal_df(
+        ReportYear=pd.array([2021], dtype="int64"),
+        ReportMonth=pd.array([6], dtype="int64"),
     )
-    result = _drop_duplicates(pdf_dup)
+    result = _build_production_date(df)
+    assert result.iloc[0] == pd.Timestamp("2021-06-01")
+
+
+@pytest.mark.unit
+def test_build_production_date_december() -> None:
+    """ReportYear=2020, ReportMonth=12 → Timestamp('2020-12-01')."""
+    df = _minimal_df(
+        ReportYear=pd.array([2020], dtype="int64"),
+        ReportMonth=pd.array([12], dtype="int64"),
+    )
+    result = _build_production_date(df)
+    assert result.iloc[0] == pd.Timestamp("2020-12-01")
+
+
+@pytest.mark.unit
+def test_build_production_date_invalid_month() -> None:
+    """Invalid month (13) → NaT (not an exception)."""
+    df = _minimal_df(
+        ReportYear=pd.array([2021], dtype="int64"),
+        ReportMonth=pd.array([13], dtype="int64"),
+    )
+    result = _build_production_date(df)
+    assert pd.isna(result.iloc[0])
+
+
+@pytest.mark.unit
+def test_build_production_date_dtype() -> None:
+    """Return dtype is datetime64[ns]."""
+    df = _minimal_df()
+    result = _build_production_date(df)
+    assert "datetime64" in str(result.dtype)
+
+
+# ---------------------------------------------------------------------------
+# _deduplicate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_deduplicate_keeps_latest_accepted_date() -> None:
+    """Two rows with same key → keep the one with the later AcceptedDate."""
+    df = pd.DataFrame(
+        {
+            "ApiCountyCode": pd.array(["01", "01"], dtype=pd.StringDtype()),
+            "ApiSequenceNumber": pd.array(["12345", "12345"], dtype=pd.StringDtype()),
+            "ReportYear": [2021, 2021],
+            "ReportMonth": [6, 6],
+            "AcceptedDate": pd.to_datetime(["2021-06-01", "2021-06-15"]),
+            "OilProduced": pd.array([100.0, 200.0], dtype=pd.Float64Dtype()),
+        }
+    )
+    result = _deduplicate(df)
+    assert len(result) == 1
+    assert result["OilProduced"].iloc[0] == 200.0
+
+
+@pytest.mark.unit
+def test_deduplicate_no_duplicates_unchanged() -> None:
+    """No duplicates → row count unchanged."""
+    df = pd.DataFrame(
+        {
+            "ApiCountyCode": pd.array(["01", "02"], dtype=pd.StringDtype()),
+            "ApiSequenceNumber": pd.array(["12345", "67890"], dtype=pd.StringDtype()),
+            "ReportYear": [2021, 2021],
+            "ReportMonth": [6, 7],
+            "AcceptedDate": pd.to_datetime(["2021-06-01", "2021-07-01"]),
+        }
+    )
+    result = _deduplicate(df)
     assert len(result) == 2
 
 
 @pytest.mark.unit
-def test_drop_duplicates_no_dups_unchanged() -> None:
-    pdf = make_partition()
-    result = _drop_duplicates(pdf)
-    assert len(result) == len(pdf)
+def test_deduplicate_all_null_accepted_date() -> None:
+    """All-null AcceptedDate for duplicates → one row retained per key."""
+    df = pd.DataFrame(
+        {
+            "ApiCountyCode": pd.array(["01", "01"], dtype=pd.StringDtype()),
+            "ApiSequenceNumber": pd.array(["12345", "12345"], dtype=pd.StringDtype()),
+            "ReportYear": [2021, 2021],
+            "ReportMonth": [6, 6],
+            "AcceptedDate": pd.to_datetime(pd.Series([pd.NaT, pd.NaT])),
+        }
+    )
+    result = _deduplicate(df)
+    assert len(result) == 1
 
 
 @pytest.mark.unit
-def test_drop_duplicates_dtypes_unchanged() -> None:
-    pdf = make_partition()
-    result = _drop_duplicates(pdf)
-    for col in pdf.columns:
-        assert result[col].dtype == pdf[col].dtype
+def test_deduplicate_idempotent() -> None:
+    """Calling _deduplicate twice equals calling it once (TR-15)."""
+    df = pd.DataFrame(
+        {
+            "ApiCountyCode": pd.array(["01", "01", "02"], dtype=pd.StringDtype()),
+            "ApiSequenceNumber": pd.array(["12345", "12345", "67890"], dtype=pd.StringDtype()),
+            "ReportYear": [2021, 2021, 2021],
+            "ReportMonth": [6, 6, 7],
+            "AcceptedDate": pd.to_datetime(["2021-06-01", "2021-06-15", "2021-07-01"]),
+        }
+    )
+    once = _deduplicate(df).reset_index(drop=True)
+    twice = _deduplicate(_deduplicate(df)).reset_index(drop=True)
+    pd.testing.assert_frame_equal(once, twice)
 
 
 @pytest.mark.unit
-def test_tr15_drop_duplicates_idempotent() -> None:
-    pdf = make_partition()
-    pdf_dup = pd.concat([pdf, pdf], ignore_index=True)
-    once = _drop_duplicates(pdf_dup)
-    twice = _drop_duplicates(once)
-    assert len(once) == len(twice)
+def test_deduplicate_row_count_leq() -> None:
+    """Row count after deduplication ≤ row count before (TR-15)."""
+    df = _minimal_df()
+    df = pd.concat([df, df]).reset_index(drop=True)
+    result = _deduplicate(df)
+    assert len(result) <= len(df)
 
 
 # ---------------------------------------------------------------------------
-# T-03: _handle_negative_production (TR-01, TR-05)
+# _clean_production_volumes
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_tr01_negative_oil_becomes_na() -> None:
-    pdf = make_partition(OilProduced=pd.array([-5.0], dtype=pd.Float64Dtype()))
-    result = _handle_negative_production(pdf)
+def test_clean_production_volumes_negative_oil(caplog: pytest.LogCaptureFixture) -> None:
+    """Negative OilProduced → pd.NA (TR-01)."""
+    df = _minimal_df(OilProduced=pd.array([-100.0], dtype=pd.Float64Dtype()))
+    result = _clean_production_volumes(df)
     assert pd.isna(result["OilProduced"].iloc[0])
-    assert result["OilProduced_negative"].iloc[0]
 
 
 @pytest.mark.unit
-def test_tr05_zero_oil_preserved() -> None:
-    pdf = make_partition(OilProduced=pd.array([0.0], dtype=pd.Float64Dtype()))
-    result = _handle_negative_production(pdf)
+def test_clean_production_volumes_zero_preserved() -> None:
+    """Zero OilProduced → remains 0.0 (TR-05)."""
+    df = _minimal_df(OilProduced=pd.array([0.0], dtype=pd.Float64Dtype()))
+    result = _clean_production_volumes(df)
     assert result["OilProduced"].iloc[0] == 0.0
-    assert not result["OilProduced_negative"].iloc[0]
 
 
 @pytest.mark.unit
-def test_oil_na_gives_na_flag() -> None:
-    pdf = make_partition(OilProduced=pd.array([pd.NA], dtype=pd.Float64Dtype()))
-    result = _handle_negative_production(pdf)
-    assert pd.isna(result["OilProduced_negative"].iloc[0])
+def test_clean_production_volumes_outlier_oil(caplog: pytest.LogCaptureFixture) -> None:
+    """OilProduced > 50,000 → pd.NA + WARNING (TR-02)."""
+    df = _minimal_df(OilProduced=pd.array([75000.0], dtype=pd.Float64Dtype()))
+    with caplog.at_level(logging.WARNING, logger="cogcc_pipeline.transform"):
+        result = _clean_production_volumes(df)
+    assert pd.isna(result["OilProduced"].iloc[0])
+    assert any("outlier" in r.message.lower() or "75000" in r.message for r in caplog.records)
 
 
 @pytest.mark.unit
-def test_gas_positive_unchanged() -> None:
-    pdf = make_partition(GasProduced=pd.array([100.0], dtype=pd.Float64Dtype()))
-    result = _handle_negative_production(pdf)
-    assert result["GasProduced"].iloc[0] == 100.0
-    assert not result["GasProduced_negative"].iloc[0]
-
-
-# ---------------------------------------------------------------------------
-# T-04: _flag_unit_outliers (TR-02)
-# ---------------------------------------------------------------------------
+def test_clean_production_volumes_negative_gas() -> None:
+    """Negative GasProduced → pd.NA."""
+    df = _minimal_df(GasProduced=pd.array([-1.0], dtype=pd.Float64Dtype()))
+    result = _clean_production_volumes(df)
+    assert pd.isna(result["GasProduced"].iloc[0])
 
 
 @pytest.mark.unit
-def test_tr02_oil_55000_flagged() -> None:
-    pdf = make_partition(OilProduced=pd.array([55000.0], dtype=pd.Float64Dtype()))
-    result = _flag_unit_outliers(pdf)
-    assert result["OilProduced_unit_flag"].iloc[0]
-    assert result["OilProduced"].iloc[0] == 55000.0
-
-
-@pytest.mark.unit
-def test_tr02_oil_49999_not_flagged() -> None:
-    pdf = make_partition(OilProduced=pd.array([49999.0], dtype=pd.Float64Dtype()))
-    result = _flag_unit_outliers(pdf)
-    assert not result["OilProduced_unit_flag"].iloc[0]
-
-
-@pytest.mark.unit
-def test_oil_zero_not_flagged() -> None:
-    pdf = make_partition(OilProduced=pd.array([0.0], dtype=pd.Float64Dtype()))
-    result = _flag_unit_outliers(pdf)
-    assert not result["OilProduced_unit_flag"].iloc[0]
-
-
-@pytest.mark.unit
-def test_oil_na_flag_is_na() -> None:
-    pdf = make_partition(OilProduced=pd.array([pd.NA], dtype=pd.Float64Dtype()))
-    result = _flag_unit_outliers(pdf)
-    assert pd.isna(result["OilProduced_unit_flag"].iloc[0])
-
-
-# ---------------------------------------------------------------------------
-# T-05: _standardize_strings
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_standardize_strings_strips_and_uppercases() -> None:
-    pdf = make_partition(OpName=pd.array(["  chevron  usa "], dtype=pd.StringDtype()))
-    result = _standardize_strings(pdf)
-    assert result["OpName"].iloc[0] == "CHEVRON USA"
-
-
-@pytest.mark.unit
-def test_standardize_strings_preserves_na() -> None:
-    pdf = make_partition(OpName=pd.array([pd.NA], dtype=pd.StringDtype()))
-    result = _standardize_strings(pdf)
-    assert pd.isna(result["OpName"].iloc[0])
-
-
-@pytest.mark.unit
-def test_standardize_strings_double_space() -> None:
-    pdf = make_partition(Well=pd.array(["well  name"], dtype=pd.StringDtype()))
-    result = _standardize_strings(pdf)
-    assert result["Well"].iloc[0] == "WELL NAME"
-
-
-@pytest.mark.unit
-def test_standardize_strings_formation_code() -> None:
-    pdf = make_partition(FormationCode=pd.array(["niobrara"], dtype=pd.StringDtype()))
-    result = _standardize_strings(pdf)
-    assert result["FormationCode"].iloc[0] == "NIOBRARA"
-
-
-# ---------------------------------------------------------------------------
-# T-06: _cast_well_status
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_cast_well_status_valid_value() -> None:
-    pdf = make_partition(WellStatus=pd.array(["PR"], dtype=pd.StringDtype()))
-    result = _cast_well_status(pdf)
-    assert hasattr(result["WellStatus"].dtype, "categories")
-    assert result["WellStatus"].iloc[0] == "PR"
-
-
-@pytest.mark.unit
-def test_cast_well_status_invalid_becomes_na() -> None:
-    pdf = make_partition(WellStatus=pd.array(["UNKNOWN"], dtype=pd.StringDtype()))
-    result = _cast_well_status(pdf)
-    assert pd.isna(result["WellStatus"].iloc[0])
-
-
-@pytest.mark.unit
-def test_cast_well_status_na_stays_na() -> None:
-    pdf = make_partition(WellStatus=pd.array([pd.NA], dtype=pd.StringDtype()))
-    result = _cast_well_status(pdf)
-    assert pd.isna(result["WellStatus"].iloc[0])
-
-
-@pytest.mark.unit
-def test_cast_well_status_categories() -> None:
-    pdf = make_partition(WellStatus=pd.array(["PR"], dtype=pd.StringDtype()))
-    result = _cast_well_status(pdf)
-    cats = list(result["WellStatus"].cat.categories)
-    assert cats == WELL_STATUS_CATEGORIES
-
-
-# ---------------------------------------------------------------------------
-# T-07: _filter_date_range
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_filter_date_range_keeps_correct_rows() -> None:
-    pdf = make_partition()
-    pdf = _add_derived_keys(pdf)
-    extra_rows = []
-    for y, m in [(2019, 12), (2020, 1), (2021, 6)]:
-        row = make_partition(
-            ReportYear=pd.array([y], dtype="int64"), ReportMonth=pd.array([m], dtype="int64")
-        )
-        extra_rows.append(_add_derived_keys(row))
-    combined = pd.concat(extra_rows, ignore_index=True)
-    result = _filter_date_range(combined, pd.Timestamp("2020-01-01"))
-    assert all(result["production_date"] >= pd.Timestamp("2020-01-01"))
-    assert len(result) == 2
-
-
-@pytest.mark.unit
-def test_filter_date_range_all_before_returns_empty() -> None:
-    pdf = make_partition(
-        ReportYear=pd.array([2019], dtype="int64"), ReportMonth=pd.array([6], dtype="int64")
+def test_clean_production_volumes_zero_water_zero_days() -> None:
+    """WaterProduced=0.0 and DaysProduced=0 → no exception, values preserved."""
+    df = _minimal_df(
+        WaterProduced=pd.array([0.0], dtype=pd.Float64Dtype()),
+        DaysProduced=pd.array([0], dtype=pd.Int64Dtype()),
     )
-    pdf = _add_derived_keys(pdf)
-    result = _filter_date_range(pdf, pd.Timestamp("2020-01-01"))
-    assert len(result) == 0
+    result = _clean_production_volumes(df)
+    assert result["WaterProduced"].iloc[0] == 0.0
+
+
+@pytest.mark.unit
+def test_clean_production_volumes_nonzero_oil_zero_days(caplog: pytest.LogCaptureFixture) -> None:
+    """DaysProduced=0 but OilProduced=100 → WARNING, OilProduced unchanged."""
+    df = _minimal_df(
+        OilProduced=pd.array([100.0], dtype=pd.Float64Dtype()),
+        DaysProduced=pd.array([0], dtype=pd.Int64Dtype()),
+    )
+    with caplog.at_level(logging.WARNING, logger="cogcc_pipeline.transform"):
+        result = _clean_production_volumes(df)
+    assert result["OilProduced"].iloc[0] == 100.0
+    assert any("DaysProduced" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _cast_well_status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_cast_well_status_valid_values() -> None:
+    """Valid WellStatus values → CategoricalDtype with declared categories."""
+    df = _minimal_df()
+    df = pd.concat([df, df, df]).reset_index(drop=True)
+    df["WellStatus"] = pd.array(["AC", "SI", "PA"], dtype=pd.StringDtype())
+    result = _cast_well_status(df)
+    assert isinstance(result["WellStatus"].dtype, pd.CategoricalDtype)
+    assert list(result["WellStatus"].cat.categories) == WELL_STATUS_CATEGORIES
+
+
+@pytest.mark.unit
+def test_cast_well_status_unknown_becomes_na() -> None:
+    """Value 'XX' not in allowed list → pd.NA."""
+    df = _minimal_df(WellStatus=pd.array(["XX"], dtype=pd.StringDtype()))
+    result = _cast_well_status(df)
+    assert pd.isna(result["WellStatus"].iloc[0])
+
+
+@pytest.mark.unit
+def test_cast_well_status_null_remains_null() -> None:
+    """Null WellStatus → remains null after cast."""
+    df = _minimal_df(WellStatus=pd.array([pd.NA], dtype=pd.StringDtype()))
+    result = _cast_well_status(df)
+    assert pd.isna(result["WellStatus"].iloc[0])
+
+
+@pytest.mark.unit
+def test_cast_well_status_unknown_count() -> None:
+    """Non-null count after cast equals count of rows with recognised status codes."""
+    df = pd.DataFrame(
+        {
+            "WellStatus": pd.array(["AC", "XX", "SI", pd.NA], dtype=pd.StringDtype()),
+        }
+    )
+    result = _cast_well_status(df)
+    recognised_count = 2  # AC and SI
+    assert result["WellStatus"].notna().sum() == recognised_count
+
+
+# ---------------------------------------------------------------------------
+# _transform_partition
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_transform_partition_has_well_id_and_date() -> None:
+    """Output contains well_id and production_date columns."""
+    df = _minimal_df()
+    result = _transform_partition(df)
+    assert "well_id" in result.columns
     assert "production_date" in result.columns
 
 
-# ---------------------------------------------------------------------------
-# T-08: _sort_partition_by_date
-# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_transform_partition_drops_year_month() -> None:
+    """Output does NOT contain ReportYear or ReportMonth."""
+    df = _minimal_df()
+    result = _transform_partition(df)
+    assert "ReportYear" not in result.columns
+    assert "ReportMonth" not in result.columns
 
 
 @pytest.mark.unit
-def test_sort_partition_by_date_ascending() -> None:
-    rows = []
-    for y, m in [(2021, 3), (2021, 1), (2021, 2)]:
-        row = make_partition(
-            ReportYear=pd.array([y], dtype="int64"), ReportMonth=pd.array([m], dtype="int64")
-        )
-        rows.append(_add_derived_keys(row))
-    pdf = pd.concat(rows, ignore_index=True)
-    result = _sort_partition_by_date(pdf)
-    dates = list(result["production_date"])
-    assert dates == sorted(dates)
+def test_transform_partition_well_id_dtype() -> None:
+    """well_id dtype is pd.StringDtype()."""
+    df = _minimal_df()
+    result = _transform_partition(df)
+    assert isinstance(result["well_id"].dtype, pd.StringDtype)
 
 
 @pytest.mark.unit
-def test_sort_partition_by_date_no_rows_lost() -> None:
-    rows = []
-    for m in [3, 1, 2]:
-        row = make_partition(
-            ReportYear=pd.array([2021], dtype="int64"), ReportMonth=pd.array([m], dtype="int64")
-        )
-        rows.append(_add_derived_keys(row))
-    pdf = pd.concat(rows, ignore_index=True)
-    result = _sort_partition_by_date(pdf)
-    assert len(result) == len(pdf)
+def test_transform_partition_production_date_dtype() -> None:
+    """production_date dtype is datetime64[ns]."""
+    df = _minimal_df()
+    result = _transform_partition(df)
+    assert "datetime64" in str(result["production_date"].dtype)
 
 
 @pytest.mark.unit
-def test_tr16_sort_stability() -> None:
-    """TR-16: Sorted dates are ascending and no rows are lost."""
-    rows = []
-    for m in [6, 1, 3, 2]:
-        row = make_partition(
-            ReportYear=pd.array([2021], dtype="int64"), ReportMonth=pd.array([m], dtype="int64")
-        )
-        rows.append(_add_derived_keys(row))
-    pdf = pd.concat(rows, ignore_index=True)
-    result = _sort_partition_by_date(pdf)
-    dates = list(result["production_date"])
-    assert dates == sorted(dates)
-    assert len(result) == len(pdf)
+def test_transform_partition_well_status_categorical() -> None:
+    """WellStatus dtype is CategoricalDtype."""
+    df = _minimal_df()
+    result = _transform_partition(df)
+    assert isinstance(result["WellStatus"].dtype, pd.CategoricalDtype)
+
+
+@pytest.mark.unit
+def test_transform_partition_meta_consistency(tmp_path: Path, config_fixture: dict) -> None:
+    """Meta from _transform_partition on empty DataFrame matches result columns."""
+    from cogcc_pipeline.ingest import make_delayed_df
+    from tests.conftest import _make_raw_csv_content
+
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(_make_raw_csv_content(n_rows=3), encoding="utf-8")
+    ddf = make_delayed_df(csv_path, config_fixture)
+
+    meta = _transform_partition(ddf._meta.copy())
+    transformed = ddf.map_partitions(_transform_partition, meta=meta)
+
+    assert list(meta.columns) == list(transformed._meta.columns)
 
 
 # ---------------------------------------------------------------------------
-# T-09: build_cleaning_report
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_build_cleaning_report_creates_file(tmp_path: Path) -> None:
-    stats = {
-        "rows_before": 100,
-        "rows_after_dedup": 95,
-        "rows_after_date_filter": 90,
-        "negative_oil_count": 2,
-        "negative_gas_count": 1,
-        "negative_water_count": 0,
-        "unit_flag_oil_count": 3,
-        "null_counts_per_column": {"OilProduced": 0},
-    }
-    output_path = tmp_path / "report.json"
-    build_cleaning_report(stats, output_path)
-    assert output_path.exists()
-
-
-@pytest.mark.unit
-def test_build_cleaning_report_valid_json(tmp_path: Path) -> None:
-    stats = {
-        "rows_before": 100,
-        "rows_after_dedup": 95,
-        "rows_after_date_filter": 90,
-        "negative_oil_count": 0,
-        "negative_gas_count": 0,
-        "negative_water_count": 0,
-        "unit_flag_oil_count": 0,
-        "null_counts_per_column": {},
-    }
-    output_path = tmp_path / "report.json"
-    build_cleaning_report(stats, output_path)
-    data = json.loads(output_path.read_text())
-    assert "rows_before" in data
-    assert "null_counts_per_column" in data
-
-
-# ---------------------------------------------------------------------------
-# T-11 Domain tests (TR-01, TR-02, TR-04, TR-05, TR-11 through TR-16)
+# check_well_completeness
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_tr01_all_negatives_become_na() -> None:
-    """TR-01: Negative OilProduced, GasProduced, WaterProduced all become NA."""
-    pdf = make_partition(
-        OilProduced=pd.array([-10.0], dtype=pd.Float64Dtype()),
-        GasProduced=pd.array([-20.0], dtype=pd.Float64Dtype()),
-        WaterProduced=pd.array([-5.0], dtype=pd.Float64Dtype()),
+def test_check_well_completeness_no_gaps() -> None:
+    """Well with 12 consecutive monthly records → gap_count == 0."""
+    well_id = "05-01-12345-00"
+    dates = pd.date_range("2021-01-01", periods=12, freq="MS")
+    df = pd.DataFrame(
+        {
+            "well_id": pd.array([well_id] * 12, dtype=pd.StringDtype()),
+            "production_date": dates,
+        }
     )
-    result = _handle_negative_production(pdf)
-    assert pd.isna(result["OilProduced"].iloc[0])
-    assert pd.isna(result["GasProduced"].iloc[0])
-    assert pd.isna(result["WaterProduced"].iloc[0])
-    assert result["OilProduced_negative"].iloc[0] == True  # noqa: E712
+    ddf = dd.from_pandas(df, npartitions=1)
+    summary = check_well_completeness(ddf)
+    assert summary.loc[well_id, "gap_count"] == 0
 
 
 @pytest.mark.unit
-def test_tr04_well_12_records_preserved(sample_cleaned_df: pd.DataFrame) -> None:
-    """TR-04: 12 monthly records for a well all preserved through cleaning."""
-    rows = []
-    for m in range(1, 13):
-        row = make_partition(
-            ReportYear=pd.array([2021], dtype="int64"),
-            ReportMonth=pd.array([m], dtype="int64"),
-        )
-        rows.append(row)
-    pdf = pd.concat(rows, ignore_index=True)
-    result = _drop_duplicates(pdf)
-    assert len(result) == 12
+def test_check_well_completeness_one_gap(caplog: pytest.LogCaptureFixture) -> None:
+    """Well missing March 2021 → gap_count == 1 and WARNING logged."""
+    well_id = "05-01-12345-00"
+    months = [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # missing month 3
+    dates = [pd.Timestamp(f"2021-{m:02d}-01") for m in months]
+    df = pd.DataFrame(
+        {
+            "well_id": pd.array([well_id] * len(dates), dtype=pd.StringDtype()),
+            "production_date": dates,
+        }
+    )
+    ddf = dd.from_pandas(df, npartitions=1)
+    with caplog.at_level(logging.WARNING, logger="cogcc_pipeline.transform"):
+        summary = check_well_completeness(ddf)
+    assert summary.loc[well_id, "gap_count"] == 1
+    assert any("gap" in r.message.lower() for r in caplog.records)
 
 
 @pytest.mark.unit
-def test_tr11_value_preserved_when_no_cleaning_triggered() -> None:
-    """TR-11: OilProduced unchanged when no cleaning rules trigger."""
-    pdf = make_partition(OilProduced=pd.array([123.45], dtype=pd.Float64Dtype()))
-    result = _handle_negative_production(pdf)
-    assert result["OilProduced"].iloc[0] == 123.45
+def test_check_well_completeness_two_wells() -> None:
+    """Two wells → summary DataFrame has two rows."""
+    df = pd.DataFrame(
+        {
+            "well_id": pd.array(["W1", "W1", "W2", "W2"], dtype=pd.StringDtype()),
+            "production_date": pd.to_datetime(
+                ["2021-01-01", "2021-02-01", "2021-01-01", "2021-02-01"]
+            ),
+        }
+    )
+    ddf = dd.from_pandas(df, npartitions=1)
+    summary = check_well_completeness(ddf)
+    assert len(summary) == 2
+
+
+# ---------------------------------------------------------------------------
+# check_data_integrity
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_tr14_schema_stability_across_partitions() -> None:
-    """TR-14: Two partitions have identical columns and dtypes after map functions."""
-    pdf1 = make_partition(OilProduced=pd.array([100.0], dtype=pd.Float64Dtype()))
-    pdf2 = make_partition(OilProduced=pd.array([200.0], dtype=pd.Float64Dtype()))
-
-    r1 = _handle_negative_production(_drop_duplicates(pdf1))
-    r2 = _handle_negative_production(_drop_duplicates(pdf2))
-
-    assert list(r1.columns) == list(r2.columns)
-    for col in r1.columns:
-        assert r1[col].dtype == r2[col].dtype
+def test_check_data_integrity_no_discrepancy(caplog: pytest.LogCaptureFixture) -> None:
+    """Matching interim and processed → no WARNING logged."""
+    df = pd.DataFrame(
+        {
+            "well_id": pd.array(["W1", "W1"], dtype=pd.StringDtype()),
+            "OilProduced": pd.array([100.0, 200.0], dtype=pd.Float64Dtype()),
+        }
+    )
+    ddf = dd.from_pandas(df, npartitions=1)
+    with caplog.at_level(logging.WARNING, logger="cogcc_pipeline.transform"):
+        check_data_integrity(ddf, ddf)
+    warn_messages = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "discrepancy" in r.message.lower()
+    ]
+    assert len(warn_messages) == 0
 
 
 @pytest.mark.unit
-def test_tr15_row_count_idempotency() -> None:
-    """TR-15: Output rows <= input rows; dedup is idempotent."""
-    pdf = make_partition()
-    pdf_dup = pd.concat([pdf, pdf], ignore_index=True)
-    r1 = _drop_duplicates(pdf_dup)
-    r2 = _drop_duplicates(r1)
-    assert len(r1) <= len(pdf_dup)
-    assert len(r2) == len(r1)
+def test_check_data_integrity_with_discrepancy(caplog: pytest.LogCaptureFixture) -> None:
+    """Processed with different OilProduced sum → WARNING logged."""
+    interim_df = pd.DataFrame(
+        {
+            "well_id": pd.array(["W1"], dtype=pd.StringDtype()),
+            "OilProduced": pd.array([1000.0], dtype=pd.Float64Dtype()),
+        }
+    )
+    processed_df = pd.DataFrame(
+        {
+            "well_id": pd.array(["W1"], dtype=pd.StringDtype()),
+            "OilProduced": pd.array([1.0], dtype=pd.Float64Dtype()),
+        }
+    )
+    interim_ddf = dd.from_pandas(interim_df, npartitions=1)
+    processed_ddf = dd.from_pandas(processed_df, npartitions=1)
+
+    with caplog.at_level(logging.WARNING, logger="cogcc_pipeline.transform"):
+        check_data_integrity(interim_ddf, processed_ddf, sample_n=1)
+    warn_messages = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "discrepancy" in r.message.lower()
+    ]
+    assert len(warn_messages) >= 1

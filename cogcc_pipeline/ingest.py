@@ -2,292 +2,238 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
 
+import dask
 import dask.dataframe as dd
 import pandas as pd
-from dask import delayed
-from dask.distributed import Client, LocalCluster
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# I-01: dtype mapping and meta construction
-# ---------------------------------------------------------------------------
+# Canonical schema: column → pandas dtype
+DTYPE_MAP: dict[str, object] = {
+    "DocNum": pd.Int64Dtype(),
+    "ReportMonth": "int64",
+    "ReportYear": "int64",
+    "DaysProduced": pd.Int64Dtype(),
+    "Revised": pd.BooleanDtype(),
+    "OpName": pd.StringDtype(),
+    "OpNumber": pd.Int64Dtype(),
+    "FacilityId": pd.Int64Dtype(),
+    "ApiCountyCode": pd.StringDtype(),
+    "ApiSequenceNumber": pd.StringDtype(),
+    "ApiSidetrack": pd.StringDtype(),
+    "Well": pd.StringDtype(),
+    "WellStatus": pd.StringDtype(),
+    "FormationCode": pd.StringDtype(),
+    "OilProduced": pd.Float64Dtype(),
+    "OilSales": pd.Float64Dtype(),
+    "OilAdjustment": pd.Float64Dtype(),
+    "OilGravity": pd.Float64Dtype(),
+    "GasProduced": pd.Float64Dtype(),
+    "GasSales": pd.Float64Dtype(),
+    "GasBtuSales": pd.Float64Dtype(),
+    "GasUsedOnLease": pd.Float64Dtype(),
+    "GasShrinkage": pd.Float64Dtype(),
+    "GasPressureTubing": pd.Float64Dtype(),
+    "GasPressureCasing": pd.Float64Dtype(),
+    "WaterProduced": pd.Float64Dtype(),
+    "WaterPressureTubing": pd.Float64Dtype(),
+    "WaterPressureCasing": pd.Float64Dtype(),
+    "FlaredVented": pd.Float64Dtype(),
+    "BomInvent": pd.Float64Dtype(),
+    "EomInvent": pd.Float64Dtype(),
+}
+
+# Non-nullable columns per the data dictionary
+NON_NULLABLE = {"ReportMonth", "ReportYear", "ApiCountyCode", "ApiSequenceNumber", "Well"}
+
+REQUIRED_COLUMNS = set(DTYPE_MAP.keys()) | {"AcceptedDate"}
 
 
-def build_dtype_map() -> dict[str, Any]:
-    """Return a column→dtype dict for all raw CSV columns (excluding AcceptedDate).
+class IngestError(RuntimeError):
+    """Raised on unrecoverable ingest failures."""
+
+
+def log_file_metadata(path: Path) -> dict:
+    """Compute and log file-level metadata for a raw CSV.
 
     Returns:
-        Dict mapping column names to pandas dtypes for use in pd.read_csv dtype=.
+        Dict with file_path, file_size_bytes, sha256, row_count_raw.
     """
-    return {
-        "DocNum": pd.Int64Dtype(),
-        "ReportMonth": "int64",
-        "ReportYear": "int64",
-        "DaysProduced": pd.Int64Dtype(),
-        "Revised": pd.BooleanDtype(),
-        "OpName": pd.StringDtype(),
-        "OpNumber": pd.Int64Dtype(),
-        "FacilityId": pd.Int64Dtype(),
-        "ApiCountyCode": pd.StringDtype(),
-        "ApiSequenceNumber": pd.StringDtype(),
-        "ApiSidetrack": pd.StringDtype(),
-        "Well": pd.StringDtype(),
-        "WellStatus": pd.StringDtype(),
-        "FormationCode": pd.StringDtype(),
-        "OilProduced": pd.Float64Dtype(),
-        "OilSales": pd.Float64Dtype(),
-        "OilAdjustment": pd.Float64Dtype(),
-        "OilGravity": pd.Float64Dtype(),
-        "GasProduced": pd.Float64Dtype(),
-        "GasSales": pd.Float64Dtype(),
-        "GasBtuSales": pd.Float64Dtype(),
-        "GasUsedOnLease": pd.Float64Dtype(),
-        "GasShrinkage": pd.Float64Dtype(),
-        "GasPressureTubing": pd.Float64Dtype(),
-        "GasPressureCasing": pd.Float64Dtype(),
-        "WaterProduced": pd.Float64Dtype(),
-        "WaterPressureTubing": pd.Float64Dtype(),
-        "WaterPressureCasing": pd.Float64Dtype(),
-        "FlaredVented": pd.Float64Dtype(),
-        "BomInvent": pd.Float64Dtype(),
-        "EomInvent": pd.Float64Dtype(),
+    file_size = path.stat().st_size
+    content = path.read_bytes()
+    sha256 = hashlib.sha256(content).hexdigest()
+    row_count_raw = max(0, content.decode("utf-8", errors="replace").count("\n") - 1)
+
+    meta = {
+        "file_path": str(path.absolute()),
+        "file_size_bytes": file_size,
+        "sha256": sha256,
+        "row_count_raw": row_count_raw,
     }
+    logger.info(
+        "File metadata: path=%s size=%d sha256=%s rows=%d",
+        meta["file_path"],
+        file_size,
+        sha256,
+        row_count_raw,
+    )
+    return meta
 
 
-def build_meta() -> pd.DataFrame:
-    """Return an empty DataFrame with all columns and dtypes per the data dictionary.
-
-    Returns:
-        Empty pandas DataFrame matching the full schema.
-    """
-    dtype_map = build_dtype_map()  # type: ignore[call-overload]
-    meta = pd.DataFrame({col: pd.Series(dtype=dt) for col, dt in dtype_map.items()})
-    meta["AcceptedDate"] = pd.Series(dtype="datetime64[us]")
-    # Reorder to logical column order
-    ordered_cols = [
-        "DocNum",
-        "ReportMonth",
-        "ReportYear",
-        "DaysProduced",
-        "AcceptedDate",
-        "Revised",
-        "OpName",
-        "OpNumber",
-        "FacilityId",
-        "ApiCountyCode",
-        "ApiSequenceNumber",
-        "ApiSidetrack",
-        "Well",
-        "WellStatus",
-        "FormationCode",
-        "OilProduced",
-        "OilSales",
-        "OilAdjustment",
-        "OilGravity",
-        "GasProduced",
-        "GasSales",
-        "GasBtuSales",
-        "GasUsedOnLease",
-        "GasShrinkage",
-        "GasPressureTubing",
-        "GasPressureCasing",
-        "WaterProduced",
-        "WaterPressureTubing",
-        "WaterPressureCasing",
-        "FlaredVented",
-        "BomInvent",
-        "EomInvent",
-    ]
-    return meta[ordered_cols]
-
-
-# ---------------------------------------------------------------------------
-# I-02: Single raw CSV reader
-# ---------------------------------------------------------------------------
-
-
-def read_raw_file(file_path: Path) -> pd.DataFrame:
-    """Read a single raw production CSV with enforced dtypes and schema validation.
-
-    Missing columns are added as all-NA with the correct dtype.
-
-    Args:
-        file_path: Path to a raw CSV file.
-
-    Returns:
-        pandas DataFrame matching the schema defined by build_meta().
+def read_raw_file(path: Path, config: dict) -> pd.DataFrame:
+    """Read a single raw CSV with schema enforcement and year filtering.
 
     Raises:
-        FileNotFoundError: If file does not exist.
-        ValueError: On CSV parse error.
+        IngestError: If required columns are missing or encoding cannot be handled.
     """
-    if not file_path.exists():
-        raise FileNotFoundError(f"CSV not found: {file_path}")
+    start_year: int = config["ingest"]["start_year"]
 
-    dtype_map = build_dtype_map()
-    try:
-        df = pd.read_csv(
-            file_path,
+    # Build dtype dict excluding AcceptedDate (handled via parse_dates)
+    dtype_map: dict[str, Any] = {k: v for k, v in DTYPE_MAP.items()}
+
+    def _read(enc: str) -> pd.DataFrame:
+        return pd.read_csv(
+            path,
             dtype=dtype_map,  # type: ignore[arg-type]
             parse_dates=["AcceptedDate"],
-            low_memory=False,
-            na_values=["N/A", "NA", "n/a", ""],
-            keep_default_na=True,
+            encoding=enc,
         )
-    except Exception as exc:
-        logger.error("CSV parse error in %s: %s", file_path, exc)
-        raise ValueError(f"CSV parse error in {file_path}: {exc}") from exc
 
-    meta = build_meta()
-    for col, dtype in meta.dtypes.items():
-        if col not in df.columns:
-            logger.warning("Missing column '%s' in %s — filling with NA", col, file_path.name)
-            df[col] = pd.array([pd.NA] * len(df), dtype=dtype)  # type: ignore[call-overload]
+    try:
+        df = _read("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            df = _read("latin-1")
+        except Exception as exc:
+            raise IngestError(f"Cannot decode {path}: {exc}") from exc
 
-    # Cast datetime columns to match meta dtype (datetime64[us])
-    for col in df.select_dtypes(include=["datetime64"]).columns:
-        if col in meta.columns:
-            df[col] = df[col].astype(meta[col].dtype)
+    # Check for required columns
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise IngestError(f"Missing required columns in {path}: {missing}")
 
-    # Ensure column order matches meta
-    df = df[list(meta.columns)]
+    # Filter to configured start year
+    df = df[df["ReportYear"] >= start_year].copy()
+
+    # Drop rows where both ApiCountyCode and ApiSequenceNumber are null
+    both_null = df["ApiCountyCode"].isna() & df["ApiSequenceNumber"].isna()
+    if both_null.any():
+        logger.warning(
+            "Dropping %d rows with null ApiCountyCode and ApiSequenceNumber", both_null.sum()
+        )
+        df = df[~both_null].copy()
+
+    # Warn on nulls in non-nullable columns
+    for col in NON_NULLABLE:
+        if col in df.columns and df[col].isna().any():
+            logger.warning("Non-nullable column %s contains nulls in %s", col, path)
+
     return df
 
 
-# ---------------------------------------------------------------------------
-# I-03: Year filter
-# ---------------------------------------------------------------------------
+def make_delayed_df(path: Path, config: dict) -> dd.DataFrame:
+    """Wrap read_raw_file in a dask.delayed call and return a Dask DataFrame.
 
-
-def _filter_year(pdf: pd.DataFrame, year_start: int) -> pd.DataFrame:
-    """Filter a pandas partition to rows where ReportYear >= year_start.
-
-    Args:
-        pdf: A pandas partition.
-        year_start: Minimum year (inclusive).
-
-    Returns:
-        Filtered pandas DataFrame.
+    The meta is built by reading the first 5 data rows of the file.
     """
-    return pdf[pdf["ReportYear"] >= year_start]
 
-
-# ---------------------------------------------------------------------------
-# I-04: Schema validation
-# ---------------------------------------------------------------------------
-
-
-def validate_schema(ddf: dd.DataFrame, expected_columns: list[str]) -> list[str]:
-    """Return list of column names missing from ddf (without calling .compute()).
-
-    Args:
-        ddf: A Dask DataFrame.
-        expected_columns: List of expected column names.
-
-    Returns:
-        List of missing column names (empty if all present).
-    """
-    present = set(ddf.columns)
-    missing = [c for c in expected_columns if c not in present]
-    for col in missing:
-        logger.warning("Schema validation: missing column '%s'", col)
-    return missing
-
-
-# ---------------------------------------------------------------------------
-# I-05: Dask distributed client management
-# ---------------------------------------------------------------------------
-
-
-def get_or_create_client(config: dict) -> tuple[Client, bool]:
-    """Return existing Dask distributed Client or create a new one.
-
-    Args:
-        config: Full config dict.
-
-    Returns:
-        Tuple of (Client, created) where created=True if a new client was made.
-    """
-    from dask.distributed import get_client
-
+    # Build meta from a minimal real read (head of file only)
     try:
-        client = get_client()
-        logger.info("Reusing existing Dask client. Dashboard: %s", client.dashboard_link)
-        return client, False
-    except ValueError:
-        dcfg = config["dask"]
-        cluster = LocalCluster(
-            n_workers=dcfg["n_workers"],
-            threads_per_worker=dcfg["threads_per_worker"],
-            memory_limit=dcfg["memory_limit"],
-            dashboard_address=f":{dcfg['dashboard_port']}",
-        )
-        client = Client(cluster)
-        logger.info("Created new Dask client. Dashboard: %s", client.dashboard_link)
-        return client, True
+        meta_df = read_raw_file(path, config)
+        meta: pd.DataFrame = meta_df.iloc[0:0].copy()
+    except Exception:
+        # Fallback: construct empty DataFrame from schema
+        meta_cols = {**DTYPE_MAP}
+        meta = pd.DataFrame({c: pd.Series([], dtype=t) for c, t in meta_cols.items()})  # type: ignore[call-overload]
+        meta["AcceptedDate"] = pd.Series(dtype="datetime64[ns]")
+
+    delayed_read = dask.delayed(read_raw_file)(path, config)
+    ddf = dd.from_delayed([delayed_read], meta=meta)
+    return ddf
 
 
-# ---------------------------------------------------------------------------
-# I-06: Ingest stage runner
-# ---------------------------------------------------------------------------
-
-
-def run_ingest(config: dict) -> None:
-    """Top-level ingest stage: read raw CSVs, filter, and write interim Parquet.
-
-    Args:
-        config: Full config dict.
+def validate_schema(ddf: dd.DataFrame) -> None:
+    """Validate that a Dask DataFrame matches the canonical schema.
 
     Raises:
-        FileNotFoundError: If no CSV files are found in raw_dir.
-        RuntimeError: On Dask computation errors.
+        IngestError: If required columns are missing.
     """
-    raw_dir = Path(config["ingest"]["raw_dir"])
-    interim_dir = Path(config["ingest"]["interim_dir"])
-    year_start: int = config["ingest"]["year_start"]
+    actual_cols = set(ddf.columns)
+    expected_cols = set(DTYPE_MAP.keys()) | {"AcceptedDate"}
+    missing = expected_cols - actual_cols
+    if missing:
+        raise IngestError(f"Schema validation failed — missing columns: {sorted(missing)}")
 
+    # Warn on dtype mismatches (do not raise)
+    for col, expected_dtype in DTYPE_MAP.items():
+        if col not in ddf.columns:
+            continue
+        actual_dtype = ddf.dtypes[col]
+        if str(actual_dtype) != str(expected_dtype):
+            logger.warning(
+                "Dtype mismatch for %s: expected %s, got %s", col, expected_dtype, actual_dtype
+            )
+
+    n_partitions = ddf.npartitions
+    logger.info(
+        "Schema validated: %d columns, %d partitions (estimated)",
+        len(ddf.columns),
+        n_partitions,
+    )
+
+
+def write_interim(ddf: dd.DataFrame, config: dict) -> None:
+    """Repartition and write Dask DataFrame to interim Parquet dataset."""
+    target_n = max(10, min(ddf.npartitions, 50))
+    ddf = ddf.repartition(npartitions=target_n)
+
+    out_dir = config["ingest"]["interim_dir"] + "/production.parquet"
+    ddf.to_parquet(out_dir, engine="pyarrow", write_index=False, overwrite=True)
+    logger.info("Wrote interim Parquet: %d partitions → %s", target_n, out_dir)
+
+
+def run_ingest(config: dict) -> dd.DataFrame:
+    """Orchestrate the full ingest stage.
+
+    Returns:
+        Dask DataFrame (not computed).
+
+    Raises:
+        IngestError: If no CSV files are found or on schema failure.
+    """
+    try:
+        from distributed import get_client
+
+        client = get_client()
+        logger.info("Reusing existing Dask client: %s", client)
+    except ValueError:
+        from distributed import Client, LocalCluster
+
+        dask_cfg = config["dask"]
+        cluster = LocalCluster(
+            n_workers=dask_cfg.get("n_workers", 2),
+            threads_per_worker=dask_cfg.get("threads_per_worker", 2),
+            memory_limit=dask_cfg.get("memory_limit", "3GB"),
+        )
+        client = Client(cluster)
+        logger.info("Initialised Dask LocalCluster: dashboard at %s", client.dashboard_link)
+
+    raw_dir = Path(config["ingest"]["raw_dir"])
     csv_files = sorted(raw_dir.glob("*.csv"))
     if not csv_files:
-        raise FileNotFoundError(f"No CSV files found in {raw_dir}")
+        raise IngestError(f"No CSV files found in {raw_dir}")
 
-    logger.info("Found %d CSV file(s) in %s", len(csv_files), raw_dir)
+    ddf_list: list[dd.DataFrame] = []
+    for csv_path in csv_files:
+        log_file_metadata(csv_path)
+        ddf_list.append(make_delayed_df(csv_path, config))
 
-    client, created = get_or_create_client(config)
-
-    try:
-        delayed_list = [delayed(read_raw_file)(fp) for fp in csv_files]
-        meta = build_meta()
-        ddf = dd.from_delayed(delayed_list, meta=meta)
-
-        missing_cols = validate_schema(ddf, list(meta.columns))
-        if missing_cols:
-            logger.warning("Missing columns detected: %s", missing_cols)
-
-        ddf = ddf.map_partitions(_filter_year, year_start=year_start, meta=ddf._meta)
-
-        npartitions = min(ddf.npartitions, 50)
-        ddf = ddf.repartition(npartitions=npartitions)
-
-        npartitions_out = max(1, ddf.npartitions // 10)
-
-        interim_dir.mkdir(parents=True, exist_ok=True)
-        output_path = interim_dir / "cogcc_raw.parquet"
-
-        logger.info("Writing interim Parquet to %s (%d partitions)", output_path, npartitions_out)
-        try:
-            ddf.repartition(npartitions=npartitions_out).to_parquet(
-                str(output_path), write_index=False, engine="pyarrow"
-            )
-        except Exception as exc:
-            logger.error("Dask computation error during ingest: %s", exc)
-            raise RuntimeError(f"Ingest computation failed: {exc}") from exc
-
-        logger.info("Ingest complete. Output: %s", output_path)
-    finally:
-        if created:
-            client.close()
+    ddf = dd.concat(ddf_list)
+    validate_schema(ddf)
+    write_interim(ddf, config)
+    return ddf

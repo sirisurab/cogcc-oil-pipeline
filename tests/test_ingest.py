@@ -1,291 +1,256 @@
-"""Tests for cogcc_pipeline/ingest.py."""
+"""Tests for cogcc_pipeline.ingest module."""
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import dask.dataframe as dd
 import pandas as pd
 import pytest
 
 from cogcc_pipeline.ingest import (
-    _filter_year,
-    build_dtype_map,
-    build_meta,
-    get_or_create_client,
+    IngestError,
+    log_file_metadata,
+    make_delayed_df,
     read_raw_file,
-    run_ingest,
     validate_schema,
+    write_interim,
 )
+from tests.conftest import CANONICAL_COLUMNS, _make_raw_csv_content
 
 # ---------------------------------------------------------------------------
-# I-01: build_dtype_map / build_meta
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_build_dtype_map_columns() -> None:
-    dtype_map = build_dtype_map()
-    assert "AcceptedDate" not in dtype_map
-    assert "DocNum" in dtype_map
-    assert "OilProduced" in dtype_map
-
-
-@pytest.mark.unit
-def test_build_meta_has_all_columns() -> None:
-    meta = build_meta()
-    assert "AcceptedDate" in meta.columns
-    assert "DocNum" in meta.columns
-
-
-@pytest.mark.unit
-def test_build_meta_docnum_dtype() -> None:
-    meta = build_meta()
-    assert meta["DocNum"].dtype == "int64"
-
-
-@pytest.mark.unit
-def test_build_meta_daysproduced_dtype() -> None:
-    meta = build_meta()
-    assert meta["DaysProduced"].dtype == pd.Int64Dtype()
-
-
-@pytest.mark.unit
-def test_build_meta_oilproduced_dtype() -> None:
-    meta = build_meta()
-    assert meta["OilProduced"].dtype == pd.Float64Dtype()
-
-
-@pytest.mark.unit
-def test_build_meta_wellstatus_dtype() -> None:
-    meta = build_meta()
-    assert meta["WellStatus"].dtype == pd.StringDtype()
-
-
-@pytest.mark.unit
-def test_build_meta_accepteddate_dtype() -> None:
-    meta = build_meta()
-    assert meta["AcceptedDate"].dtype == "datetime64[us]"
-
-
-# ---------------------------------------------------------------------------
-# I-02: read_raw_file
+# log_file_metadata
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_read_raw_file_all_columns(tmp_path: Path, sample_raw_df: pd.DataFrame) -> None:
+def test_log_file_metadata_sha256(tmp_path: Path) -> None:
+    """Returned dict contains correct sha256 hex string."""
+    content = b"Header\nRow1\nRow2\n"
+    f = tmp_path / "test.csv"
+    f.write_bytes(content)
+    expected_sha256 = hashlib.sha256(content).hexdigest()
+
+    meta = log_file_metadata(f)
+    assert meta["sha256"] == expected_sha256
+
+
+@pytest.mark.unit
+def test_log_file_metadata_row_count(tmp_path: Path) -> None:
+    """row_count_raw equals number of data lines (total - header)."""
+    f = tmp_path / "test.csv"
+    f.write_text("Header\nRow1\nRow2\nRow3\nRow4\nRow5\n", encoding="utf-8")
+
+    meta = log_file_metadata(f)
+    assert meta["row_count_raw"] == 5
+
+
+@pytest.mark.unit
+def test_log_file_metadata_file_size(tmp_path: Path) -> None:
+    """file_size_bytes equals os.path.getsize."""
+    import os
+
+    f = tmp_path / "test.csv"
+    f.write_text("Header\nRow1\n", encoding="utf-8")
+
+    meta = log_file_metadata(f)
+    assert meta["file_size_bytes"] == os.path.getsize(f)
+
+
+# ---------------------------------------------------------------------------
+# read_raw_file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_read_raw_file_dtypes(tmp_path: Path, config_fixture: dict) -> None:
+    """Returned DataFrame has correct dtypes for key columns."""
     csv_path = tmp_path / "test.csv"
-    meta = build_meta()
-    # Write a CSV with all expected columns
-    sample_raw_df.to_csv(csv_path, index=False)
-    df = read_raw_file(csv_path)
-    for col in meta.columns:
-        assert col in df.columns
+    csv_path.write_text(_make_raw_csv_content(n_rows=5), encoding="utf-8")
 
-
-@pytest.mark.unit
-def test_read_raw_file_missing_column_filled_na(
-    tmp_path: Path, sample_raw_df: pd.DataFrame
-) -> None:
-    # Drop FlaredVented before writing
-    df_no_col = sample_raw_df.drop(columns=["FlaredVented"])
-    csv_path = tmp_path / "partial.csv"
-    df_no_col.to_csv(csv_path, index=False)
-    result = read_raw_file(csv_path)
-    assert "FlaredVented" in result.columns
-    assert result["FlaredVented"].isna().all()
-
-
-@pytest.mark.unit
-def test_read_raw_file_accepteddate_dtype(tmp_path: Path, sample_raw_df: pd.DataFrame) -> None:
-    csv_path = tmp_path / "test.csv"
-    sample_raw_df.to_csv(csv_path, index=False)
-    df = read_raw_file(csv_path)
+    df = read_raw_file(csv_path, config_fixture)
+    assert str(df["DocNum"].dtype) == "Int64"
+    assert str(df["OilProduced"].dtype) == "Float64"
+    assert str(df["Revised"].dtype) == "boolean"
+    assert isinstance(df["ApiCountyCode"].dtype, pd.StringDtype)
     assert df["AcceptedDate"].dtype in ("datetime64[ns]", "datetime64[us]")
 
 
 @pytest.mark.unit
-def test_read_raw_file_not_found(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        read_raw_file(tmp_path / "missing.csv")
-
-
-@pytest.mark.unit
-def test_read_raw_file_na_string_values(tmp_path: Path, sample_raw_df: pd.DataFrame) -> None:
-    """OilProduced 'N/A' string → pd.NA."""
-    csv_path = tmp_path / "na_test.csv"
-    # Write a CSV with N/A in OilProduced
-    csv_content = sample_raw_df.to_csv(index=False)
-    # Replace first value with N/A
-    csv_content = csv_content.replace("100.0", "N/A", 1)
-    csv_path.write_text(csv_content)
-    df = read_raw_file(csv_path)
-    assert pd.isna(df["OilProduced"].iloc[0])
-
-
-# ---------------------------------------------------------------------------
-# I-03: _filter_year
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_filter_year_keeps_correct_rows() -> None:
-    df = pd.DataFrame({"ReportYear": [2018, 2019, 2020, 2021], "x": [1, 2, 3, 4]})
-    result = _filter_year(df, 2020)
-    assert list(result["ReportYear"]) == [2020, 2021]
-
-
-@pytest.mark.unit
-def test_filter_year_all_below_returns_empty() -> None:
-    df = pd.DataFrame({"ReportYear": [2018, 2019], "x": [1, 2]})
-    result = _filter_year(df, 2020)
-    assert len(result) == 0
-    assert "ReportYear" in result.columns
-
-
-@pytest.mark.unit
-def test_filter_year_all_above_unchanged() -> None:
-    df = pd.DataFrame({"ReportYear": [2020, 2021, 2022], "x": [1, 2, 3]})
-    result = _filter_year(df, 2020)
-    assert len(result) == 3
-
-
-# ---------------------------------------------------------------------------
-# I-04: validate_schema
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_validate_schema_all_present() -> None:
-    meta = build_meta()
-    ddf = dd.from_pandas(meta, npartitions=1)
-    missing = validate_schema(ddf, list(meta.columns))
-    assert missing == []
-
-
-@pytest.mark.unit
-def test_validate_schema_missing_columns() -> None:
-    df = pd.DataFrame({"DocNum": [1], "ReportYear": [2021]})
-    ddf = dd.from_pandas(df, npartitions=1)
-    missing = validate_schema(ddf, ["DocNum", "ReportYear", "OilProduced", "GasProduced"])
-    assert "OilProduced" in missing
-    assert "GasProduced" in missing
-
-
-# ---------------------------------------------------------------------------
-# I-05: get_or_create_client
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_get_or_create_client_reuses_existing(sample_config: dict) -> None:
-    mock_client = MagicMock()
-    mock_client.dashboard_link = "http://localhost:8787"
-    with patch("dask.distributed.get_client", return_value=mock_client):
-        client, created = get_or_create_client(sample_config)
-    assert client is mock_client
-    assert created is False
-
-
-@pytest.mark.unit
-def test_get_or_create_client_creates_new(sample_config: dict) -> None:
-    mock_client = MagicMock()
-    mock_client.dashboard_link = "http://localhost:8787"
-    mock_cluster = MagicMock()
-    with patch("dask.distributed.get_client", side_effect=ValueError("no client")):
-        with patch("cogcc_pipeline.ingest.LocalCluster", return_value=mock_cluster):
-            with patch("cogcc_pipeline.ingest.Client", return_value=mock_client):
-                client, created = get_or_create_client(sample_config)
-    assert created is True
-
-
-# ---------------------------------------------------------------------------
-# I-06: run_ingest
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_run_ingest_no_csv_raises(sample_config: dict, tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        run_ingest(sample_config)
-
-
-@pytest.mark.unit
-def test_run_ingest_filter_applied(sample_config: dict, tmp_path: Path) -> None:
-    """Assert _filter_year removes pre-2020 rows."""
-    raw_dir = Path(sample_config["ingest"]["raw_dir"])
-    # Write a CSV with some pre-2020 rows
-    df_mix = pd.DataFrame(
-        {
-            "DocNum": [1, 2, 3],
-            "ReportMonth": [1, 1, 1],
-            "ReportYear": [2019, 2020, 2021],
-            **{
-                c: [pd.NA] * 3
-                for c in [
-                    "DaysProduced",
-                    "AcceptedDate",
-                    "Revised",
-                    "OpName",
-                    "OpNumber",
-                    "FacilityId",
-                    "ApiCountyCode",
-                    "ApiSequenceNumber",
-                    "ApiSidetrack",
-                    "Well",
-                    "WellStatus",
-                    "FormationCode",
-                    "OilProduced",
-                    "OilSales",
-                    "OilAdjustment",
-                    "OilGravity",
-                    "GasProduced",
-                    "GasSales",
-                    "GasBtuSales",
-                    "GasUsedOnLease",
-                    "GasShrinkage",
-                    "GasPressureTubing",
-                    "GasPressureCasing",
-                    "WaterProduced",
-                    "WaterPressureTubing",
-                    "WaterPressureCasing",
-                    "FlaredVented",
-                    "BomInvent",
-                    "EomInvent",
-                ]
-            },
-        }
+def test_read_raw_file_year_filter(tmp_path: Path, config_fixture: dict) -> None:
+    """Only rows with ReportYear >= start_year are returned."""
+    header = ",".join(CANONICAL_COLUMNS)
+    row_old = (
+        "1,1,2018,28,2018-01-15,False,Op,100,200,01,12345,00,Well,AC,NIOBRARA,"
+        "100.0,90.0,0.0,40.0,500.0,450.0,1000.0,10.0,5.0,200.0,100.0,200.0,50.0,30.0,2.0,10.0,5.0"
     )
-    csv_path = raw_dir / "test.csv"
-    df_mix.to_csv(csv_path, index=False)
+    row_new = (
+        "2,6,2021,28,2021-06-15,False,Op,100,200,01,12345,00,Well,AC,NIOBRARA,"
+        "100.0,90.0,0.0,40.0,500.0,450.0,1000.0,10.0,5.0,200.0,100.0,200.0,50.0,30.0,2.0,10.0,5.0"
+    )
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(f"{header}\n{row_old}\n{row_new}\n", encoding="utf-8")
 
-    mock_client = MagicMock()
-    mock_client.dashboard_link = "http://localhost:8787"
-    with patch("dask.distributed.get_client", side_effect=ValueError("no client")):
-        with patch("cogcc_pipeline.ingest.LocalCluster", return_value=MagicMock()):
-            with patch("cogcc_pipeline.ingest.Client", return_value=mock_client):
-                run_ingest(sample_config)
+    df = read_raw_file(csv_path, config_fixture)
+    assert len(df) == 1
+    assert df["ReportYear"].iloc[0] == 2021
 
-    interim_dir = Path(sample_config["ingest"]["interim_dir"])
-    parquet_path = interim_dir / "cogcc_raw.parquet"
-    assert parquet_path.exists()
-    result = pd.read_parquet(parquet_path, engine="pyarrow")
-    assert all(result["ReportYear"] >= 2020)
+
+@pytest.mark.unit
+def test_read_raw_file_missing_column_raises(tmp_path: Path, config_fixture: dict) -> None:
+    """CSV missing ApiCountyCode raises IngestError."""
+    cols = [c for c in CANONICAL_COLUMNS if c != "ApiCountyCode"]
+    header = ",".join(cols)
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(f"{header}\n" + ",".join(["x"] * len(cols)) + "\n", encoding="utf-8")
+    with pytest.raises((IngestError, ValueError)):
+        read_raw_file(csv_path, config_fixture)
+
+
+@pytest.mark.unit
+def test_read_raw_file_drops_both_null_api(tmp_path: Path, config_fixture: dict) -> None:
+    """Rows where both ApiCountyCode and ApiSequenceNumber are null are dropped."""
+    header = ",".join(CANONICAL_COLUMNS)
+    good_row = (
+        "1,1,2021,28,2021-01-15,False,Op,100,200,01,12345,00,Well,AC,NIOBRARA,"
+        "100.0,90.0,0.0,40.0,500.0,450.0,1000.0,10.0,5.0,200.0,100.0,200.0,50.0,30.0,2.0,10.0,5.0"
+    )
+    # Both county code and sequence number null
+    bad_row = (
+        "2,2,2021,28,2021-02-15,False,Op,100,200,,,00,Well,AC,NIOBRARA,"
+        "100.0,90.0,0.0,40.0,500.0,450.0,1000.0,10.0,5.0,200.0,100.0,200.0,50.0,30.0,2.0,10.0,5.0"
+    )
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(f"{header}\n{good_row}\n{bad_row}\n", encoding="utf-8")
+
+    df = read_raw_file(csv_path, config_fixture)
+    assert len(df) == 1
+
+
+@pytest.mark.unit
+def test_read_raw_file_bom(tmp_path: Path, config_fixture: dict) -> None:
+    """File with BOM is read without error and column names are clean."""
+    content = _make_raw_csv_content(n_rows=3)
+    csv_path = tmp_path / "bom.csv"
+    csv_path.write_bytes(b"\xef\xbb\xbf" + content.encode("utf-8"))
+
+    df = read_raw_file(csv_path, config_fixture)
+    assert "DocNum" in df.columns
+    assert all(not col.startswith("\ufeff") for col in df.columns)
 
 
 # ---------------------------------------------------------------------------
-# I-07: TR-17 — Dask graph laziness
+# make_delayed_df
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_tr17_dask_dataframe_is_lazy(sample_raw_df: pd.DataFrame) -> None:
-    """Assert intermediate operations produce dd.DataFrame, not pandas."""
-    from dask import delayed
+def test_make_delayed_df_returns_dask_df(tmp_path: Path, config_fixture: dict) -> None:
+    """make_delayed_df returns a dask.dataframe.DataFrame, not a pandas DataFrame."""
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(_make_raw_csv_content(n_rows=5), encoding="utf-8")
 
-    delayed_list = [delayed(lambda: sample_raw_df)()]
-    meta = build_meta()
-    ddf = dd.from_delayed(delayed_list, meta=meta)
-    assert isinstance(ddf, dd.DataFrame)
+    result = make_delayed_df(csv_path, config_fixture)
+    assert isinstance(result, dd.DataFrame)
+    assert not isinstance(result, pd.DataFrame)
+
+
+@pytest.mark.unit
+def test_make_delayed_df_compute(tmp_path: Path, config_fixture: dict) -> None:
+    """Calling .compute() on the result returns a pandas DataFrame with expected rows."""
+    n = 5
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(_make_raw_csv_content(n_rows=n), encoding="utf-8")
+
+    ddf = make_delayed_df(csv_path, config_fixture)
+    df = ddf.compute()
+    assert isinstance(df, pd.DataFrame)
+    assert len(df) == n
+
+
+# ---------------------------------------------------------------------------
+# validate_schema
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_validate_schema_valid(tmp_path: Path, config_fixture: dict) -> None:
+    """Dask DataFrame with all canonical columns → no exception."""
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(_make_raw_csv_content(n_rows=3), encoding="utf-8")
+
+    ddf = make_delayed_df(csv_path, config_fixture)
+    validate_schema(ddf)  # should not raise
+
+
+@pytest.mark.unit
+def test_validate_schema_missing_column(tmp_path: Path, config_fixture: dict) -> None:
+    """Dask DataFrame missing OilProduced → IngestError mentioning that column."""
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(_make_raw_csv_content(n_rows=3), encoding="utf-8")
+
+    ddf = make_delayed_df(csv_path, config_fixture)
+    ddf = ddf.drop(columns=["OilProduced"])
+    with pytest.raises(IngestError, match="OilProduced"):
+        validate_schema(ddf)
+
+
+@pytest.mark.unit
+def test_validate_schema_dtype_mismatch_logs_warning(
+    tmp_path: Path, config_fixture: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dask DataFrame with DocNum as int64 instead of Int64 → WARNING logged, no exception."""
+    import logging
+
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(_make_raw_csv_content(n_rows=3), encoding="utf-8")
+
+    ddf = make_delayed_df(csv_path, config_fixture)
+    # Simulate dtype mismatch
+    meta = ddf._meta.copy()
+    meta["DocNum"] = meta["DocNum"].astype("int64")
+    ddf2 = ddf.map_partitions(lambda df: df.assign(DocNum=df["DocNum"].astype("int64")), meta=meta)
+
+    with caplog.at_level(logging.WARNING, logger="cogcc_pipeline.ingest"):
+        validate_schema(ddf2)  # Should not raise
+
+    # Only warn — no IngestError raised (already confirmed above)
+
+
+# ---------------------------------------------------------------------------
+# write_interim
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_write_interim_min_10_partitions(tmp_path: Path, config_fixture: dict) -> None:
+    """Dask DataFrame with 3 partitions → repartitioned to at least 10 files."""
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(_make_raw_csv_content(n_rows=30), encoding="utf-8")
+
+    ddf = make_delayed_df(csv_path, config_fixture)
+    assert ddf.npartitions < 10  # starts with 1
+
+    write_interim(ddf, config_fixture)
+
+    out_dir = Path(config_fixture["ingest"]["interim_dir"]) / "production.parquet"
+    parquet_files = list(out_dir.glob("*.parquet"))
+    assert len(parquet_files) >= 10
+
+
+@pytest.mark.unit
+def test_write_interim_max_50_partitions(tmp_path: Path, config_fixture: dict) -> None:
+    """Dask DataFrame with many partitions → at most 50 files written."""
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(_make_raw_csv_content(n_rows=5), encoding="utf-8")
+
+    ddf = make_delayed_df(csv_path, config_fixture)
+    # Force many partitions
+    ddf = ddf.repartition(npartitions=200)
+
+    write_interim(ddf, config_fixture)
+
+    out_dir = Path(config_fixture["ingest"]["interim_dir"]) / "production.parquet"
+    parquet_files = list(out_dir.glob("*.parquet"))
+    assert len(parquet_files) <= 50

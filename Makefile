@@ -4,29 +4,28 @@ env:
 	python3 -m venv .venv
 
 install:
-	python3 -m pip install --upgrade pip setuptools wheel
-	pip install -e ".[dev]"
+	. .venv/bin/activate && pip install --upgrade pip setuptools wheel && pip install -e ".[dev]"
 
 acquire:
-	cogcc-pipeline --stages acquire
+	python -m cogcc_pipeline.pipeline --stages acquire
 
 ingest:
-	cogcc-pipeline --stages ingest
+	python -m cogcc_pipeline.pipeline --stages ingest
 
 transform:
-	cogcc-pipeline --stages transform
+	python -m cogcc_pipeline.pipeline --stages transform
 
 features:
-	cogcc-pipeline --stages features
+	python -m cogcc_pipeline.pipeline --stages features
 
 pipeline: acquire ingest transform features
 	cogcc-pipeline
 
 test:
-	pytest tests/
+	pytest tests/ -v
 
 lint:
-	ruff check .
+	ruff check cogcc_pipeline/ tests/
 
 typecheck:
 	mypy cogcc_pipeline/

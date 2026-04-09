@@ -1,335 +1,361 @@
-# Acquire Stage — Task Specifications
+# Acquire Component Tasks
 
-**Package:** `cogcc_pipeline`
-**Module:** `cogcc_pipeline/acquire.py`
+**Pipeline package:** `cogcc_pipeline`
+**Module file:** `cogcc_pipeline/acquire.py`
 **Test file:** `tests/test_acquire.py`
 
 ## Overview
 
-The acquire stage downloads COGCC annual production ZIP files (2020 through the prior year) and the current-year monthly CSV directly from the ECMC server. Files are saved to `data/raw/`. A JSON download manifest is written to `data/raw/download_manifest.json` recording metadata for every acquired file. All configuration is read from `config.yaml`. Parallel downloads use the Dask threaded scheduler (not `dask.distributed`).
+The acquire stage downloads COGCC/ECMC production data files from the Colorado Energy
+and Carbon Management Commission (ECMC) website. For historical years (2020 through the
+year prior to the current year), it downloads annual ZIP archives and extracts the
+contained CSV. For the current year it downloads a single flat monthly CSV directly.
+All resulting CSV files are placed in `data/raw/`. Downloads are parallelised using the
+Dask threaded scheduler (not the distributed scheduler). A 0.5-second sleep per worker
+is applied to avoid server overload. The stage is fully idempotent — re-running it must
+skip files that already exist and are valid.
 
-## Data Sources
+---
 
-| Year | URL pattern | Local filename |
-|------|-------------|----------------|
-| 2020 … prior year | `https://ecmc.state.co.us/documents/data/downloads/production/{year}_prod_reports.zip` | `data/raw/{year}_prod_reports.csv` (after unzip) |
-| Current year | `https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv` | `data/raw/monthly_prod.csv` |
+## Design Decisions and Constraints
 
-## Design Decisions & Constraints
+- URL patterns are read from `config.yaml` (`acquire` section). No URL is hardcoded in
+  `acquire.py`.
+- Historical years: `https://ecmc.state.co.us/documents/data/downloads/production/{year}_prod_reports.zip`
+- Current year: `https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv`
+- Output filenames:
+  - Historical: `data/raw/{year}_prod_reports.csv`
+  - Current year: `data/raw/monthly_prod.csv`
+- Maximum 5 concurrent download workers (from `config.yaml acquire.max_workers`).
+- Use `requests` + `BeautifulSoup` only. Do NOT use Playwright or any browser automation.
+- Use Dask's threaded scheduler: pass `scheduler="threads"` and
+  `num_workers=config["acquire"]["max_workers"]` directly to `dask.compute()`. Do NOT
+  initialise a distributed Client in this stage.
+- Skip download if the target file already exists on disk AND has size > 0 bytes AND is
+  readable as UTF-8 text with at least one data row beyond the header. Log a
+  `DEBUG` message for skipped files.
+- Log a `WARNING` if a downloaded file is 0 bytes; do not raise.
+- All other HTTP or IO errors must be caught, logged at `ERROR` level, and re-raised as
+  `AcquireError`.
+- The `data/raw/` directory is created automatically if it does not exist.
+- `logs/` directory must be created at startup if absent; log to both stdout and
+  `logs/pipeline.log`.
 
-- Use `requests` with retry logic (exponential backoff, configurable max retries) for all HTTP operations. Do **not** use Playwright or any browser automation.
-- Parallel downloads use `dask.compute()` with `scheduler="threads"` and `num_workers` from `config["acquire"]["max_workers"]` (maximum 5 concurrent workers). Do **not** initialize a `dask.distributed` Client in this stage.
-- Each download worker sleeps 0.5 seconds after completing its download to avoid overloading the server.
-- Skip already-downloaded files (idempotent): if the local CSV already exists, do not re-download.
-- ZIP files are downloaded to a temp path inside `data/raw/`, extracted, then the ZIP is deleted — only the extracted CSV is kept.
-- A download manifest (`data/raw/download_manifest.json`) records, for each file: `url`, `filename`, `size_bytes`, `download_timestamp` (ISO-8601 UTC), `md5_checksum`.
-- All configurable values (URLs, directory paths, worker counts, retry settings, year range) come from `config.yaml` — never hardcoded.
-- Use `pathlib.Path` throughout (no `os.path`).
-- All functions must have type hints and docstrings.
-- Logging via Python `logging` module (not `print`). Logs go to both stdout and `logs/pipeline.log`.
+---
 
-## `config.yaml` — acquire section
+## Task 01: Scaffold project structure and pyproject.toml
+
+**Module:** `pyproject.toml`, `Makefile`, `config.yaml`, `.gitignore`, `cogcc_pipeline/__init__.py`
+
+**Description:**
+Create the project scaffold required before any pipeline code can be written.
+
+**Artefacts to create:**
+
+### `pyproject.toml`
+- `build-backend` must be `"setuptools.build_meta"` (never `"setuptools.backends.legacy:build"`).
+- Package name: `cogcc-pipeline`; `packages = [{find = {}}]`; `python_requires = ">=3.11"`
+- Runtime dependencies: `pandas`, `numpy`, `requests`, `pyarrow`, `dask[distributed]`,
+  `bokeh`, `scikit-learn`, `pydantic`, `tqdm`, `pyyaml`, `beautifulsoup4`, `lxml`
+- Dev dependencies: `pytest`, `pytest-mock`, `ruff`, `mypy`, `pandas-stubs`,
+  `types-requests`, `types-PyYAML`
+- CLI entry point: `cogcc-pipeline = "cogcc_pipeline.pipeline:main"`
+
+### `Makefile`
+- `env` target: creates `.venv` using `python3 -m venv .venv`
+- `install` target: activates venv, runs `pip install --upgrade pip setuptools wheel`,
+  then `pip install -e ".[dev]"`
+- Individual stage targets (`acquire`, `ingest`, `transform`, `features`) each invoke the
+  CLI with the appropriate stage argument, e.g.:
+  `python -m cogcc_pipeline.pipeline --stages acquire`
+- `pipeline` target: depends on `acquire ingest transform features` in order and invokes
+  `cogcc-pipeline` (the registered CLI entry point) with no arguments (runs all stages).
+- `test` target: `pytest tests/ -v`
+- `lint` target: `ruff check cogcc_pipeline/ tests/`
+- `typecheck` target: `mypy cogcc_pipeline/`
+
+### `config.yaml`
+Top-level sections: `acquire`, `ingest`, `transform`, `features`, `dask`, `logging`.
 
 ```
 acquire:
-  year_start: 2020
+  start_year: 2020
+  raw_dir: "data/raw"
   max_workers: 5
-  retry_max_attempts: 3
-  retry_backoff_factor: 1.0
   zip_url_template: "https://ecmc.state.co.us/documents/data/downloads/production/{year}_prod_reports.zip"
   monthly_url: "https://ecmc.state.co.us/documents/data/downloads/production/monthly_prod.csv"
+  sleep_seconds: 0.5
+
+ingest:
   raw_dir: "data/raw"
+  interim_dir: "data/interim"
+  start_year: 2020
+
+transform:
+  interim_dir: "data/interim"
+  processed_dir: "data/processed"
+
+features:
+  processed_dir: "data/processed"
+  output_dir: "data/features"
+  rolling_windows: [3, 6]
+  lag_periods: [1, 3]
+
+dask:
+  scheduler: "local"
+  n_workers: 2
+  threads_per_worker: 2
+  memory_limit: "3GB"
+  dashboard_port: 8787
+
+logging:
+  log_file: "logs/pipeline.log"
+  level: "INFO"
 ```
 
----
+### `.gitignore`
+Must include: `.venv/`, `__pycache__/`, `*.pyc`, `*.egg-info/`, `.pytest_cache/`,
+`dist/`, `build/`, `logs/`, `data/`, `large_tool_results/`, `conversation_history/`
 
-## Task A-01: Project scaffolding and configuration
+### `cogcc_pipeline/__init__.py`
+Empty init; version string `__version__ = "0.1.0"`.
 
-**Module:** `cogcc_pipeline/__init__.py`, `cogcc_pipeline/acquire.py`, `config.yaml`, `pyproject.toml`, `Makefile`, `.gitignore`, `requirements.txt`
-
-**Description:**
-Create the full project scaffold. This is done **once** and shared across all pipeline stages.
-
-### Files to create
-
-1. **`pyproject.toml`**
-   - `build-backend = "setuptools.build_meta"` (never `legacy:build`)
-   - Package name: `cogcc_pipeline`
-   - Python requires: `>=3.11`
-   - Runtime dependencies: `requests`, `pandas>=2.0`, `pyarrow`, `dask[distributed]`, `bokeh`, `pyyaml`, `scikit-learn`, `numpy`
-   - Dev dependencies: `pytest`, `pytest-mock`, `mypy`, `ruff`, `pandas-stubs`, `types-requests`
-   - Entry point: `cogcc-pipeline = cogcc_pipeline.pipeline:main`
-
-2. **`config.yaml`**
-   - Top-level sections: `acquire`, `ingest`, `transform`, `features`, `dask`, `logging`
-   - `acquire` section: per design decisions above
-   - `ingest` section: `raw_dir: "data/raw"`, `interim_dir: "data/interim"`, `year_start: 2020`
-   - `transform` section: `interim_dir: "data/interim"`, `processed_dir: "data/processed"`, `date_start: "2020-01-01"`
-   - `features` section: `interim_dir: "data/interim"`, `processed_dir: "data/processed"`, `rolling_windows: [3, 6]`, `decline_rate_clip_min: -1.0`, `decline_rate_clip_max: 10.0`
-   - `dask` section: `scheduler: "local"`, `n_workers: 2`, `threads_per_worker: 2`, `memory_limit: "3GB"`, `dashboard_port: 8787`
-   - `logging` section: `log_file: "logs/pipeline.log"`, `level: "INFO"`
-
-3. **`Makefile`**
-   - `make env`: creates `.venv` using `python3 -m venv .venv`
-   - `make install`: bootstraps pip/setuptools/wheel then runs `pip install -e ".[dev]"`. Never use `pip install -r requirements.txt` as the sole install step.
-   - `make acquire`: runs the acquire stage via the CLI entry point
-   - `make ingest`: runs the ingest stage
-   - `make transform`: runs the transform stage
-   - `make features`: runs the features stage
-   - `make pipeline`: depends on `acquire ingest transform features` in sequence. Invokes the CLI entry point.
-   - `make test`: runs `pytest tests/`
-   - `make lint`: runs `ruff check .`
-   - `make typecheck`: runs `mypy cogcc_pipeline/`
-
-4. **`.gitignore`**
-   - Must include: `data/`, `logs/`, `large_tool_results/`, `conversation_history/`, `.venv/`, `__pycache__/`, `*.egg-info/`, `.DS_Store`
-
-5. **`cogcc_pipeline/__init__.py`** — empty or package-level docstring only.
-
-6. **`requirements.txt`** — list all third-party packages used across the pipeline (not pinned versions; this file supplements `pyproject.toml` for reference).
-
-**Definition of done:** All scaffold files exist. `pip install -e ".[dev]"` succeeds in a fresh venv. `ruff` and `mypy` report no errors on the empty package skeleton. `requirements.txt` updated with all third-party packages imported in this task.
+**Definition of done:** All scaffold files exist. `make env && make install` completes
+without errors. `cogcc-pipeline --help` prints usage. `pytest tests/` runs (even with 0
+tests). `ruff check cogcc_pipeline/` and `mypy cogcc_pipeline/` report no errors.
+`requirements.txt` updated with all third-party packages imported in this task.
 
 ---
 
-## Task A-02: Logging setup utility
+## Task 02: Implement custom exception and config loader
 
 **Module:** `cogcc_pipeline/acquire.py`
+**Classes/Functions:**
+- `class AcquireError(RuntimeError)` — raised on unrecoverable download or extraction errors
+- `load_config(config_path: str = "config.yaml") -> dict` — reads and returns the parsed
+  YAML config dict
+
+**Description:**
+`AcquireError` is a thin subclass of `RuntimeError` with no additional attributes.
+`load_config` uses `pyyaml` to parse `config.yaml`. It must raise `FileNotFoundError` if
+the config file does not exist, and `ValueError` if any required top-level key
+(`acquire`, `ingest`, `transform`, `features`, `dask`, `logging`) is absent.
+
+**Error handling:**
+- `FileNotFoundError` when config path is missing
+- `ValueError` when required sections are absent
+
+**Dependencies:** `pyyaml`
+
+**Test cases:**
+
+- `@pytest.mark.unit` — Given a valid config dict written to a temp file, assert
+  `load_config` returns a dict with all six required top-level keys.
+- `@pytest.mark.unit` — Given a config file missing the `dask` key, assert `load_config`
+  raises `ValueError`.
+- `@pytest.mark.unit` — Given a non-existent path, assert `load_config` raises
+  `FileNotFoundError`.
+
+**Definition of done:** `AcquireError` and `load_config` implemented, all test cases
+pass, ruff and mypy report no errors, `requirements.txt` updated with all third-party
+packages imported in this task.
+
+---
+
+## Task 03: Implement file validity checker
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `is_valid_file(path: Path) -> bool`
+
+**Description:**
+Returns `True` if and only if:
+1. `path` exists on disk
+2. `path.stat().st_size > 0`
+3. The file is readable as UTF-8 text without a `UnicodeDecodeError`
+4. The file contains at least one non-header data line (i.e., line count >= 2)
+
+Returns `False` for any other condition. Never raises.
+
+**Dependencies:** `pathlib`
+
+**Test cases:**
+
+- `@pytest.mark.unit` — Given a temp file with a header and one data row, assert returns
+  `True`.
+- `@pytest.mark.unit` — Given an empty temp file (0 bytes), assert returns `False`.
+- `@pytest.mark.unit` — Given a temp file with only a header line and no data rows, assert
+  returns `False`.
+- `@pytest.mark.unit` — Given a path that does not exist, assert returns `False`.
+- `@pytest.mark.unit` — Given a temp file containing invalid UTF-8 bytes, assert returns
+  `False`.
+
+**Definition of done:** `is_valid_file` implemented, all test cases pass, ruff and mypy
+report no errors, `requirements.txt` updated with all third-party packages imported in
+this task.
+
+---
+
+## Task 04: Implement ZIP downloader and extractor for historical years
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:**
+`download_year_zip(year: int, config: dict) -> Path`
+
+**Description:**
+Downloads the annual production ZIP file for a given historical year and extracts the
+first CSV found inside the archive. Steps:
+1. Construct the ZIP URL from `config["acquire"]["zip_url_template"].format(year=year)`.
+2. Construct the expected output path: `Path(config["acquire"]["raw_dir"]) / f"{year}_prod_reports.csv"`.
+3. If `is_valid_file(output_path)` returns `True`, log at `DEBUG` level and return
+   `output_path` immediately (idempotent skip).
+4. Otherwise, `GET` the ZIP URL using `requests`, stream the response, write to a temp
+   file, then extract the first `.csv` entry from the ZIP archive to `output_path`.
+5. Sleep `config["acquire"]["sleep_seconds"]` seconds after the download completes.
+6. If the resulting file fails `is_valid_file`, log a `WARNING`.
+7. On any `requests.RequestException` or `zipfile.BadZipFile`, catch, log `ERROR`, raise
+   `AcquireError`.
+
+**Returns:** `Path` to the extracted CSV file.
+
+**Error handling:**
+- `AcquireError` on network or ZIP extraction failures
+- Logs `DEBUG` for skipped (already valid) files
+- Logs `WARNING` for 0-byte or unreadable results
+- Logs `ERROR` before re-raising as `AcquireError`
+
+**Dependencies:** `requests`, `zipfile`, `pathlib`, `time`
+
+**Test cases:**
+
+- `@pytest.mark.unit` — Mock `requests.get` to return a valid ZIP bytes payload; assert
+  the function returns a `Path` pointing to a `.csv` file in the configured raw dir.
+- `@pytest.mark.unit` — If the output CSV already exists and passes `is_valid_file`,
+  assert the function returns immediately without calling `requests.get` (mock is never
+  called).
+- `@pytest.mark.unit` — Mock `requests.get` to raise `requests.ConnectionError`; assert
+  `AcquireError` is raised.
+- `@pytest.mark.unit` — Mock `requests.get` to return a non-ZIP binary payload; assert
+  `AcquireError` is raised (bad zip file).
+- `@pytest.mark.integration` — Given network access, call `download_year_zip(2020, config)`;
+  assert the returned path exists in `data/raw/` and passes `is_valid_file`.
+
+**Definition of done:** `download_year_zip` implemented, all test cases pass, ruff and
+mypy report no errors, `requirements.txt` updated with all third-party packages imported
+in this task.
+
+---
+
+## Task 05: Implement current-year monthly CSV downloader
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `download_monthly_csv(config: dict) -> Path`
+
+**Description:**
+Downloads the current-year monthly production CSV directly (no ZIP). Steps:
+1. URL: `config["acquire"]["monthly_url"]`.
+2. Output path: `Path(config["acquire"]["raw_dir"]) / "monthly_prod.csv"`.
+3. If `is_valid_file(output_path)` returns `True`, log `DEBUG` and return immediately.
+4. Otherwise stream-download and write to `output_path`.
+5. Sleep `config["acquire"]["sleep_seconds"]` after download.
+6. Warn if result fails `is_valid_file`.
+7. On `requests.RequestException`, catch, log `ERROR`, raise `AcquireError`.
+
+**Returns:** `Path` to the downloaded CSV file.
+
+**Dependencies:** `requests`, `pathlib`, `time`
+
+**Test cases:**
+
+- `@pytest.mark.unit` — Mock `requests.get` to return CSV text; assert the function
+  returns a `Path` with filename `monthly_prod.csv`.
+- `@pytest.mark.unit` — If `monthly_prod.csv` already exists and is valid, assert
+  `requests.get` is never called.
+- `@pytest.mark.unit` — Mock `requests.get` to raise `requests.Timeout`; assert
+  `AcquireError` is raised.
+- `@pytest.mark.integration` — With network access, call `download_monthly_csv(config)`;
+  assert the file exists and passes `is_valid_file`.
+
+**Definition of done:** `download_monthly_csv` implemented, all test cases pass, ruff and
+mypy report no errors, `requirements.txt` updated with all third-party packages imported
+in this task.
+
+---
+
+## Task 06: Implement parallel acquire orchestrator
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `run_acquire(config: dict) -> list[Path]`
+
+**Description:**
+Orchestrates parallel downloads for all target years using the Dask threaded scheduler.
+Steps:
+1. Compute `target_years`: `range(config["acquire"]["start_year"], current_year)` for
+   historical years (exclusive of current year).
+2. Build a list of `dask.delayed` calls: one `delayed(download_year_zip)(year, config)`
+   per historical year, plus one `delayed(download_monthly_csv)(config)` for the current
+   year.
+3. Call `dask.compute(*delayed_list, scheduler="threads",
+   num_workers=config["acquire"]["max_workers"])`.
+4. Return the flat list of `Path` objects from the compute result.
+5. Log the total number of files downloaded and their paths at `INFO` level.
+
+**Important:** Do NOT initialise a `distributed.Client` or `LocalCluster` anywhere in the
+acquire stage. Use only `scheduler="threads"` passed to `dask.compute()`.
+
+**Dependencies:** `dask`, `pathlib`, `datetime`
+
+**Test cases:**
+
+- `@pytest.mark.unit` — Mock `download_year_zip` and `download_monthly_csv`; assert
+  `run_acquire` returns a list of `Path` objects of length = (current_year - start_year + 1).
+- `@pytest.mark.unit` — Assert that `dask.compute` is called with `scheduler="threads"`
+  (use `pytest-mock` to spy on `dask.compute`).
+- `@pytest.mark.unit` — If one `download_year_zip` raises `AcquireError`, assert the
+  error propagates out of `run_acquire`.
+- `@pytest.mark.integration` — Run `run_acquire(config)` with network; assert one CSV
+  per target year exists in `data/raw/` and all pass `is_valid_file` (TR-20, TR-21).
+
+**Acquire idempotency test (TR-20):**
+
+- `@pytest.mark.unit` — Mock all downloaders; call `run_acquire` twice; assert the
+  mock downloader is called the same number of times in both runs (files already valid
+  on the second run trigger the skip path and do not re-download).
+
+**Acquired file integrity test (TR-21):**
+
+- `@pytest.mark.integration` — After `run_acquire`, iterate every file in `data/raw/`;
+  assert each file has `stat().st_size > 0`, is readable as UTF-8, and has at least one
+  data row beyond the header.
+
+**Definition of done:** `run_acquire` implemented, all test cases pass (including TR-20
+and TR-21), ruff and mypy report no errors, `requirements.txt` updated with all
+third-party packages imported in this task.
+
+---
+
+## Task 07: Implement logging setup helper
+
+**Module:** `cogcc_pipeline/acquire.py` (also used by all other pipeline modules via import)
 **Function:** `setup_logging(config: dict) -> logging.Logger`
 
 **Description:**
-Create a module-level logging setup function. It must configure a logger that writes to both stdout (`StreamHandler`) and `logs/pipeline.log` (`FileHandler`). The `logs/` directory must be created if it does not exist. Log level and log file path are read from `config["logging"]`.
+Configures the root logger with two handlers:
+1. A `StreamHandler` writing to stdout at the configured level.
+2. A `FileHandler` writing to `config["logging"]["log_file"]`.
 
-**Parameters:**
-- `config`: full config dict loaded from `config.yaml`
-
-**Returns:** configured `logging.Logger` instance
-
-**Error handling:**
-- If `logs/` cannot be created due to permission error, raise `OSError` with descriptive message.
+Creates the `logs/` directory if it does not exist. Returns the configured logger.
+This function is called once at pipeline startup in `pipeline.py` and must be safe to
+call multiple times without duplicating handlers (check `logger.handlers` before adding).
 
 **Dependencies:** `logging`, `pathlib`
 
-**Definition of done:** Function implemented, logs written to both stdout and file simultaneously, `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task A-03: Configuration loader
-
-**Module:** `cogcc_pipeline/acquire.py`
-**Function:** `load_config(config_path: Path) -> dict`
-
-**Description:**
-Load `config.yaml` and return as a Python dict. Validate that all required top-level sections (`acquire`, `ingest`, `transform`, `features`, `dask`, `logging`) are present. Raise `KeyError` with a descriptive message if any section is missing.
-
-**Parameters:**
-- `config_path`: absolute or relative `Path` to `config.yaml`
-
-**Returns:** `dict` with full configuration
-
-**Error handling:**
-- File not found → raise `FileNotFoundError`
-- YAML parse error → raise `ValueError` wrapping the original exception
-- Missing section → raise `KeyError`
-
-**Dependencies:** `pyyaml`, `pathlib`
-
-**Definition of done:** Function implemented, all error paths tested, `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task A-04: MD5 checksum computation
-
-**Module:** `cogcc_pipeline/acquire.py`
-**Function:** `compute_md5(file_path: Path) -> str`
-
-**Description:**
-Compute the MD5 hexdigest of a file, reading in 8 KB chunks to support large files without loading the entire file into memory.
-
-**Parameters:**
-- `file_path`: path to the file
-
-**Returns:** lowercase hex MD5 string
-
-**Error handling:**
-- File not found → raise `FileNotFoundError`
-
-**Dependencies:** `hashlib`, `pathlib`
-
-**Test cases:**
-- `@pytest.mark.unit` Given a known small file with known content, assert the returned MD5 matches the expected hexdigest.
-- `@pytest.mark.unit` Given a non-existent path, assert `FileNotFoundError` is raised.
-
-**Definition of done:** Function implemented, tests pass, `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task A-05: HTTP file downloader with retry logic
-
-**Module:** `cogcc_pipeline/acquire.py`
-**Function:** `download_file(url: str, dest_path: Path, retry_max_attempts: int, retry_backoff_factor: float) -> Path`
-
-**Description:**
-Download a file from `url` and write it to `dest_path`. Implement exponential backoff retry: on HTTP errors or connection errors, wait `retry_backoff_factor * (2 ** attempt)` seconds before retrying. Stream the response body in chunks (8 KB) to support large files without loading entirely into memory. Sleep 0.5 seconds after a successful download.
-
-**Parameters:**
-- `url`: HTTP URL to download
-- `dest_path`: local path where file will be written
-- `retry_max_attempts`: maximum number of attempts (from config)
-- `retry_backoff_factor`: base multiplier for backoff (from config)
-
-**Returns:** `dest_path` (the path that was written)
-
-**Error handling:**
-- All attempts failed → raise `RuntimeError` with the URL and last exception message.
-- HTTP status ≥ 400 on final attempt → raise `RuntimeError`.
-- Parent directory of `dest_path` is created if it does not exist.
-
-**Dependencies:** `requests`, `time`, `pathlib`
-
-**Test cases:**
-- `@pytest.mark.unit` Mock `requests.get` to return a 200 response with binary content; assert file is written to `dest_path` and the function returns `dest_path`.
-- `@pytest.mark.unit` Mock `requests.get` to raise `requests.ConnectionError` on first two attempts and succeed on the third; assert the function returns successfully and the retry count was 3.
-- `@pytest.mark.unit` Mock `requests.get` to always raise `requests.ConnectionError`; assert `RuntimeError` is raised after `retry_max_attempts` attempts.
-- `@pytest.mark.unit` Mock `requests.get` to return HTTP 404; assert `RuntimeError` is raised.
-
-**Definition of done:** Function implemented, all test cases pass, `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task A-06: ZIP extractor
-
-**Module:** `cogcc_pipeline/acquire.py`
-**Function:** `extract_csv_from_zip(zip_path: Path, dest_dir: Path) -> Path`
-
-**Description:**
-Open the ZIP file at `zip_path`, find the first `.csv` file inside it, extract it to `dest_dir`, and delete the ZIP file. Return the path to the extracted CSV.
-
-**Parameters:**
-- `zip_path`: path to the downloaded ZIP file
-- `dest_dir`: directory where CSV should be placed
-
-**Returns:** `Path` to extracted CSV file
-
-**Error handling:**
-- ZIP contains no CSV file → raise `ValueError` describing the ZIP filename.
-- ZIP file is corrupted → let `zipfile.BadZipFile` propagate naturally.
-
-**Dependencies:** `zipfile`, `pathlib`
-
-**Test cases:**
-- `@pytest.mark.unit` Create an in-memory ZIP with a single CSV file; assert `extract_csv_from_zip` returns a path pointing to a `.csv` file in `dest_dir`.
-- `@pytest.mark.unit` Create an in-memory ZIP with no CSV files; assert `ValueError` is raised.
-- `@pytest.mark.unit` After extraction, assert the source ZIP file no longer exists on disk.
-
-**Definition of done:** Function implemented, tests pass, `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task A-07: Download manifest writer
-
-**Module:** `cogcc_pipeline/acquire.py`
-**Function:** `update_manifest(manifest_path: Path, entry: dict) -> None`
-
-**Description:**
-Read the existing JSON manifest from `manifest_path` (if it exists), add or update the entry keyed by `entry["filename"]`, and write the manifest back. Each manifest entry must contain: `url`, `filename`, `size_bytes`, `download_timestamp` (ISO-8601 UTC string), `md5_checksum`.
-
-**Parameters:**
-- `manifest_path`: path to the JSON manifest file
-- `entry`: dict with the fields listed above
-
-**Error handling:**
-- If manifest file does not exist, create it from scratch.
-- If manifest file contains invalid JSON, log a warning and overwrite it.
-
-**Dependencies:** `json`, `pathlib`, `logging`
-
-**Test cases:**
-- `@pytest.mark.unit` Given a non-existent manifest path, assert a new manifest file is created containing the entry.
-- `@pytest.mark.unit` Given an existing manifest with one entry, add a second entry and assert both entries are present in the result.
-- `@pytest.mark.unit` Given a manifest file with corrupted JSON, assert a warning is logged and the manifest is overwritten with the new entry.
-
-**Definition of done:** Function implemented, tests pass, `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task A-08: Per-year acquire worker
-
-**Module:** `cogcc_pipeline/acquire.py`
-**Function:** `acquire_year(year: int, config: dict) -> dict`
-
-**Description:**
-Acquire production data for a single year. Determines whether the year is the current year or a past year, selects the appropriate URL, skips download if the target CSV already exists on disk (idempotent), downloads, extracts (for ZIP years), computes MD5, and returns a manifest entry dict.
-
-**Parameters:**
-- `year`: the year to acquire (integer)
-- `config`: full config dict
-
-**Returns:** manifest entry dict (see Task A-07 for fields)
-
-**Behavior:**
-- If `year == current_year`: URL = `config["acquire"]["monthly_url"]`, dest = `data/raw/monthly_prod.csv`
-- If `year < current_year`: URL = zip template with year, dest = `data/raw/{year}_prod_reports.csv`; downloads ZIP to a temp path then calls `extract_csv_from_zip`
-- If dest CSV already exists: log a message ("Skipping {filename}, already exists") and return a manifest entry with `skipped: true`
-- After download (not skipped): call `compute_md5`, record `size_bytes`, `download_timestamp` (UTC now), write to manifest via `update_manifest`
-- Sleep 0.5 seconds after any successful download
-
-**Error handling:**
-- If download or extraction fails, log the error and re-raise so the Dask graph can surface the failure.
-
-**Dependencies:** `datetime`, `pathlib`, `logging`
-
-**Test cases:**
-- `@pytest.mark.unit` When the target CSV already exists, assert the function returns a dict with `skipped: True` and `download_file` is never called.
-- `@pytest.mark.unit` For a past year (mocked download and extraction), assert the returned dict contains all required manifest fields.
-- `@pytest.mark.unit` For the current year (mocked download), assert the dest filename is `monthly_prod.csv`.
-
-**Definition of done:** Function implemented, tests pass, `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task A-09: Acquire stage runner
-
-**Module:** `cogcc_pipeline/acquire.py`
-**Function:** `run_acquire(config: dict) -> list[dict]`
-
-**Description:**
-Top-level acquire stage entry point. Builds a list of years from `config["acquire"]["year_start"]` through the current year (inclusive), creates a Dask `delayed` task per year calling `acquire_year`, then runs all tasks using `dask.compute(..., scheduler="threads", num_workers=config["acquire"]["max_workers"])`. Returns a list of manifest entry dicts. Logs a summary: total files attempted, skipped, downloaded, failed.
-
-**Parameters:**
-- `config`: full config dict
-
-**Returns:** `list[dict]` — one manifest entry per year
-
-**Error handling:**
-- If any year's task raises, log the error and continue (do not abort remaining years). Collect failed years and log a summary at the end.
-- If `data/raw/` directory does not exist, create it before building the task graph.
-
-**Dependencies:** `dask`, `pathlib`, `logging`
-
-**Test cases:**
-- `@pytest.mark.unit` Mock `acquire_year` to return a fixed dict; assert `run_acquire` returns one entry per year in `year_start`..`current_year`.
-- `@pytest.mark.unit` Mock `acquire_year` to raise for one year; assert the other years' results are still returned and the failure is logged.
-- `@pytest.mark.integration` (requires network) Call `run_acquire` with `year_start` = current year only; assert `data/raw/monthly_prod.csv` exists and is non-empty after the call.
-
-**Definition of done:** Function implemented, unit tests pass, `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task A-10: Acquire idempotency and file integrity tests (TR-20, TR-21)
-
-**Test file:** `tests/test_acquire.py`
-
-**Description:**
-Implement the test cases required by TR-20 and TR-21 from `test-requirements.xml`.
-
 **Test cases:**
 
-- `@pytest.mark.unit` **TR-20a** Mock the filesystem so that the target CSV already exists; call `run_acquire` a second time; assert file count in `data/raw/` is unchanged and no download function is called.
-- `@pytest.mark.unit` **TR-20b** Mock a first acquire run that writes a file; mock a second run; assert the file content is identical after both runs.
-- `@pytest.mark.unit` **TR-20c** Assert no exception is raised when `acquire_year` is called and the target CSV already exists.
-- `@pytest.mark.integration` **TR-21a** After a real acquire run (current year only), assert every file in `data/raw/` has `os.path.getsize > 0`.
-- `@pytest.mark.integration` **TR-21b** After a real acquire run, assert every file in `data/raw/` is readable as text (UTF-8) without `UnicodeDecodeError`.
-- `@pytest.mark.integration` **TR-21c** After a real acquire run, assert every CSV file contains at least one row beyond the header line.
+- `@pytest.mark.unit` — Call `setup_logging` twice with the same config; assert the
+  root logger has exactly two handlers (not four).
+- `@pytest.mark.unit` — Assert `logs/` directory is created when it does not exist.
+- `@pytest.mark.unit` — Assert the returned logger level matches `config["logging"]["level"]`.
 
-**Definition of done:** All test cases implemented and passing (unit tests pass without network; integration tests marked appropriately), `ruff` and `mypy` report no errors, `requirements.txt` updated with all third-party packages imported in this task.
+**Definition of done:** `setup_logging` implemented, all test cases pass, ruff and mypy
+report no errors, `requirements.txt` updated with all third-party packages imported in
+this task.

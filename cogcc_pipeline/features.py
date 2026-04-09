@@ -1,483 +1,294 @@
-"""Features stage: engineer ML-ready features from cleaned production data."""
+"""Features stage: engineer derived ML features from processed Parquet data."""
 
 from __future__ import annotations
 
-import json
 import logging
-from pathlib import Path
 
 import dask
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
-from dask.distributed import Client, LocalCluster
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_OUTPUT_COLUMNS = [
+    "production_date",
+    "OilProduced",
+    "GasProduced",
+    "WaterProduced",
+    "cum_oil",
+    "cum_gas",
+    "cum_water",
+    "gor",
+    "water_cut",
+    "decline_rate",
+]
 
-# ---------------------------------------------------------------------------
-# Shared: Dask client management
-# ---------------------------------------------------------------------------
+
+class FeaturesError(RuntimeError):
+    """Raised on unrecoverable feature-engineering failures."""
 
 
-def get_or_create_client(config: dict) -> tuple[Client, bool]:
-    """Return existing Dask distributed Client or create a new one.
+def _add_cumulative_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add cum_oil, cum_gas, cum_water columns via per-well cumulative sum.
 
-    Args:
-        config: Full config dict.
-
-    Returns:
-        Tuple of (Client, created).
+    Input DataFrame may have well_id as index — reset/restore around groupby.
     """
-    from dask.distributed import get_client
+    df = df.copy()
+    index_was_well_id = df.index.name == "well_id"
+    if index_was_well_id:
+        df = df.reset_index()
 
-    try:
-        client = get_client()
-        logger.info("Reusing existing Dask client. Dashboard: %s", client.dashboard_link)
-        return client, False
-    except ValueError:
-        dcfg = config["dask"]
-        cluster = LocalCluster(
-            n_workers=dcfg["n_workers"],
-            threads_per_worker=dcfg["threads_per_worker"],
-            memory_limit=dcfg["memory_limit"],
-            dashboard_address=f":{dcfg['dashboard_port']}",
-        )
-        client = Client(cluster)
-        logger.info("Created new Dask client. Dashboard: %s", client.dashboard_link)
-        return client, True
-
-
-# ---------------------------------------------------------------------------
-# F-01: Time features
-# ---------------------------------------------------------------------------
-
-
-def _add_time_features(pdf: pd.DataFrame) -> pd.DataFrame:
-    """Add year, month, quarter, days_in_month, months_since_2020 columns.
-
-    Args:
-        pdf: Pandas partition with production_date column.
-
-    Returns:
-        DataFrame with five new time feature columns.
-    """
-    pdf = pdf.copy()
-    dt = pdf["production_date"].dt
-    year = dt.year.astype(pd.Int64Dtype())
-    month = dt.month.astype(pd.Int64Dtype())
-    pdf["year"] = year
-    pdf["month"] = month
-    pdf["quarter"] = dt.quarter.astype(pd.Int64Dtype())
-    pdf["days_in_month"] = dt.days_in_month.astype(pd.Int64Dtype())
-    pdf["months_since_2020"] = ((year - 2020) * 12 + (month - 1)).astype(pd.Int64Dtype())
-    return pdf
-
-
-# ---------------------------------------------------------------------------
-# F-02: Rolling statistics per well
-# ---------------------------------------------------------------------------
-
-
-def _add_rolling_features(pdf: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
-    """Add per-well rolling mean and std for each production column and window.
-
-    Uses groupby().transform() — never iterates over groups.
-
-    Args:
-        pdf: Pandas partition. well_id may be the index or a column.
-        windows: List of rolling window sizes (e.g. [3, 6]).
-
-    Returns:
-        DataFrame with rolling feature columns added.
-    """
-    pdf = pdf.copy()
-    prod_cols = ["OilProduced", "GasProduced", "WaterProduced"]
-    prefix_map = {
-        "OilProduced": "oil",
-        "GasProduced": "gas",
-        "WaterProduced": "water",
-    }
-
-    # Handle well_id as index or column
-    if "well_id" not in pdf.columns and pdf.index.name == "well_id":
-        grp = pdf.groupby(level=0)
-    else:
-        grp = pdf.groupby("well_id")  # type: ignore[assignment]
-
-    for col in prod_cols:
-        prefix = prefix_map[col]
-        for w in windows:
-            mean_col = f"{prefix}_roll{w}_mean"
-            std_col = f"{prefix}_roll{w}_std"
-            pdf[mean_col] = (
-                grp[col]
-                .transform(
-                    lambda x, window=w: x.astype("float64").rolling(window, min_periods=1).mean()
-                )
-                .astype(pd.Float64Dtype())
-            )
-            pdf[std_col] = (
-                grp[col]
-                .transform(
-                    lambda x, window=w: x.astype("float64").rolling(window, min_periods=1).std()
-                )
-                .astype(pd.Float64Dtype())
-            )
-
-    return pdf
-
-
-# ---------------------------------------------------------------------------
-# F-03: Cumulative production per well
-# ---------------------------------------------------------------------------
-
-
-def _add_cumulative_features(pdf: pd.DataFrame) -> pd.DataFrame:
-    """Add cum_oil, cum_gas, cum_water per well using groupby cumsum.
-
-    NA values are treated as 0 for cumsum, but NAs do not propagate.
-
-    Args:
-        pdf: Pandas partition.
-
-    Returns:
-        DataFrame with cumulative production columns added.
-    """
-    pdf = pdf.copy()
-    prod_map = {
-        "OilProduced": "cum_oil",
-        "GasProduced": "cum_gas",
-        "WaterProduced": "cum_water",
-    }
-
-    for src_col, dst_col in prod_map.items():
-        filled = pdf[src_col].fillna(0.0)
-        if "well_id" not in pdf.columns and pdf.index.name == "well_id":
-            cumsum = filled.groupby(level=0).transform("cumsum")
+    for col, new_col in [
+        ("OilProduced", "cum_oil"),
+        ("GasProduced", "cum_gas"),
+        ("WaterProduced", "cum_water"),
+    ]:
+        if col in df.columns:
+            df[new_col] = df.groupby("well_id")[col].transform("cumsum").astype(pd.Float64Dtype())
         else:
-            cumsum = filled.groupby(pdf["well_id"]).transform("cumsum")
-        pdf[dst_col] = cumsum.astype(pd.Float64Dtype())
-    return pdf
+            df[new_col] = pd.array([], dtype=pd.Float64Dtype()) if len(df) == 0 else pd.NA
+
+    if index_was_well_id:
+        df = df.set_index("well_id")
+    return df
 
 
-# ---------------------------------------------------------------------------
-# F-04: Decline rate calculation
-# ---------------------------------------------------------------------------
+def _add_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add gor and water_cut columns using vectorised operations.
 
+    GOR rules (TR-06):
+    - oil > 0: gor = gas / oil
+    - oil == 0 and gas > 0: gor = NaN
+    - oil == 0 and gas == 0: gor = NaN
+    - oil > 0 and gas == 0: gor = 0.0
 
-def _add_decline_rates(
-    pdf: pd.DataFrame,
-    clip_min: float,
-    clip_max: float,
-) -> pd.DataFrame:
-    """Add oil_decline_rate and gas_decline_rate (MoM % change, clipped).
-
-    Args:
-        pdf: Pandas partition.
-        clip_min: Lower clip bound (e.g. -1.0).
-        clip_max: Upper clip bound (e.g. 10.0).
-
-    Returns:
-        DataFrame with two new decline rate columns.
+    Water cut rules (TR-10):
+    - denom > 0: water_cut = water / (oil + water)
+    - denom == 0: water_cut = NaN
+    - out of [0,1]: → pd.NA + WARNING
     """
-    pdf = pdf.copy()
+    df = df.copy()
+    index_was_well_id = df.index.name == "well_id"
+    if index_was_well_id:
+        df = df.reset_index()
 
-    if "well_id" not in pdf.columns and pdf.index.name == "well_id":
+    oil = df["OilProduced"].to_numpy(dtype=float, na_value=np.nan)
+    gas = df["GasProduced"].to_numpy(dtype=float, na_value=np.nan)
+    water = df["WaterProduced"].to_numpy(dtype=float, na_value=np.nan)
 
-        def grp_fn(col: str) -> pd.Series:
-            return pdf[col].groupby(level=0).transform(lambda x: x.shift(1))
-    else:
+    # GOR
+    with np.errstate(divide="ignore", invalid="ignore"):
+        raw_gor = np.where(oil > 0, gas / oil, np.nan)
+        # oil > 0 and gas == 0 → 0.0
+        raw_gor = np.where((oil > 0) & (gas == 0), 0.0, raw_gor)
 
-        def grp_fn(col: str) -> pd.Series:
-            return pdf[col].groupby(pdf["well_id"]).transform(lambda x: x.shift(1))
+    df["gor"] = pd.array(raw_gor, dtype=pd.Float64Dtype())
 
-    for col, rate_col in [("OilProduced", "oil_decline_rate"), ("GasProduced", "gas_decline_rate")]:
-        current = pdf[col].astype("float64")
-        prior = grp_fn(col).astype("float64")
-
-        # Compute raw rate: (current - prior) / abs(prior)
-        raw = (current - prior) / prior.abs()
-
-        # Edge cases (vectorized via np.where):
-        both_zero = (prior == 0.0) & (current == 0.0)
-        prior_zero_current_pos = (prior == 0.0) & (current > 0.0)
-        either_na = current.isna() | prior.isna()
-
-        rate = raw.copy()
-        rate = rate.where(~both_zero, 0.0)
-        rate = rate.where(~prior_zero_current_pos, np.nan)
-        rate = rate.where(~either_na, np.nan)
-
-        # Clip non-NA values
-        rate = rate.clip(lower=clip_min, upper=clip_max)
-        pdf[rate_col] = rate.astype(pd.Float64Dtype())
-
-    return pdf
-
-
-# ---------------------------------------------------------------------------
-# F-05: Ratio features (GOR, water cut, WOR)
-# ---------------------------------------------------------------------------
-
-
-def _add_ratio_features(pdf: pd.DataFrame) -> pd.DataFrame:
-    """Add gor, water_cut, wor ratio features with zero-division handling.
-
-    Args:
-        pdf: Pandas partition with OilProduced, GasProduced, WaterProduced.
-
-    Returns:
-        DataFrame with gor, water_cut, wor columns added.
-    """
-    pdf = pdf.copy()
-    oil = pdf["OilProduced"].astype("float64")
-    gas = pdf["GasProduced"].astype("float64")
-    water = pdf["WaterProduced"].astype("float64")
-
-    oil_na = pdf["OilProduced"].isna()
-    gas_na = pdf["GasProduced"].isna()
-    water_na = pdf["WaterProduced"].isna()
-
-    # GOR: GasProduced / OilProduced
-    gor = np.where(
-        oil_na | gas_na,
-        np.nan,
-        np.where(
-            oil > 0,
-            gas / oil,
-            np.where(gas == 0, 0.0, np.nan),  # oil=0, gas=0 → 0.0; oil=0, gas>0 → NA
-        ),
-    )
-    pdf["gor"] = pd.array(gor, dtype=pd.Float64Dtype())
-
-    # Water cut: WaterProduced / (OilProduced + WaterProduced)
+    # Water cut
     denom = oil + water
-    water_cut = np.where(
-        oil_na | water_na,
-        np.nan,
-        np.where(denom > 0, water / denom, 0.0),
-    )
-    pdf["water_cut"] = pd.array(water_cut, dtype=pd.Float64Dtype())
+    with np.errstate(divide="ignore", invalid="ignore"):
+        raw_wc = np.where(denom > 0, water / denom, np.nan)
 
-    # WOR: WaterProduced / OilProduced
-    wor = np.where(
-        oil_na | water_na,
-        np.nan,
-        np.where(
-            oil > 0,
-            water / oil,
-            np.where(water == 0, 0.0, np.nan),
-        ),
-    )
-    pdf["wor"] = pd.array(wor, dtype=pd.Float64Dtype())
+    # Values outside [0,1] → pd.NA + WARNING
+    out_of_range = np.isfinite(raw_wc) & ((raw_wc < 0) | (raw_wc > 1))
+    if out_of_range.any():
+        logger.warning(
+            "water_cut out of [0,1] for %d rows — replacing with NA", int(out_of_range.sum())
+        )
+        raw_wc = np.where(out_of_range, np.nan, raw_wc)
 
-    return pdf
+    df["water_cut"] = pd.array(raw_wc, dtype=pd.Float64Dtype())
+
+    if index_was_well_id:
+        df = df.set_index("well_id")
+    return df
 
 
-# ---------------------------------------------------------------------------
-# F-06: Well age feature
-# ---------------------------------------------------------------------------
+def _add_decline_rates(df: pd.DataFrame) -> pd.DataFrame:
+    """Add decline_rate column: period-over-period oil decline per well.
 
-
-def _add_well_age(pdf: pd.DataFrame) -> pd.DataFrame:
-    """Add well_age_months: months since first production date per well.
-
-    Args:
-        pdf: Pandas partition with production_date and well_id (column or index).
-
-    Returns:
-        DataFrame with well_age_months column added.
+    Formula: pct_change * -1, inf → NaN, clipped to [-1.0, 10.0].
     """
-    pdf = pdf.copy()
+    df = df.copy()
+    index_was_well_id = df.index.name == "well_id"
+    if index_was_well_id:
+        df = df.reset_index()
 
-    if "well_id" not in pdf.columns and pdf.index.name == "well_id":
-        first_date = pdf["production_date"].groupby(level=0).transform("min")
-    else:
-        first_date = pdf.groupby("well_id")["production_date"].transform("min")
+    raw = df.groupby("well_id")["OilProduced"].transform(lambda s: s.pct_change() * -1)
+    raw_np = raw.to_numpy(dtype=float, na_value=np.nan)
+    raw_np = np.where(np.isinf(raw_np), np.nan, raw_np)
+    clipped = np.clip(raw_np, -1.0, 10.0)
 
-    prod_date = pdf["production_date"]
-    age = (
-        (prod_date.dt.year - first_date.dt.year) * 12 + (prod_date.dt.month - first_date.dt.month)
-    ).astype(pd.Int64Dtype())
-    pdf["well_age_months"] = age
-    return pdf
+    df["decline_rate"] = pd.array(clipped, dtype=pd.Float64Dtype())
 
-
-# ---------------------------------------------------------------------------
-# F-07: Label encoder
-# ---------------------------------------------------------------------------
+    if index_was_well_id:
+        df = df.set_index("well_id")
+    return df
 
 
-def fit_label_encoders(ddf: dd.DataFrame) -> dict[str, dict[str, int]]:
-    """Compute label encoder mappings for OpName and FormationCode.
+def _add_rolling_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
+    """Add rolling average columns for OilProduced, GasProduced, WaterProduced per well.
 
-    Sorts alphabetically for reproducibility. NA → -1.
-
-    Args:
-        ddf: Dask DataFrame with OpName and FormationCode columns.
-
-    Returns:
-        Dict of dicts: {"OpName": {name: int, ...}, "FormationCode": {code: int, ...}}.
+    Columns named: oil_rolling_{w}m, gas_rolling_{w}m, water_rolling_{w}m.
+    min_periods=1 ensures partial-window means for early history (TR-09b).
     """
-    op_unique, form_unique = dask.compute(
-        ddf["OpName"].unique(),
-        ddf["FormationCode"].unique(),
-    )
+    df = df.copy()
+    index_was_well_id = df.index.name == "well_id"
+    if index_was_well_id:
+        df = df.reset_index()
 
-    def _build_mapping(values: pd.arrays.ArrowExtensionArray | pd.Series | list) -> dict[str, int]:
-        vals_clean = sorted(str(v) for v in values if not pd.isna(v))
-        mapping: dict[str, int] = {v: i for i, v in enumerate(vals_clean)}
-        return mapping
+    for w in windows:
+        for col, prefix in [
+            ("OilProduced", "oil"),
+            ("GasProduced", "gas"),
+            ("WaterProduced", "water"),
+        ]:
+            new_col = f"{prefix}_rolling_{w}m"
+            if col in df.columns:
+                result = df.groupby("well_id")[col].transform(
+                    lambda s, window=w: s.rolling(window, min_periods=1).mean()
+                )
+                df[new_col] = result.astype(pd.Float64Dtype())
+            else:
+                df[new_col] = pd.array([], dtype=pd.Float64Dtype()) if len(df) == 0 else pd.NA
 
-    return {
-        "OpName": _build_mapping(op_unique),
-        "FormationCode": _build_mapping(form_unique),
-    }
+    if index_was_well_id:
+        df = df.set_index("well_id")
+    return df
 
 
-def _apply_label_encoding(
-    pdf: pd.DataFrame,
-    mappings: dict[str, dict[str, int]],
+def _add_lag_features(df: pd.DataFrame, lags: list[int]) -> pd.DataFrame:
+    """Add oil lag feature columns: oil_lag_{l}m for each lag l.
+
+    First l records per well will be NaN (no prior history). (TR-09c)
+    """
+    df = df.copy()
+    index_was_well_id = df.index.name == "well_id"
+    if index_was_well_id:
+        df = df.reset_index()
+
+    for lag in lags:
+        new_col = f"oil_lag_{lag}m"
+        result = df.groupby("well_id")["OilProduced"].transform(lambda s, lag_n=lag: s.shift(lag_n))
+        df[new_col] = result.astype(pd.Float64Dtype())
+
+    if index_was_well_id:
+        df = df.set_index("well_id")
+    return df
+
+
+def _engineer_features_partition(
+    df: pd.DataFrame, windows: list[int], lags: list[int]
 ) -> pd.DataFrame:
-    """Add operator_encoded and formation_encoded columns using pre-fit mappings.
+    """Apply all feature engineering steps to one partition.
 
-    Unknown or NA values map to -1.
-
-    Args:
-        pdf: Pandas partition.
-        mappings: Dict from fit_label_encoders.
-
-    Returns:
-        DataFrame with two new encoded columns.
+    Order: cumulative → ratios → decline → rolling → lag.
     """
-    pdf = pdf.copy()
-
-    def _encode(series: pd.Series, mapping: dict[str, int]) -> pd.Series:
-        encoded = series.map(mapping)
-        # fillna(-1) for unknowns and NAs
-        encoded = encoded.fillna(-1).astype(pd.Int64Dtype())
-        return encoded
-
-    pdf["operator_encoded"] = _encode(pdf["OpName"], mappings["OpName"])
-    pdf["formation_encoded"] = _encode(pdf["FormationCode"], mappings["FormationCode"])
-    return pdf
+    df = _add_cumulative_features(df)
+    df = _add_ratio_features(df)
+    df = _add_decline_rates(df)
+    df = _add_rolling_features(df, windows)
+    df = _add_lag_features(df, lags)
+    return df
 
 
-# ---------------------------------------------------------------------------
-# F-08: Encoder mappings writer
-# ---------------------------------------------------------------------------
-
-
-def save_encoder_mappings(mappings: dict[str, dict[str, int]], output_path: Path) -> None:
-    """Write encoder mappings to a JSON file.
-
-    Args:
-        mappings: Dict from fit_label_encoders.
-        output_path: Path to write JSON.
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w") as f:
-        json.dump(mappings, f, indent=2)
-    logger.info("Encoder mappings written to %s", output_path)
-
-
-# ---------------------------------------------------------------------------
-# F-09: Features stage runner
-# ---------------------------------------------------------------------------
-
-
-def run_features(config: dict) -> None:
-    """Top-level features stage: engineer all features and write processed Parquet.
-
-    Args:
-        config: Full config dict.
+def validate_feature_output(ddf: dd.DataFrame, config: dict) -> None:
+    """Validate the feature-engineered Dask DataFrame before writing.
 
     Raises:
-        FileNotFoundError: If cleaned Parquet not found.
-        RuntimeError: On computation errors.
+        FeaturesError: If required columns are missing or schema drifts.
     """
-    fcfg = config["features"]
-    interim_dir = Path(fcfg["interim_dir"])
-    processed_dir = Path(fcfg["processed_dir"])
-    input_path = interim_dir / "cogcc_cleaned.parquet"
-    output_path = processed_dir / "cogcc_features.parquet"
-    encoder_path = processed_dir / "encoder_mappings.json"
-    windows: list[int] = list(fcfg["rolling_windows"])
-    clip_min: float = float(fcfg["decline_rate_clip_min"])
-    clip_max: float = float(fcfg["decline_rate_clip_max"])
+    windows: list[int] = config.get("features", {}).get("rolling_windows", [3, 6])
+    lags: list[int] = config.get("features", {}).get("lag_periods", [1, 3])
 
-    if not input_path.exists():
-        raise FileNotFoundError(f"Cleaned Parquet not found: {input_path}")
+    required = list(REQUIRED_OUTPUT_COLUMNS)
+    for w in windows:
+        for prefix in ("oil", "gas", "water"):
+            required.append(f"{prefix}_rolling_{w}m")
+    for lag in lags:
+        required.append(f"oil_lag_{lag}m")
 
-    client, created = get_or_create_client(config)
+    actual = set(ddf.columns) | ({ddf.index.name} if ddf.index.name else set())
+    missing = [c for c in required if c not in actual]
+    if missing:
+        raise FeaturesError(f"Missing required feature columns: {missing}")
 
+    # Sample up to 3 partitions for validation
+    n_sample = min(3, ddf.npartitions)
+    sample_delayed = [ddf.get_partition(i) for i in range(n_sample)]
+    sample_frames = dask.compute(*sample_delayed)
+
+    # Check physical bounds via sampled frames
+    for frame in sample_frames:
+        if "gor" in frame.columns:
+            bad_gor = frame["gor"].dropna()
+            neg_gor = bad_gor[bad_gor < 0]
+            if len(neg_gor) > 0:
+                logger.warning("GOR has %d negative values", len(neg_gor))
+        if "water_cut" in frame.columns:
+            wc = frame["water_cut"].dropna()
+            bad_wc = wc[(wc < 0) | (wc > 1)]
+            if len(bad_wc) > 0:
+                logger.warning("water_cut has %d values outside [0,1]", len(bad_wc))
+        if "decline_rate" in frame.columns:
+            dr = frame["decline_rate"].dropna()
+            bad_dr = dr[(dr < -1.0) | (dr > 10.0)]
+            if len(bad_dr) > 0:
+                logger.warning("decline_rate has %d values outside [-1, 10]", len(bad_dr))
+
+    # Schema consistency across sampled partitions
+    if len(sample_frames) > 1:
+        ref_cols = list(sample_frames[0].columns)
+        ref_dtypes = dict(sample_frames[0].dtypes)
+        for i, frame in enumerate(sample_frames[1:], start=1):
+            if list(frame.columns) != ref_cols:
+                raise FeaturesError(f"Schema drift detected between partition 0 and partition {i}")
+            for col, dtype in ref_dtypes.items():
+                if col in frame.dtypes and str(frame.dtypes[col]) != str(dtype):
+                    raise FeaturesError(f"Dtype mismatch in partition {i} for column {col}")
+
+    logger.info("Feature output validation passed: %d required columns present", len(required))
+
+
+def run_features(config: dict) -> dd.DataFrame:
+    """Orchestrate the full features stage.
+
+    Returns:
+        Dask DataFrame (not computed on full dataset).
+    """
     try:
-        ddf = dd.read_parquet(str(input_path), engine="pyarrow")
-        npartitions = max(10, min(ddf.npartitions, 50))
-        ddf = ddf.repartition(npartitions=npartitions)
+        from distributed import get_client
 
-        # F-01: Time features meta
-        meta = ddf._meta.copy()
-        for col in ("year", "month", "quarter", "days_in_month", "months_since_2020"):
-            meta[col] = pd.Series(dtype=pd.Int64Dtype())
-        ddf = ddf.map_partitions(_add_time_features, meta=meta)
+        client = get_client()
+        logger.info("Reusing existing Dask client: %s", client)
+    except ValueError:
+        from distributed import Client, LocalCluster
 
-        # F-02: Rolling features meta — derived by calling function on empty meta frame
-        meta = _add_rolling_features(ddf._meta.copy(), windows=windows)
-        ddf = ddf.map_partitions(_add_rolling_features, windows=windows, meta=meta)
-
-        # F-03: Cumulative features meta
-        meta = ddf._meta.copy()
-        for col in ("cum_oil", "cum_gas", "cum_water"):
-            meta[col] = pd.Series(dtype=pd.Float64Dtype())
-        ddf = ddf.map_partitions(_add_cumulative_features, meta=meta)
-
-        # F-04: Decline rates meta
-        meta = ddf._meta.copy()
-        meta["oil_decline_rate"] = pd.Series(dtype=pd.Float64Dtype())
-        meta["gas_decline_rate"] = pd.Series(dtype=pd.Float64Dtype())
-        ddf = ddf.map_partitions(
-            _add_decline_rates, clip_min=clip_min, clip_max=clip_max, meta=meta
+        dask_cfg = config["dask"]
+        cluster = LocalCluster(
+            n_workers=dask_cfg.get("n_workers", 2),
+            threads_per_worker=dask_cfg.get("threads_per_worker", 2),
+            memory_limit=dask_cfg.get("memory_limit", "3GB"),
         )
+        client = Client(cluster)
+        logger.info("Initialised Dask LocalCluster: dashboard at %s", client.dashboard_link)
 
-        # F-05: Ratio features meta
-        meta = ddf._meta.copy()
-        for col in ("gor", "water_cut", "wor"):
-            meta[col] = pd.Series(dtype=pd.Float64Dtype())
-        ddf = ddf.map_partitions(_add_ratio_features, meta=meta)
+    processed_path = config["features"]["processed_dir"] + "/production.parquet"
+    ddf = dd.read_parquet(processed_path, engine="pyarrow")
 
-        # F-06: Well age meta
-        meta = ddf._meta.copy()
-        meta["well_age_months"] = pd.Series(dtype=pd.Int64Dtype())
-        ddf = ddf.map_partitions(_add_well_age, meta=meta)
+    windows: list[int] = config.get("features", {}).get("rolling_windows", [3, 6])
+    lags: list[int] = config.get("features", {}).get("lag_periods", [1, 3])
 
-        # F-07: Label encoding — fit on full dataset, then apply
-        logger.info("Fitting label encoders…")
-        mappings = fit_label_encoders(ddf)
+    meta = _engineer_features_partition(ddf._meta.copy(), windows, lags)
+    ddf = ddf.map_partitions(_engineer_features_partition, windows, lags, meta=meta)
 
-        meta = ddf._meta.copy()
-        meta["operator_encoded"] = pd.Series(dtype=pd.Int64Dtype())
-        meta["formation_encoded"] = pd.Series(dtype=pd.Int64Dtype())
-        ddf = ddf.map_partitions(_apply_label_encoding, mappings=mappings, meta=meta)
+    validate_feature_output(ddf, config)
 
-        # F-08: Save encoder mappings
-        processed_dir.mkdir(parents=True, exist_ok=True)
-        save_encoder_mappings(mappings, encoder_path)
+    ddf = ddf.repartition(npartitions=max(10, min(ddf.npartitions, 50)))
 
-        npartitions_out = max(10, min(ddf.npartitions, 50))
+    out_path = config["features"]["output_dir"] + "/production_features.parquet"
+    ddf.to_parquet(out_path, engine="pyarrow", write_index=True, overwrite=True)
+    logger.info("Wrote features Parquet to %s", out_path)
 
-        logger.info("Writing feature Parquet to %s (%d partitions)", output_path, npartitions_out)
-        try:
-            ddf.repartition(npartitions=npartitions_out).to_parquet(
-                str(output_path), write_index=True, engine="pyarrow"
-            )
-        except Exception as exc:
-            logger.error("Feature Parquet write error: %s", exc)
-            raise RuntimeError(f"Features write failed: {exc}") from exc
-
-        logger.info("Features stage complete. Output: %s", output_path)
-
-    finally:
-        if created:
-            client.close()
+    return ddf
