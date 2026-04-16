@@ -1,5 +1,88 @@
 
-## Eval Run at 2026-04-05 12:56:36
+## Eval Run at 2026-04-09 05:13:25
+
+**Status:** ❌ FAILED
+
+### Failures:
+- **Linting:**
+```
+Linting failed. Fix these errors:
+E741 Ambiguous variable name: `l`
+   --> cogcc_pipeline/features.py:173:75
+    |
+171 |     for lag in lags:
+172 |         new_col = f"oil_lag_{lag}m"
+173 |         result = df.groupby("well_id")["OilProduced"].transform(lambda s, l=lag: s.shift(l))
+    |                                                                           ^
+174 |         df[new_col] = result.astype(pd.Float64Dtype())
+    |
+
+F841 Local variable `result` is assigned to but never used
+   --> tests/test_features.py:268:5
+    |
+266 |     # pct_change * -1: (old - new) / old → high for near-zero decline
+267 |     df = _make_well_df(["W1", "W1", "W1"], [100.0, 1.0, 0.001])
+268 |     result = _add_decline_rates(df)
+    |     ^^^^^^
+269 |     # row 2: (1-0.001)/1 * -1 ... actually (prev-cur)/prev = (1-0.001)/1 = 0.999, * -1 = -0.999
+270 |     # Not above 10. Let's try: 0.001 → 0.0001
+    |
+help: Remove assignment to unused variable `result`
+
+Found 2 errors.
+No fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).
+
+```
+
+- **Type check:**
+```
+Type check failed. Fix these errors:
+/cogcc_pipeline/transform.py:120: error: No overload variant of "where" of "Series" matches argument types "Series[bool]", "NAType"  [call-overload]
+/cogcc_pipeline/transform.py:120: note: Possible overload variants:
+/cogcc_pipeline/transform.py:120: note:     def where(self, cond: Series[Any] | Series[builtins.bool] | ndarray[tuple[Any, ...], dtype[numpy.bool[builtins.bool]]] | Callable[[Series[Any]], Series[builtins.bool]] | Callable[[Any], builtins.bool], other: Any | Series[Any] | Callable[..., Any | Series[Any]] = ..., *, inplace: Literal[True], axis: Literal['index', 0] | None = ..., level: Hashable | None = ...) -> None
+/cogcc_pipeline/transform.py:120: note:     def where(self, cond: Series[Any] | Series[builtins.bool] | ndarray[tuple[Any, ...], dtype[numpy.bool[builtins.bool]]] | Callable[[Series[Any]], Series[builtins.bool]] | Callable[[Any], builtins.bool], other: str | bytes | date | datetime | timedelta | <13 more items> = ..., *, inplace: Literal[False] = ..., axis: Literal['index', 0] | None = ..., level: Hashable | None = ...) -> Series[Any]
+/cogcc_pipeline/ingest.py:101: error: Argument "dtype" to "read_csv" has incompatible type "dict[str, object]"; expected "ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str] | Mapping[Hashable, ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str]] | defaultdict[Any, Any] | None"  [arg-type]
+/cogcc_pipeline/ingest.py:151: error: No overload variant of "array" matches argument types "list[Never]", "object"  [call-overload]
+/cogcc_pipeline/ingest.py:151: note: Possible overload variants:
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[Just[float]], dtype: Literal['Float32', 'Float64'] | Float32Dtype | Float64Dtype | None = ..., copy: bool = ...) -> FloatingArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: tuple[Any, ...] | MutableSequence[Any], dtype: type[builtins.bool] | Literal['bool'] | type[int] | Literal['int'] | type[float] | Literal['float'] | type[complex] | Literal['complex'] | type[bytes] | Literal['bytes'] | type[object] | Literal['object'] | Literal['?', 'b1', 'bool_'] | type[numpy.bool[builtins.bool]] | Literal['b', 'i1', 'int8', 'byte', 'h', 'i2', 'int16', 'short', 'i', 'i4', 'int32', 'intc', 'l', 'long', 'l', 'i8', 'int64', 'int_', 'long', 'q', 'longlong', 'p', 'intp'] | type[signedinteger[_8Bit]] | type[signedinteger[_16Bit]] | type[signedinteger[_32Bit]] | type[signedinteger[_32Bit | _64Bit]] | type[signedinteger[_64Bit]] | type[signedinteger[_32Bit | _64Bit]] | Literal['B', 'u1', 'uint8', 'ubyte', 'H', 'u2', 'uint16', 'ushort', 'I', 'u4', 'uint32', 'uintc', 'L', 'ulong', 'L', 'u8', 'uint', 'ulong', 'uint64', 'Q', 'ulonglong', 'P', 'uintp'] | type[unsignedinteger[_8Bit]] | type[unsignedinteger[_16Bit]] | type[unsignedinteger[_32Bit]] | type[unsignedinteger[_32Bit | _64Bit]] | type[unsignedinteger[_64Bit]] | type[unsignedinteger[_32Bit | _64Bit]] | Literal['e', 'f2', '<f2', 'float16', 'half'] | type[floating[_16Bit]] | Literal['f', 'f4', 'float32', 'single', 'd', 'f8', 'float64', 'double', 'g', 'f16', 'float128', 'longdouble'] | type[floating[_32Bit]] | type[float64] | type[floating[_64Bit | _96Bit | _128Bit]] | Literal['F', 'c8', 'complex64', 'csingle', 'D', 'c16', 'complex128', 'cdouble', 'G', 'c32', 'complex256', 'clongdouble'] | type[complexfloating[_32Bit, _32Bit]] | type[complex128] | type[complexfloating[_64Bit | _96Bit | _128Bit, _64Bit | _96Bit | _128Bit]] | Literal['U', 'str_', 'unicode'] | type[str_] | Literal['S', 'bytes_'] | type[bytes_] | Literal['object_', 'O'] | type[object_] | Literal['V', 'void'] | type[void], copy: bool = ...) -> NumpyExtensionArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[NAType | None], dtype: type[builtins.bool] | Literal['bool'] | type[int] | Literal['int'] | type[float] | Literal['float'] | type[complex] | Literal['complex'] | type[bytes] | Literal['bytes'] | type[object] | Literal['object'] | Literal['?', 'b1', 'bool_'] | type[numpy.bool[builtins.bool]] | Literal['b', 'i1', 'int8', 'byte', 'h', 'i2', 'int16', 'short', 'i', 'i4', 'int32', 'intc', 'l', 'long', 'l', 'i8', 'int64', 'int_', 'long', 'q', 'longlong', 'p', 'intp'] | type[signedinteger[_8Bit]] | type[signedinteger[_16Bit]] | type[signedinteger[_32Bit]] | type[signedinteger[_32Bit | _64Bit]] | type[signedinteger[_64Bit]] | type[signedinteger[_32Bit | _64Bit]] | Literal['B', 'u1', 'uint8', 'ubyte', 'H', 'u2', 'uint16', 'ushort', 'I', 'u4', 'uint32', 'uintc', 'L', 'ulong', 'L', 'u8', 'uint', 'ulong', 'uint64', 'Q', 'ulonglong', 'P', 'uintp'] | type[unsignedinteger[_8Bit]] | type[unsignedinteger[_16Bit]] | type[unsignedinteger[_32Bit]] | type[unsignedinteger[_32Bit | _64Bit]] | type[unsignedinteger[_64Bit]] | type[unsignedinteger[_32Bit | _64Bit]] | Literal['e', 'f2', '<f2', 'float16', 'half'] | type[floating[_16Bit]] | Literal['f', 'f4', 'float32', 'single', 'd', 'f8', 'float64', 'double', 'g', 'f16', 'float128', 'longdouble'] | type[floating[_32Bit]] | type[float64] | type[floating[_64Bit | _96Bit | _128Bit]] | Literal['F', 'c8', 'complex64', 'csingle', 'D', 'c16', 'complex128', 'cdouble', 'G', 'c32', 'complex256', 'clongdouble'] | type[complexfloating[_32Bit, _32Bit]] | type[complex128] | type[complexfloating[_64Bit | _96Bit | _128Bit, _64Bit | _96Bit | _128Bit]] | Literal['U', 'str_', 'unicode'] | type[str_] | Literal['S', 'bytes_'] | type[bytes_] | Literal['object_', 'O'] | type[object_] | Literal['V', 'void'] | type[void] | None = ..., copy: bool = ...) -> NumpyExtensionArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[Timedelta] | Series[Timedelta] | TimedeltaArray | TimedeltaIndex | ndarray[tuple[int], dtype[timedelta64[timedelta | int | None]]], dtype: Literal['timedelta64[s]', 'timedelta64[ms]', 'timedelta64[us]', 'timedelta64[ns]', 'm8[s]', 'm8[ms]', 'm8[us]', 'm8[ns]', '<m8[s]', '<m8[ms]', '<m8[us]', '<m8[ns]'] | Literal['duration[s][pyarrow]', 'duration[ms][pyarrow]', 'duration[us][pyarrow]', 'duration[ns][pyarrow]'] | None = ..., copy: bool = ...) -> TimedeltaArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[builtins.bool | numpy.bool[builtins.bool] | Just[float] | NAType | None], dtype: BooleanDtype | Literal['boolean'], copy: bool = ...) -> BooleanArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[builtins.bool | numpy.bool[builtins.bool] | NAType | None], dtype: None = ..., copy: bool = ...) -> BooleanArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: ndarray[tuple[Any, ...], dtype[numpy.bool[builtins.bool]]] | BooleanArray, dtype: BooleanDtype | Literal['boolean'] | None = ..., copy: bool = ...) -> BooleanArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[float | integer[Any] | NAType | None], dtype: Literal['Int8', 'Int16', 'Int32', 'Int64'] | Int8Dtype | Int16Dtype | Int32Dtype | Int64Dtype | Literal['UInt8', 'UInt16', 'UInt32', 'UInt64'] | UInt8Dtype | UInt16Dtype | UInt32Dtype | UInt64Dtype, copy: bool = ...) -> IntegerArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[int | integer[Any] | NAType | None], dtype: None = ..., copy: bool = ...) -> IntegerArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: ndarray[tuple[Any, ...], dtype[integer[Any]]] | IntegerArray, dtype: Literal['Int8', 'Int16', 'Int32', 'Int64'] | Int8Dtype | Int16Dtype | Int32Dtype | Int64Dtype | Literal['UInt8', 'UInt16', 'UInt32', 'UInt64'] | UInt8Dtype | UInt16Dtype | UInt32Dtype | UInt64Dtype | None = ..., copy: bool = ...) -> IntegerArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[float | floating[Any] | NAType | None] | ndarray[tuple[Any, ...], dtype[floating[Any]]] | FloatingArray, dtype: Literal['Float32', 'Float64'] | Float32Dtype | Float64Dtype | None = ..., copy: bool = ...) -> FloatingArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: tuple[Just[float] | str | datetime | datetime64[date | int | None] | NaTType | None, ...] | MutableSequence[Just[float] | str | datetime | datetime64[date | int | None] | NaTType | None] | ndarray[tuple[Any, ...], dtype[Any]] | DatetimeArray, dtype: DatetimeTZDtype | Literal['datetime64[s, UTC]', 'datetime64[ms, UTC]', 'datetime64[us, UTC]', 'datetime64[ns, UTC]'] | dtype[datetime64[date | int | None]] | Literal['datetime64[s]', 'datetime64[ms]', 'datetime64[us]', 'datetime64[ns]', 'M8[s]', 'M8[ms]', 'M8[us]', 'M8[ns]', '<M8[s]', '<M8[ms]', '<M8[us]', '<M8[ns]'], copy: bool = ...) -> DatetimeArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: Sequence[datetime | NaTType | None] | Sequence[datetime64[date | int | None] | NaTType | None] | ndarray[tuple[Any, ...], dtype[datetime64[date | int | None]]] | DatetimeArray, dtype: None = ..., copy: bool = ...) -> DatetimeArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: tuple[Just[float] | str | str_ | NAType | None, ...] | MutableSequence[Just[float] | str | str_ | NAType | None] | ndarray[tuple[Any, ...], dtype[Any]] | BaseStringArray[None], dtype: StringDtype[Never], copy: bool = ...) -> BaseStringArray[None]
+/cogcc_pipeline/ingest.py:151: note:     def array(data: tuple[Just[float] | str | str_ | NAType | None, ...] | MutableSequence[Just[float] | str | str_ | NAType | None] | ndarray[tuple[Any, ...], dtype[Any]] | BaseStringArray[None], dtype: StringDtype[Literal['pyarrow']] | Literal['string[pyarrow]'], copy: bool = ...) -> ArrowStringArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: tuple[Just[float] | str | str_ | NAType | None, ...] | MutableSequence[Just[float] | str | str_ | NAType | None] | ndarray[tuple[Any, ...], dtype[Any]] | BaseStringArray[None], dtype: StringDtype[Literal['python']] | Literal['string[python]'], copy: bool = ...) -> StringArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: tuple[Just[float] | str | str_ | NAType | None, ...] | MutableSequence[Just[float] | str | str_ | NAType | None] | ndarray[tuple[Any, ...], dtype[Any]] | BaseStringArray[None], dtype: StringDtype[None] | Literal['string'], copy: bool = ...) -> BaseStringArray[None]
+/cogcc_pipeline/ingest.py:151: note:     def array(data: tuple[str | str_ | NAType | None, ...] | MutableSequence[str | str_ | NAType | None] | ndarray[tuple[Any, ...], dtype[str_]] | BaseStringArray[None], dtype: None = ..., copy: bool = ...) -> BaseStringArray[None]
+/cogcc_pipeline/ingest.py:151: note:     def array(data: tuple[Any, ...] | MutableSequence[Any], dtype: None = ..., copy: bool = ...) -> NumpyExtensionArray
+/cogcc_pipeline/ingest.py:151: note:     def array(data: ndarray[tuple[Any, ...], dtype[Any]] | NumpyExtensionArray | RangeIndex, dtype: type[builtins.bool] | Literal['bool'] | type[int] | Literal['int'] | type[float] | Literal['float'] | type[complex] | Literal['complex'] | type[bytes] | Literal['bytes'] | type[object] | Literal['object'] | Literal['?', 'b1', 'bool_'] | type[numpy.bool[builtins.bool]] | Literal['b', 'i1', 'int8', 'byte', 'h', 'i2', 'int16', 'short', 'i', 'i4', 'int32', 'intc', 'l', 'long', 'l', 'i8', 'int64', 'int_', 'long', 'q', 'longlong', 'p', 'intp'] | type[signedinteger[_8Bit]] | type[signedinteger[_16Bit]] | type[signedinteger[_32Bit]] | type[signedinteger[_32Bit | _64Bit]] | type[signedinteger[_64Bit]] | type[signedinteger[_32Bit | _64Bit]] | Literal['B', 'u1', 'uint8', 'ubyte', 'H', 'u2', 'uint16', 'ushort', 'I', 'u4', 'uint32', 'uintc', 'L', 'ulong', 'L', 'u8', 'uint', 'ulong', 'uint64', 'Q', 'ulonglong', 'P', 'uintp'] | type[unsignedinteger[_8Bit]] | type[unsignedinteger[_16Bit]] | type[unsignedinteger[_32Bit]] | type[unsignedinteger[_32Bit | _64Bit]] | type[unsignedinteger[_64Bit]] | type[unsignedinteger[_32Bit | _64Bit]] | Literal['e', 'f2', '<f2', 'float16', 'half'] | type[floating[_16Bit]] | Literal['f', 'f4', 'float32', 'single', 'd', 'f8', 'float64', 'double', 'g', 'f16', 'float128', 'longdouble'] | type[floating[_32Bit]] | type[float64] | type[floating[_64Bit | _96Bit | _128Bit]] | Literal['F', 'c8', 'complex64', 'csingle', 'D', 'c16', 'complex128', 'cdouble', 'G', 'c32', 'complex256', 'clongdouble'] | type[complexfloating[_32Bit, _32Bit]] | type[complex128] | type[complexfloating[_64Bit | _96Bit | _128Bit, _64Bit | _96Bit | _128Bit]] | Literal['U', 'str_', 'unicode'] | type[str_] | Literal['S', 'bytes_'] | type[bytes_] | Literal['object_', 'O'] | type[object_] | Literal['V', 'void'] | type[void] | None = ..., copy: bool = ...) -> NumpyExtensionArray
+/tests/conftest.py:143: error: Value expression in dictionary comprehension has incompatible type "object"; expected type "ExtensionDtype | str | dtype[generic[Any]] | type[object]"  [misc]
+/tests/conftest.py:158: error: Argument 1 to "array" has incompatible type "list[str]"; expected "tuple[Just[float] | str | str_ | NAType | None, ...] | MutableSequence[Just[float] | str | str_ | NAType | None] | ndarray[tuple[Any, ...], dtype[Any]] | BaseStringArray[None]"  [arg-type]
+/tests/conftest.py:158: error: Argument "dtype" to "array" has incompatible type "StringDtype[None]"; expected "StringDtype[Never]"  [arg-type]
+/tests/test_features.py:40: error: Argument 1 to "array" has incompatible type "list[str]"; expected "tuple[Just[float] | str | str_ | NAType | None, ...] | MutableSequence[Just[float] | str | str_ | NAType | None] | ndarray[tuple[Any, ...], dtype[Any]] | BaseStringArray[None]"  [arg-type]
+/tests/test_features.py:40: error: Argument "dtype" to "array" has incompatible type "StringDtype[None]"; expected "StringDtype[Never]"  [arg-type]
+/tests/test_transform.py:209: error: Argument 1 to "to_datetime" has incompatible type "list[NaTType]"; expected "Sequence[float | date] | list[str] | tuple[float | str | date, ...] | ndarray[tuple[Any, ...], dtype[datetime64[date | int | None]]] | ndarray[tuple[Any, ...], dtype[str_]] | ndarray[tuple[Any, ...], dtype[integer[Any]]] | ndarray[tuple[Any, ...], dtype[floating[Any]]] | Index[Any] | ExtensionArray"  [arg-type]
+Found 9 errors in 5 files (checked 12 source files)
+
+```
+
+- **Unit Tests:**
+```
+Unit Tests failed. Fix these errors:
+
+```
+
+---
+
+## Eval Run at 2026-04-09 05:36:06
 
 **Status:** ❌ FAILED
 
@@ -7,404 +90,144 @@
 - **Type check:**
 ```
 Type check failed. Fix these errors:
-/cogcc_pipeline/transform.py:35: error: No overload variant of "where" of "Series" matches argument types "Series[bool]", "NAType"  [call-overload]
-/cogcc_pipeline/transform.py:35: note: Possible overload variants:
-/cogcc_pipeline/transform.py:35: note:     def where(self, cond: Series[Any] | Series[builtins.bool] | ndarray[tuple[Any, ...], dtype[numpy.bool[builtins.bool]]] | Callable[[Series[Any]], Series[builtins.bool]] | Callable[[Any], builtins.bool], other: Any | Series[Any] | Callable[..., Any | Series[Any]] = ..., *, inplace: Literal[True], axis: Literal['index', 0] | None = ..., level: Hashable | None = ...) -> None
-/cogcc_pipeline/transform.py:35: note:     def where(self, cond: Series[Any] | Series[builtins.bool] | ndarray[tuple[Any, ...], dtype[numpy.bool[builtins.bool]]] | Callable[[Series[Any]], Series[builtins.bool]] | Callable[[Any], builtins.bool], other: str | bytes | date | datetime | timedelta | <13 more items> = ..., *, inplace: Literal[False] = ..., axis: Literal['index', 0] | None = ..., level: Hashable | None = ...) -> Series[Any]
-/cogcc_pipeline/transform.py:65: error: Name "pd.NAType" is not defined  [name-defined]
-/cogcc_pipeline/features.py:11: error: Skipping analyzing "joblib": module is installed, but missing library stubs or py.typed marker  [import-untyped]
-/cogcc_pipeline/features.py:14: error: Skipping analyzing "sklearn.preprocessing": module is installed, but missing library stubs or py.typed marker  [import-untyped]
-/cogcc_pipeline/features.py:14: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
-/tests/test_features.py:62: error: Argument 2 to "_single_well_df" has incompatible type "list[int]"; expected "list[float] | None"  [arg-type]
-/tests/test_features.py:62: note: "list" is invariant -- see https://mypy.readthedocs.io/en/stable/common_issues.html#variance
-/tests/test_features.py:62: note: Consider using "Sequence" instead, which is covariant
-/tests/test_features.py:72: error: Argument 2 to "_single_well_df" has incompatible type "list[int]"; expected "list[float] | None"  [arg-type]
-/tests/test_features.py:72: note: "list" is invariant -- see https://mypy.readthedocs.io/en/stable/common_issues.html#variance
-/tests/test_features.py:72: note: Consider using "Sequence" instead, which is covariant
-/tests/test_features.py:80: error: Argument 2 to "_single_well_df" has incompatible type "list[int]"; expected "list[float] | None"  [arg-type]
-/tests/test_features.py:80: note: "list" is invariant -- see https://mypy.readthedocs.io/en/stable/common_issues.html#variance
-/tests/test_features.py:80: note: Consider using "Sequence" instead, which is covariant
-/tests/test_features.py:91: error: Argument 2 to "_single_well_df" has incompatible type "list[int]"; expected "list[float] | None"  [arg-type]
-/tests/test_features.py:91: note: "list" is invariant -- see https://mypy.readthedocs.io/en/stable/common_issues.html#variance
-/tests/test_features.py:91: note: Consider using "Sequence" instead, which is covariant
-/tests/test_features.py:537: error: Skipping analyzing "joblib": module is installed, but missing library stubs or py.typed marker  [import-untyped]
-/tests/test_orchestrator.py:115: error: "orchestrate" does not return a value (it only ever returns None)  [func-returns-value]
-/tests/test_orchestrator.py:152: error: "orchestrate" does not return a value (it only ever returns None)  [func-returns-value]
-Found 11 errors in 4 files (checked 14 source files)
+/cogcc_pipeline/ingest.py:102: error: Argument "dtype" to "read_csv" has incompatible type "dict[str, Any]"; expected "ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str] | Mapping[Hashable, ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str]] | defaultdict[Any, Any] | None"  [arg-type]
+/cogcc_pipeline/ingest.py:152: error: No overload variant of "Series" matches argument types "list[Never]", "object"  [call-overload]
+/cogcc_pipeline/ingest.py:152: note: Possible overload variants:
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Sequence[Never], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: None = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[Any]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Sequence[list[str]], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: None = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[list[str]]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Sequence[str], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str] | None = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[str]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta, HashableT1: Hashable] __new__(cls, data: DatetimeIndex | Sequence[datetime64[date | int | None] | datetime | date] | dict[HashableT1, datetime64[date | int | None] | datetime | date] | datetime64[date | int | None] | datetime | date, index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: Literal['datetime64[s, UTC]', 'datetime64[ms, UTC]', 'datetime64[us, UTC]', 'datetime64[ns, UTC]'] | Literal['datetime64[s]', 'datetime64[ms]', 'datetime64[us]', 'datetime64[ns]', 'M8[s]', 'M8[ms]', 'M8[us]', 'M8[ns]', '<M8[s]', '<M8[ms]', '<M8[us]', '<M8[ns]'] | Literal['date32[pyarrow]', 'date64[pyarrow]', 'timestamp[s][pyarrow]', 'timestamp[ms][pyarrow]', 'timestamp[us][pyarrow]', 'timestamp[ns][pyarrow]'] = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[Timestamp]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Sequence[datetime | timedelta64[timedelta | int | None]] | ndarray[tuple[Any, ...], dtype[datetime64[date | int | None]]] | DatetimeArray, index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., *, dtype: Literal['datetime64[s, UTC]', 'datetime64[ms, UTC]', 'datetime64[us, UTC]', 'datetime64[ns, UTC]'] | Literal['datetime64[s]', 'datetime64[ms]', 'datetime64[us]', 'datetime64[ns]', 'M8[s]', 'M8[ms]', 'M8[us]', 'M8[ns]', '<M8[s]', '<M8[ms]', '<M8[us]', '<M8[ns]'] | Literal['date32[pyarrow]', 'date64[pyarrow]', 'timestamp[s][pyarrow]', 'timestamp[ms][pyarrow]', 'timestamp[us][pyarrow]', 'timestamp[ns][pyarrow]'], name: Hashable = ..., copy: bool | None = ...) -> Series[Timestamp]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | dict[str, ndarray[tuple[Any, ...], dtype[Any]]] | SequenceNotStr[Any], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., *, dtype: CategoricalDtype | Literal['category'], name: Hashable = ..., copy: bool | None = ...) -> Series[CategoricalDtype]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: PeriodIndex | Sequence[Period], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: PeriodDtype = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[Period]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Sequence[BaseOffset], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: PeriodDtype = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[BaseOffset]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta, HashableT1: Hashable] __new__(cls, data: TimedeltaIndex | Sequence[timedelta64[timedelta | int | None] | timedelta] | dict[HashableT1, timedelta64[timedelta | int | None] | timedelta] | timedelta64[timedelta | int | None] | timedelta, index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: Literal['timedelta64[s]', 'timedelta64[ms]', 'timedelta64[us]', 'timedelta64[ns]', 'm8[s]', 'm8[ms]', 'm8[us]', 'm8[ns]', '<m8[s]', '<m8[ms]', '<m8[us]', '<m8[ns]'] | Literal['duration[s][pyarrow]', 'duration[ms][pyarrow]', 'duration[us][pyarrow]', 'duration[ns][pyarrow]'] = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[Timedelta]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta, OrderableT: int | float | Timestamp | Timedelta] __new__(cls, data: IntervalIndex[Interval[OrderableT]] | Interval[OrderableT] | Sequence[Interval[OrderableT]] | dict[Hashable, Interval[OrderableT]], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: Literal['Interval'] = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[Interval[OrderableT]]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Sequence[builtins.bool | numpy.bool[builtins.bool]], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: Literal['bool', 'boolean', '?', 'b1', 'bool_', 'bool[pyarrow]', 'boolean[pyarrow]'] | type[builtins.bool] | BooleanDtype | type[numpy.bool[builtins.bool]] | None = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[bool]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Sequence[int | integer[Any]], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: Literal['int', 'Int8', 'Int16', 'Int32', 'Int64', 'b', 'i1', 'int8', 'byte', 'h', 'i2', 'int16', 'short', 'i', 'i4', 'int32', 'intc', 'l', 'long', 'i8', 'int64', 'int_', 'q', 'longlong', 'p', 'intp', 'int8[pyarrow]', 'int16[pyarrow]', 'int32[pyarrow]', 'int64[pyarrow]', 'UInt8', 'UInt16', 'UInt32', 'UInt64', 'B', 'u1', 'uint8', 'ubyte', 'H', 'u2', 'uint16', 'ushort', 'I', 'u4', 'uint32', 'uintc', 'L', 'ulong', 'u8', 'uint', 'uint64', 'Q', 'ulonglong', 'P', 'uintp', 'uint8[pyarrow]', 'uint16[pyarrow]', 'uint32[pyarrow]', 'uint64[pyarrow]'] | type[int] | Int8Dtype | Int16Dtype | Int32Dtype | Int64Dtype | <14 more items> | None = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[int]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Sequence[float | floating[Any]] | ndarray[tuple[Any, ...], dtype[floating[Any]]] | FloatingArray, index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: None = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[float]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any], index: None = ..., *, dtype: type[float] | Literal['float'] | Literal['Float32', 'Float64'] | Float32Dtype | Float64Dtype | Literal['e', 'f2', '<f2', 'float16', 'half'] | type[floating[_16Bit]] | Literal['f', 'f4', 'float32', 'single', 'd', 'f8', 'float64', 'double', 'g', 'f16', 'float128', 'longdouble'] | type[floating[_32Bit]] | type[float64] | type[floating[_64Bit | _96Bit | _128Bit]] | Literal['float[pyarrow]', 'double[pyarrow]', 'float16[pyarrow]', 'float32[pyarrow]', 'float64[pyarrow]'], name: Hashable = ..., copy: bool | None = ...) -> Series[float]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta] __new__(cls, data: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any], dtype: type[float] | Literal['float'] | Literal['Float32', 'Float64'] | Float32Dtype | Float64Dtype | Literal['e', 'f2', '<f2', 'float16', 'half'] | type[floating[_16Bit]] | Literal['f', 'f4', 'float32', 'single', 'd', 'f8', 'float64', 'double', 'g', 'f16', 'float128', 'longdouble'] | type[floating[_32Bit]] | type[float64] | type[floating[_64Bit | _96Bit | _128Bit]] | Literal['float[pyarrow]', 'double[pyarrow]', 'float16[pyarrow]', 'float32[pyarrow]', 'float64[pyarrow]'], name: Hashable = ..., copy: bool | None = ...) -> Series[float]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta, HashableT1: Hashable] __new__(cls, data: str | bytes | date | datetime | timedelta | <16 more items> | None, index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., *, dtype: type[S1], name: Hashable = ..., copy: bool | None = ...) -> Series[S1]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta, HashableT1: Hashable] __new__(cls, data: S1 | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | dict[str, ndarray[tuple[Any, ...], dtype[Any]]] | Sequence[S1] | IndexOpsMixin[S1, Any] | dict[HashableT1, S1] | KeysView[S1] | ValuesView[S1], index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str] | None = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[S1]
+/cogcc_pipeline/ingest.py:152: note:     def [S1: str | bytes | bool | int | float | complex | <6 more items> | type[str] | list[str] | date | time | datetime | timedelta, HashableT1: Hashable] __new__(cls, data: str | bytes | date | datetime | timedelta | <19 more items> | None = ..., index: Mapping[Any, Any] | ExtensionArray | ndarray[tuple[Any, ...], dtype[Any]] | Index[Any] | Series[Any] | SequenceNotStr[Any] | range | KeysView[Any] | None = ..., dtype: ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str] | None = ..., name: Hashable = ..., copy: bool | None = ...) -> Series[Any]
+/tests/conftest.py:144: error: Argument "dtype" to "read_csv" has incompatible type "dict[str, Any]"; expected "ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str] | Mapping[Hashable, ExtensionDtype | str | dtype[generic[Any]] | type[complex] | type[bool] | type[object] | type[str]] | defaultdict[Any, Any] | None"  [arg-type]
+Found 3 errors in 2 files (checked 12 source files)
 
 ```
 
 - **Unit Tests:**
 ```
 Unit Tests failed. Fix these errors:
-......................................................F........F.F...... [ 55%]
-.........................................................                [100%]Running teardown with pytest sessionfinish...
+...............................................................F.F...... [ 66%]
+..........F...........F......F.......                                    [100%]Running teardown with pytest sessionfinish...
 
 =================================== FAILURES ===================================
-_____________ test_apply_well_features_parallel_cum_oil_monotonic ______________
-tests/test_features.py:448: in test_apply_well_features_parallel_cum_oil_monotonic
-    result = apply_well_features_parallel(ddf, [3, 6, 12], logger).compute()
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:377: in compute
-    (result,) = compute(self, traverse=False, **kwargs)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:685: in compute
-    results = schedule(expr, keys, **kwargs)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/utils.py:403: in check_matching_columns
-    raise ValueError(
-E   ValueError: The columns in the computed data do not match the columns in the provided metadata.
-E     Extra:   ['APICountyCode', 'APISeqNum', 'DocNum', 'GasFlared', 'GasSold', 'GasUsed', 'OilSold', 'OpName', 'OpNum', 'Well']
-E     Missing: ['county_encoded', 'op_name_encoded']
-_________________ test_validate_features_schema_missing_column _________________
-tests/test_features.py:621: in test_validate_features_schema_missing_column
-    assert any("decline_rate" in e for e in errors)
-E   assert False
-E    +  where False = any(<generator object test_validate_features_schema_missing_column.<locals>.<genexpr> at 0x1aedebe00>)
-_____________ test_run_features_logs_schema_error_without_raising ______________
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: in get_loc
-    return self._engine.get_loc(casted_key)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+__________________________ test_read_raw_file_dtypes ___________________________
+tests/test_ingest.py:77: in test_read_raw_file_dtypes
+    assert df["AcceptedDate"].dtype == "datetime64[ns]"
+E   AssertionError: assert dtype('<M8[us]') == 'datetime64[ns]'
+E    +  where dtype('<M8[us]') = 0   2021-01-15\n1   2021-01-15\n2   2021-01-15\n3   2021-01-15\n4   2021-01-15\nName: AcceptedDate, dtype: datetime64[us].dtype
+___________________ test_read_raw_file_missing_column_raises ___________________
+pandas/_libs/lib.pyx:2478: in pandas._libs.lib.maybe_convert_numeric
     ???
-pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
-    ???
-pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
-    ???
-pandas/_libs/hashtable_class_helper.pxi:7676: in pandas._libs.hashtable.PyObjectHashTable.get_item
-    ???
-E   KeyError: 'OpName'
+E   ValueError: Unable to parse string "x"
 
-The above exception was the direct cause of the following exception:
-tests/test_features.py:686: in test_run_features_logs_schema_error_without_raising
-    result = run_features(config, logger)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-cogcc_pipeline/features.py:554: in run_features
-    ddf = encode_categoricals(ddf, encoders_path, logger)
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-cogcc_pipeline/features.py:378: in encode_categoricals
-    op_names = sorted(ddf["OpName"].dropna().compute().unique().tolist())  # type: ignore[union-attr]
-                      ^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/dask_expr/_collection.py:429: in __getitem__
-    return new_collection(self.expr.__getitem__(other))
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/_collections.py:8: in new_collection
-    meta = expr._meta
-           ^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/functools.py:998: in __get__
-    val = self.func(instance)
-          ^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/dask_expr/_expr.py:2186: in _meta
-    return super()._meta
-           ^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/functools.py:998: in __get__
-    val = self.func(instance)
-          ^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/dask_expr/_expr.py:562: in _meta
-    return self.operation(*args, **self._kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/frame.py:4378: in __getitem__
-    indexer = self.columns.get_loc(key)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: in get_loc
-    raise KeyError(key) from err
-E   KeyError: 'OpName'
-=============================== warnings summary ===============================
-tests/test_ingest.py::test_read_raw_csv_filters_to_2020_plus
-tests/test_ingest.py::test_read_raw_csv_latin1_fallback
-tests/test_ingest.py::test_run_ingest_returns_path
-tests/test_ingest.py::test_run_ingest_logs_validation_warnings
-  /cogcc_pipeline/ingest.py:204: Pandas4Warning: For backward compatibility, 'str' dtypes are included by select_dtypes when 'object' dtype is specified. This behavior is deprecated and will be removed in a future version. Explicitly pass 'str' to `include` to select them, or to `exclude` to remove them and silence this warning.
-  See https://pandas.pydata.org/docs/user_guide/migration-3-strings.html#string-migration-select-dtypes for details on how to write code that works with pandas 2 and 3.
-    str_cols = df.select_dtypes(include="object").columns
-
--- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+During handling of the above exception, another exception occurred:
+tests/test_ingest.py:108: in test_read_raw_file_missing_column_raises
+    read_raw_file(csv_path, config_fixture)
+cogcc_pipeline/ingest.py:108: in read_raw_file
+    df = _read("utf-8-sig")
+         ^^^^^^^^^^^^^^^^^^
+cogcc_pipeline/ingest.py:100: in _read
+    return pd.read_csv(
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/io/parsers/readers.py:873: in read_csv
+    return _read(filepath_or_buffer, kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/io/parsers/readers.py:306: in _read
+    return parser.read(nrows)
+           ^^^^^^^^^^^^^^^^^^
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/io/parsers/readers.py:1947: in read
+    ) = self._engine.read(  # type: ignore[attr-defined]
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/io/parsers/c_parser_wrapper.py:215: in read
+    chunks = self._reader.read_low_memory(nrows)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pandas/_libs/parsers.pyx:832: in pandas._libs.parsers.TextReader.read_low_memory
+    ???
+pandas/_libs/parsers.pyx:911: in pandas._libs.parsers.TextReader._read_rows
+    ???
+pandas/_libs/parsers.pyx:1009: in pandas._libs.parsers.TextReader._convert_column_data
+    ???
+pandas/_libs/parsers.pyx:1048: in pandas._libs.parsers.TextReader._convert_tokens
+    ???
+pandas/_libs/parsers.pyx:1166: in pandas._libs.parsers.TextReader._convert_with_dtype
+    ???
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/arrays/numeric.py:302: in _from_sequence_of_strings
+    scalars = to_numeric(strings, errors="raise", dtype_backend="numpy_nullable")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/tools/numeric.py:235: in to_numeric
+    values, new_mask = lib.maybe_convert_numeric(  # type: ignore[call-overload]
+pandas/_libs/lib.pyx:2521: in pandas._libs.lib.maybe_convert_numeric
+    ???
+E   ValueError: Unable to parse string "x" at position 0
+_______________________ test_build_production_date_dtype _______________________
+tests/test_transform.py:158: in test_build_production_date_dtype
+    assert result.dtype == "datetime64[ns]"
+E   AssertionError: assert dtype('<M8[us]') == 'datetime64[ns]'
+E    +  where dtype('<M8[us]') = 0   2021-06-01\ndtype: datetime64[us].dtype
+______________________ test_cast_well_status_valid_values ______________________
+tests/test_transform.py:313: in test_cast_well_status_valid_values
+    df = _minimal_df(WellStatus=pd.array(["AC", "SI", "PA"], dtype=pd.StringDtype()))
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_transform.py:66: in _minimal_df
+    return pd.DataFrame(base)
+           ^^^^^^^^^^^^^^^^^^
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/frame.py:769: in __init__
+    mgr = dict_to_mgr(data, index, columns, dtype=dtype, copy=copy)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/internals/construction.py:460: in dict_to_mgr
+    return arrays_to_mgr(arrays, columns, index, dtype=dtype, consolidate=copy)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/internals/construction.py:113: in arrays_to_mgr
+    index = _extract_index(arrays)
+            ^^^^^^^^^^^^^^^^^^^^^^
+../../../miniconda3/envs/dapi/lib/python3.12/site-packages/pandas/core/internals/construction.py:643: in _extract_index
+    raise ValueError("All arrays must be of the same length")
+E   ValueError: All arrays must be of the same length
+________________ test_transform_partition_production_date_dtype ________________
+tests/test_transform.py:386: in test_transform_partition_production_date_dtype
+    assert result["production_date"].dtype == "datetime64[ns]"
+E   AssertionError: assert dtype('<M8[us]') == 'datetime64[ns]'
+E    +  where dtype('<M8[us]') = 0   2021-06-01\nName: production_date, dtype: datetime64[us].dtype
 =========================== short test summary info ============================
-FAILED tests/test_features.py::test_apply_well_features_parallel_cum_oil_monotonic
-FAILED tests/test_features.py::test_validate_features_schema_missing_column
-FAILED tests/test_features.py::test_run_features_logs_schema_error_without_raising
-3 failed, 126 passed, 4 warnings in 37.93s
+FAILED tests/test_ingest.py::test_read_raw_file_dtypes - AssertionError: asse...
+FAILED tests/test_ingest.py::test_read_raw_file_missing_column_raises - Value...
+FAILED tests/test_transform.py::test_build_production_date_dtype - AssertionE...
+FAILED tests/test_transform.py::test_cast_well_status_valid_values - ValueErr...
+FAILED tests/test_transform.py::test_transform_partition_production_date_dtype
+5 failed, 104 passed in 5.51s
 
 ```
 
 ---
 
-## Eval Run at 2026-04-05 13:19:25
+## Eval Run at 2026-04-09 05:52:22
 
 **Status:** ❌ FAILED
 
 ### Failures:
-- **Unit Tests:**
+- **Type check:**
 ```
-Unit Tests failed. Fix these errors:
-......................................................F........F.F...... [ 55%]
-.........................................................                [100%]Running teardown with pytest sessionfinish...
-
-=================================== FAILURES ===================================
-_____________ test_apply_well_features_parallel_cum_oil_monotonic ______________
-tests/test_features.py:448: in test_apply_well_features_parallel_cum_oil_monotonic
-    result = apply_well_features_parallel(ddf, [3, 6, 12], logger).compute()
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:377: in compute
-    (result,) = compute(self, traverse=False, **kwargs)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:685: in compute
-    results = schedule(expr, keys, **kwargs)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/utils.py:403: in check_matching_columns
-    raise ValueError(
-E   ValueError: The columns in the computed data do not match the columns in the provided metadata.
-E     Extra:   ['APICountyCode', 'APISeqNum', 'DocNum', 'GasFlared', 'GasSold', 'GasUsed', 'OilSold', 'OpNum', 'Well']
-E     Missing: []
-_________________ test_validate_features_schema_missing_column _________________
-tests/test_features.py:621: in test_validate_features_schema_missing_column
-    assert any("decline_rate" in e for e in errors)
-E   assert False
-E    +  where False = any(<generator object test_validate_features_schema_missing_column.<locals>.<genexpr> at 0x1aefb3d30>)
-_____________ test_run_features_logs_schema_error_without_raising ______________
-tests/test_features.py:686: in test_run_features_logs_schema_error_without_raising
-    result = run_features(config, logger)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-cogcc_pipeline/features.py:553: in run_features
-    ddf = encode_categoricals(ddf, encoders_path, logger)
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-cogcc_pipeline/features.py:377: in encode_categoricals
-    op_names = sorted(ddf["OpName"].dropna().compute().unique().tolist())  # type: ignore[union-attr]
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:377: in compute
-    (result,) = compute(self, traverse=False, **kwargs)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:685: in compute
-    results = schedule(expr, keys, **kwargs)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/utils.py:403: in check_matching_columns
-    raise ValueError(
-E   ValueError: The columns in the computed data do not match the columns in the provided metadata.
-E     Extra:   ['APICountyCode', 'APISeqNum', 'DocNum', 'GasFlared', 'GasSold', 'GasUsed', 'OilSold', 'OpNum', 'Well', 'outlier_flag']
-E     Missing: []
-=============================== warnings summary ===============================
-tests/test_ingest.py::test_read_raw_csv_filters_to_2020_plus
-tests/test_ingest.py::test_read_raw_csv_latin1_fallback
-tests/test_ingest.py::test_run_ingest_returns_path
-tests/test_ingest.py::test_run_ingest_logs_validation_warnings
-  /cogcc_pipeline/ingest.py:204: Pandas4Warning: For backward compatibility, 'str' dtypes are included by select_dtypes when 'object' dtype is specified. This behavior is deprecated and will be removed in a future version. Explicitly pass 'str' to `include` to select them, or to `exclude` to remove them and silence this warning.
-  See https://pandas.pydata.org/docs/user_guide/migration-3-strings.html#string-migration-select-dtypes for details on how to write code that works with pandas 2 and 3.
-    str_cols = df.select_dtypes(include="object").columns
-
--- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-=========================== short test summary info ============================
-FAILED tests/test_features.py::test_apply_well_features_parallel_cum_oil_monotonic
-FAILED tests/test_features.py::test_validate_features_schema_missing_column
-FAILED tests/test_features.py::test_run_features_logs_schema_error_without_raising
-3 failed, 126 passed, 4 warnings in 12.79s
+Type check failed. Fix these errors:
+/tests/test_transform.py:159: error: Argument 1 to "issubdtype" has incompatible type "dtype[generic[Any]] | ExtensionDtype"; expected "type[Any] | dtype[Any] | _HasDType[dtype[Any]] | _HasNumPyDType[dtype[Any]] | tuple[Any, Any] | list[Any] | _DTypeDict | str | None"  [arg-type]
+/tests/test_transform.py:387: error: Argument 1 to "issubdtype" has incompatible type "dtype[generic[Any]] | ExtensionDtype"; expected "type[Any] | dtype[Any] | _HasDType[dtype[Any]] | _HasNumPyDType[dtype[Any]] | tuple[Any, Any] | list[Any] | _DTypeDict | str | None"  [arg-type]
+Found 2 errors in 1 file (checked 12 source files)
 
 ```
 
 ---
 
-## Eval Run at 2026-04-05 13:28:31
-
-**Status:** ❌ FAILED
-
-### Failures:
-- **Unit Tests:**
-```
-Unit Tests failed. Fix these errors:
-......................................................F........F.F...... [ 55%]
-.........................................................                [100%]Running teardown with pytest sessionfinish...
-
-=================================== FAILURES ===================================
-_____________ test_apply_well_features_parallel_cum_oil_monotonic ______________
-tests/test_features.py:439: in test_apply_well_features_parallel_cum_oil_monotonic
-    result = apply_well_features_parallel(ddf, [3, 6, 12], logger).compute()
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:377: in compute
-    (result,) = compute(self, traverse=False, **kwargs)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:685: in compute
-    results = schedule(expr, keys, **kwargs)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/utils.py:403: in check_matching_columns
-    raise ValueError(
-E   ValueError: The columns in the computed data do not match the columns in the provided metadata.
-E   Order of columns does not match.
-E   Actual:   ['well_id', 'production_date', 'oil_bbl', 'gas_mcf', 'water_bbl', 'days_produced', 'OpName', 'cum_oil', 'cum_gas', 'cum_water', 'gor', 'water_cut', 'decline_rate', 'oil_bbl_rolling_3m', 'oil_bbl_rolling_6m', 'oil_bbl_rolling_12m', 'oil_bbl_lag1', 'gas_mcf_rolling_3m', 'gas_mcf_rolling_6m', 'gas_mcf_rolling_12m', 'gas_mcf_lag1', 'water_bbl_rolling_3m', 'water_bbl_rolling_6m', 'water_bbl_rolling_12m', 'water_bbl_lag1', 'well_age_months', 'oil_bbl_30d', 'gas_mcf_30d', 'water_bbl_30d']
-E   Expected: ['well_id', 'production_date', 'oil_bbl', 'gas_mcf', 'water_bbl', 'days_produced', 'cum_oil', 'cum_gas', 'cum_water', 'gor', 'water_cut', 'decline_rate', 'well_age_months', 'oil_bbl_30d', 'gas_mcf_30d', 'water_bbl_30d', 'OpName', 'oil_bbl_rolling_3m', 'oil_bbl_rolling_6m', 'oil_bbl_rolling_12m', 'oil_bbl_lag1', 'gas_mcf_rolling_3m', 'gas_mcf_rolling_6m', 'gas_mcf_rolling_12m', 'gas_mcf_lag1', 'water_bbl_rolling_3m', 'water_bbl_rolling_6m', 'water_bbl_rolling_12m', 'water_bbl_lag1']
-_________________ test_validate_features_schema_missing_column _________________
-tests/test_features.py:612: in test_validate_features_schema_missing_column
-    assert any("decline_rate" in e for e in errors)
-E   assert False
-E    +  where False = any(<generator object test_validate_features_schema_missing_column.<locals>.<genexpr> at 0x1ab0ef920>)
-_____________ test_run_features_logs_schema_error_without_raising ______________
-tests/test_features.py:667: in test_run_features_logs_schema_error_without_raising
-    result = run_features(config, logger)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-cogcc_pipeline/features.py:553: in run_features
-    ddf = encode_categoricals(ddf, encoders_path, logger)
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-cogcc_pipeline/features.py:377: in encode_categoricals
-    op_names = sorted(ddf["OpName"].dropna().compute().unique().tolist())  # type: ignore[union-attr]
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:377: in compute
-    (result,) = compute(self, traverse=False, **kwargs)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:685: in compute
-    results = schedule(expr, keys, **kwargs)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/utils.py:403: in check_matching_columns
-    raise ValueError(
-E   ValueError: The columns in the computed data do not match the columns in the provided metadata.
-E   Order of columns does not match.
-E   Actual:   ['well_id', 'production_date', 'oil_bbl', 'gas_mcf', 'water_bbl', 'days_produced', 'OpName', 'cum_oil', 'cum_gas', 'cum_water', 'gor', 'water_cut', 'decline_rate', 'oil_bbl_rolling_3m', 'oil_bbl_rolling_6m', 'oil_bbl_rolling_12m', 'oil_bbl_lag1', 'gas_mcf_rolling_3m', 'gas_mcf_rolling_6m', 'gas_mcf_rolling_12m', 'gas_mcf_lag1', 'water_bbl_rolling_3m', 'water_bbl_rolling_6m', 'water_bbl_rolling_12m', 'water_bbl_lag1', 'well_age_months', 'oil_bbl_30d', 'gas_mcf_30d', 'water_bbl_30d']
-E   Expected: ['well_id', 'production_date', 'oil_bbl', 'gas_mcf', 'water_bbl', 'days_produced', 'cum_oil', 'cum_gas', 'cum_water', 'gor', 'water_cut', 'decline_rate', 'well_age_months', 'oil_bbl_30d', 'gas_mcf_30d', 'water_bbl_30d', 'OpName', 'oil_bbl_rolling_3m', 'oil_bbl_rolling_6m', 'oil_bbl_rolling_12m', 'oil_bbl_lag1', 'gas_mcf_rolling_3m', 'gas_mcf_rolling_6m', 'gas_mcf_rolling_12m', 'gas_mcf_lag1', 'water_bbl_rolling_3m', 'water_bbl_rolling_6m', 'water_bbl_rolling_12m', 'water_bbl_lag1']
-=============================== warnings summary ===============================
-tests/test_ingest.py::test_read_raw_csv_filters_to_2020_plus
-tests/test_ingest.py::test_read_raw_csv_latin1_fallback
-tests/test_ingest.py::test_run_ingest_returns_path
-tests/test_ingest.py::test_run_ingest_logs_validation_warnings
-  /cogcc_pipeline/ingest.py:204: Pandas4Warning: For backward compatibility, 'str' dtypes are included by select_dtypes when 'object' dtype is specified. This behavior is deprecated and will be removed in a future version. Explicitly pass 'str' to `include` to select them, or to `exclude` to remove them and silence this warning.
-  See https://pandas.pydata.org/docs/user_guide/migration-3-strings.html#string-migration-select-dtypes for details on how to write code that works with pandas 2 and 3.
-    str_cols = df.select_dtypes(include="object").columns
-
--- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-=========================== short test summary info ============================
-FAILED tests/test_features.py::test_apply_well_features_parallel_cum_oil_monotonic
-FAILED tests/test_features.py::test_validate_features_schema_missing_column
-FAILED tests/test_features.py::test_run_features_logs_schema_error_without_raising
-3 failed, 126 passed, 4 warnings in 12.37s
-
-```
-
----
-
-## Eval Run at 2026-04-05 13:35:47
-
-**Status:** ❌ FAILED
-
-### Failures:
-- **Unit Tests:**
-```
-Unit Tests failed. Fix these errors:
-.................................................................F...... [ 55%]
-.........................................................                [100%]Running teardown with pytest sessionfinish...
-
-=================================== FAILURES ===================================
-_____________ test_run_features_logs_schema_error_without_raising ______________
-tests/test_features.py:667: in test_run_features_logs_schema_error_without_raising
-    result = run_features(config, logger)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-cogcc_pipeline/features.py:559: in run_features
-    features_path = write_features_parquet(ddf, processed_dir, features_file, logger)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-cogcc_pipeline/features.py:485: in write_features_parquet
-    ddf.repartition(npartitions=30).to_parquet(
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/dask_expr/_collection.py:3325: in to_parquet
-    return to_parquet(self, path, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/dask_expr/io/parquet.py:661: in to_parquet
-    out = out.compute(**compute_kwargs)
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:377: in compute
-    (result,) = compute(self, traverse=False, **kwargs)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/base.py:685: in compute
-    results = schedule(expr, keys, **kwargs)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/io/parquet/core.py:158: in __call__
-    return self.engine.write_partition(
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/io/parquet/arrow.py:824: in write_partition
-    t = cls._pandas_to_arrow_table(df, preserve_index=preserve_index, schema=schema)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-../../../miniconda3/envs/dapi/lib/python3.12/site-packages/dask/dataframe/io/parquet/arrow.py:785: in _pandas_to_arrow_table
-    raise ValueError(
-E   ValueError: Failed to convert partition to expected pyarrow schema:
-E       `ArrowInvalid('Float value -1.224745 was truncated converting to int64', 'Conversion failed for column well_age_months with type float64')`
-E   
-E   Expected partition schema:
-E       well_id: large_string
-E       production_date: timestamp[ns]
-E       oil_bbl: double
-E       gas_mcf: double
-E       water_bbl: double
-E       days_produced: double
-E       cum_oil: double
-E       cum_gas: double
-E       cum_water: double
-E       gor: double
-E       water_cut: double
-E       decline_rate: double
-E       oil_bbl_rolling_3m: double
-E       oil_bbl_rolling_6m: double
-E       oil_bbl_rolling_12m: double
-E       oil_bbl_lag1: double
-E       gas_mcf_rolling_3m: double
-E       gas_mcf_rolling_6m: double
-E       gas_mcf_rolling_12m: double
-E       gas_mcf_lag1: double
-E       water_bbl_rolling_3m: double
-E       water_bbl_rolling_6m: double
-E       water_bbl_rolling_12m: double
-E       water_bbl_lag1: double
-E       well_age_months: int64
-E       oil_bbl_30d: double
-E       gas_mcf_30d: double
-E       water_bbl_30d: double
-E       op_name_encoded: int32
-E       county_encoded: int32
-E   
-E   Received partition schema:
-E       well_id: large_string
-E       production_date: timestamp[us]
-E       oil_bbl: double
-E       gas_mcf: double
-E       water_bbl: double
-E       days_produced: double
-E       cum_oil: double
-E       cum_gas: double
-E       cum_water: double
-E       gor: double
-E       water_cut: double
-E       decline_rate: double
-E       oil_bbl_rolling_3m: double
-E       oil_bbl_rolling_6m: double
-E       oil_bbl_rolling_12m: double
-E       oil_bbl_lag1: double
-E       gas_mcf_rolling_3m: double
-E       gas_mcf_rolling_6m: double
-E       gas_mcf_rolling_12m: double
-E       gas_mcf_lag1: double
-E       water_bbl_rolling_3m: double
-E       water_bbl_rolling_6m: double
-E       water_bbl_rolling_12m: double
-E       water_bbl_lag1: double
-E       well_age_months: double
-E       oil_bbl_30d: double
-E       gas_mcf_30d: double
-E       water_bbl_30d: double
-E       op_name_encoded: int32
-E       county_encoded: int32
-E   
-E   This error *may* be resolved by passing in schema information for
-E   the mismatched column(s) using the `schema` keyword in `to_parquet`.
-=============================== warnings summary ===============================
-tests/test_ingest.py::test_read_raw_csv_filters_to_2020_plus
-tests/test_ingest.py::test_read_raw_csv_latin1_fallback
-tests/test_ingest.py::test_run_ingest_returns_path
-tests/test_ingest.py::test_run_ingest_logs_validation_warnings
-  /cogcc_pipeline/ingest.py:204: Pandas4Warning: For backward compatibility, 'str' dtypes are included by select_dtypes when 'object' dtype is specified. This behavior is deprecated and will be removed in a future version. Explicitly pass 'str' to `include` to select them, or to `exclude` to remove them and silence this warning.
-  See https://pandas.pydata.org/docs/user_guide/migration-3-strings.html#string-migration-select-dtypes for details on how to write code that works with pandas 2 and 3.
-    str_cols = df.select_dtypes(include="object").columns
-
--- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-=========================== short test summary info ============================
-FAILED tests/test_features.py::test_run_features_logs_schema_error_without_raising
-1 failed, 128 passed, 4 warnings in 11.20s
-
-```
-
----
-
-## Eval Run at 2026-04-05 13:42:57
+## Eval Run at 2026-04-09 05:59:48
 
 **Status:** ✅ PASSED
 

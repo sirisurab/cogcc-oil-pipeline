@@ -112,10 +112,33 @@ def read_raw_file(path: Path, config: dict) -> pd.DataFrame:
         except Exception as exc:
             raise IngestError(f"Cannot decode {path}: {exc}") from exc
 
-    # Check for required columns
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise IngestError(f"Missing required columns in {path}: {missing}")
+    # Normalize column names to canonical schema via case-insensitive matching
+    canonical_lower = {c.lower(): c for c in DTYPE_MAP}
+    rename_map = {}
+    drop_cols = []
+    for col in df.columns:
+        canonical = canonical_lower.get(col.lower())
+        if canonical and canonical != col:
+            rename_map[col] = canonical
+        elif not canonical and col != "AcceptedDate":
+            drop_cols.append(col)
+    if rename_map:
+        logger.warning("Renaming non-canonical columns in %s: %s", path, rename_map)
+        df = df.rename(columns=rename_map)
+    if drop_cols:
+        logger.warning("Dropping non-canonical columns in %s: %s", path, drop_cols)
+        df = df.drop(columns=drop_cols)
+
+    # Raise only if non-nullable columns are missing
+    missing_required = [c for c in NON_NULLABLE if c not in df.columns]
+    if missing_required:
+        raise IngestError(f"Missing required columns in {path}: {missing_required}")
+
+    # Fill missing nullable columns with NA at the correct dtype
+    for col, dtype in DTYPE_MAP.items():
+        if col not in df.columns and col not in NON_NULLABLE:
+            logger.warning("Missing nullable column '%s' in %s — filling with NA", col, path)
+            df[col] = pd.Series([pd.NA] * len(df), dtype=dtype)
 
     # Filter to configured start year
     df = df[df["ReportYear"] >= start_year].copy()
