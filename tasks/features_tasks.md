@@ -1,533 +1,594 @@
-# Features Component Tasks
+# Features Stage — Task Specifications
 
-**Pipeline package:** `cogcc_pipeline`
-**Module file:** `cogcc_pipeline/features.py`
-**Test file:** `tests/test_features.py`
+## Stage Overview
 
-## Overview
-
-The features stage reads the processed Parquet dataset, engineers derived columns
-required for ML and analytics workflows, and writes a feature-matrix Parquet dataset to
-`data/features/`. Derived features include: cumulative production (Np, Gp, Wp), GOR
-(gas-oil ratio), water cut, month-over-month decline rates, rolling averages, and lag
-features. All computation uses vectorised pandas/numpy inside `map_partitions` callbacks.
-Per-well operations (cumulative sums, rolling windows, lag features) use
-`groupby().transform()` — never Python for-loops over groups. The stage uses the Dask
-distributed scheduler (reuse existing Client or initialise its own).
-
----
-
-## Feature Definitions
-
-All derived features are computed within `map_partitions` functions that operate on
-pandas DataFrames (one partition per call). Partitions are indexed by `well_id` after
-`set_index` in the transform stage, so each partition is already sorted by
-`production_date` within each well group (guaranteed by the transform stage's final sort
-step).
-
-### Cumulative Production
-- `cum_oil`: `groupby("well_id")["OilProduced"].transform("cumsum")` — cumulative oil
-  in BBL (Np). Must be monotonically non-decreasing per well (TR-03).
-- `cum_gas`: cumulative gas in MCF (Gp). Same constraint.
-- `cum_water`: cumulative water in BBL (Wp). Same constraint.
-
-### GOR (Gas-Oil Ratio)
-- `gor`: `GasProduced / OilProduced`. When `OilProduced == 0` and `GasProduced > 0`,
-  result must be `NaN` (not an exception). When both are 0 (shut-in), result must be
-  `0.0` or `NaN` — not an exception. When `OilProduced > 0` and `GasProduced == 0`,
-  result must be `0.0`. Use `numpy.where` or division with `.replace(0, pd.NA)` before
-  dividing, following the rules in TR-06 exactly.
-
-### Water Cut
-- `water_cut`: `WaterProduced / (OilProduced + WaterProduced)`.
-  - `0.0` is valid (no water, e.g., new well) — preserve as-is (TR-10).
-  - `1.0` is valid (100% water, late-life well) — preserve as-is (TR-10).
-  - When denominator is 0 (both oil and water are 0), result is `NaN`.
-  - Values outside `[0, 1]` after computation indicate data error — replace with `pd.NA`
-    and log a `WARNING`.
-
-### Decline Rate
-- `decline_rate`: period-over-period oil production decline rate per well:
-  `(OilProduced_t-1 - OilProduced_t) / OilProduced_t-1`
-  Computed using `groupby("well_id")["OilProduced"].transform(lambda s: s.pct_change() * -1)`.
-  - Clip to `[-1.0, 10.0]` after computation (engineering bounds for ML stability, TR-07).
-  - When `OilProduced_t-1 == 0` (shut-in month), the raw pct_change is `inf` or `nan` —
-    this must be handled before clipping (replace `inf` with `np.nan` using
-    `np.where(np.isinf(raw), np.nan, raw)`).
-  - After inf-handling, apply `.clip(-1.0, 10.0)`.
-
-### Rolling Averages (from `config["features"]["rolling_windows"]`, default `[3, 6]`)
-For each window `w` in rolling windows, for each volume column `[OilProduced, GasProduced, WaterProduced]`:
-- `oil_rolling_{w}m`: `groupby("well_id")["OilProduced"].transform(lambda s: s.rolling(w, min_periods=1).mean())`
-- `gas_rolling_{w}m`: same for `GasProduced`
-- `water_rolling_{w}m`: same for `WaterProduced`
-- When window is larger than available history (e.g., first 2 months of a well's life
-  with a 3-month window), use `min_periods=1` so the result is a partial-window average
-  — not `NaN` or zero (TR-09b).
-
-### Lag Features (from `config["features"]["lag_periods"]`, default `[1, 3]`)
-For each lag `l` in lag periods, for `OilProduced` only:
-- `oil_lag_{l}m`: `groupby("well_id")["OilProduced"].transform(lambda s: s.shift(l))`
-- Lag-1 for month N must equal the raw `OilProduced` for month N-1 (TR-09c).
-
----
-
-## Design Decisions and Constraints
-
-- All transformation logic inside `map_partitions` must use vectorised pandas/numpy
-  operations. Use `groupby().transform()` for all per-well operations — never a Python
-  for-loop over groupby groups.
-- The `meta=` argument for every `map_partitions` call must be derived by calling the
-  function on `ddf._meta.copy()`. Never manually construct meta column lists.
-- Physical bound validation: GOR must be non-negative (TR-01). Water cut must be in
-  `[0, 1]` (TR-01, TR-10). Production volumes must be non-negative (already enforced by
-  transform; assert in tests).
-- Cumulative production must be monotonically non-decreasing per well (TR-03).
-- Decline rate is clipped to `[-1.0, 10.0]` — these are ML stability bounds, not
-  physical constants (TR-07).
-- Output directory: `data/features/production_features.parquet/`.
-- Repartition before writing: `max(10, min(ddf.npartitions, 50))`.
-- The stage uses the Dask distributed scheduler. Check for an existing Client via
-  `distributed.get_client()`; catch `ValueError`; create `LocalCluster` + `Client` if
-  none exists.
-- The required output columns are: `well_id` (index), `production_date`, `OilProduced`,
-  `GasProduced`, `WaterProduced`, `cum_oil`, `cum_gas`, `cum_water`, `gor`, `water_cut`,
-  `decline_rate`, and all rolling and lag columns (TR-19).
-
----
-
-## Task 01: Implement FeaturesError
-
+**Package:** `cogcc_pipeline`
 **Module:** `cogcc_pipeline/features.py`
-**Class:** `class FeaturesError(RuntimeError)`
+**Test file:** `tests/test_features.py`
+**Input directory:** `data/processed/` (Parquet, output of transform)
+**Output directory:** `data/features/` (Parquet, ML-ready)
+**Scheduler:** Dask distributed scheduler (CPU-bound stage — ADR-001)
 
-**Description:**
-Thin subclass of `RuntimeError` with no additional attributes. Raised on unrecoverable
-feature-engineering failures.
+The features stage reads the processed Parquet from transform, computes all derived
+ML features (cumulative volumes, production ratios, decline rates, rolling averages,
+lag features, encoded categoricals), and writes ML-ready Parquet to `data/features/`.
 
-**Test cases:**
+### Boundary contract received from transform
+- Entity-indexed on `well_id`.
+- Sorted by `production_date` within each partition.
+- Categoricals cast to declared category sets.
+- Invalid values replaced with the appropriate null sentinel.
+- Partitioned to `max(10, min(n, 50))`.
+- No re-sorting, re-indexing, re-casting, or re-validation needed before feature
+  computation.
 
-- `@pytest.mark.unit` — Assert `FeaturesError` is a subclass of `RuntimeError`.
-- `@pytest.mark.unit` — Assert `FeaturesError("msg")` can be raised and caught as a
-  `RuntimeError`.
+### Output schema (all input columns PLUS derived feature columns)
+Every output Parquet file must contain all of the following columns (TR-19):
+`well_id` (index), `production_date`, `OilProduced`, `GasProduced`, `WaterProduced`,
+`cum_oil`, `cum_gas`, `cum_water`, `gor`, `water_cut`, `wor`, `wgr`,
+`decline_rate_oil`, `decline_rate_gas`,
+`oil_roll3`, `oil_roll6`, `oil_roll12`,
+`gas_roll3`, `gas_roll6`, `gas_roll12`,
+`water_roll3`, `water_roll6`, `water_roll12`,
+`oil_lag1`, `gas_lag1`, `water_lag1`,
+`wellstatus_encoded`, `days_produced_norm`,
+plus all original input columns not named above.
 
-**Definition of done:** `FeaturesError` implemented, all test cases pass, ruff and mypy
-report no errors, `requirements.txt` updated with all third-party packages imported in
-this task.
+### Key design constraints (from ADRs)
+- ADR-001: Use Dask distributed scheduler. Reuse the existing `Client`.
+- ADR-002: All feature operations must be vectorized. No row iteration. Use
+  `transform` (not `apply`) for grouped window computations. Use `groupby(...).transform`
+  or `map_partitions` with partition-level pandas grouped operations.
+- ADR-003: meta= arguments derived by calling the function on an empty DataFrame
+  (TR-23). Never construct meta manually.
+- ADR-004: `repartition()` is the last operation before `to_parquet()`.
+- ADR-005: Task graph stays lazy until the final write. No intermediate `.compute()`.
+- H1 (features manifest): Temporal ordering within each entity group must be preserved
+  at the point each time-dependent feature is computed. The transform stage guarantees
+  this ordering — do not re-sort.
+
+### Domain correctness constraints
+All feature computations must observe the following domain rules:
+- TR-01: Physical bound validation — production volumes, pressures, GOR must be non-negative.
+- TR-03: Cumulative production must be monotonically non-decreasing per well.
+- TR-06: GOR zero-denominator — oil_bbl=0 with gas>0 → NaN (not exception).
+- TR-07: Decline rate clipped to [-1.0, 10.0].
+- TR-08: Cumulative production flat during shut-in months (zero production).
+- TR-10: Water cut boundary values 0.0 and 1.0 are both valid and must not be
+  treated as outliers.
 
 ---
 
-## Task 02: Implement cumulative production feature builder
+## Task FEA-01: Cumulative production features
 
 **Module:** `cogcc_pipeline/features.py`
 **Function:** `_add_cumulative_features(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-Adds `cum_oil`, `cum_gas`, `cum_water` columns to a pandas partition DataFrame using
-`groupby("well_id").transform("cumsum")` for each respective production column. Each
-cumulative column has dtype `pd.Float64Dtype()`. Returns the augmented DataFrame.
+Partition-level function (called via `map_partitions`) that computes per-well
+cumulative production for oil, gas, and water. Must be pure and stateless.
 
-The input DataFrame may have `well_id` as the index (after `set_index` in transform).
-Reset the index before groupby if needed, then restore it.
+### Cumulative columns computed:
+- `cum_oil` — cumulative sum of `OilProduced` per `well_id`, sorted ascending by
+  `production_date`.
+- `cum_gas` — cumulative sum of `GasProduced` per `well_id`.
+- `cum_water` — cumulative sum of `WaterProduced` per `well_id`.
 
-**Test cases:**
+### Implementation:
+Use `df.groupby(level="well_id", group_keys=False)["OilProduced"].cumsum()` (and
+similarly for gas and water). The index is `well_id` (set by transform). Since the
+DataFrame is already sorted by `production_date` within each partition (transform
+guarantee), the cumulative sum is computed in correct temporal order without
+re-sorting.
 
-- `@pytest.mark.unit` — Given a synthetic single-well DataFrame with
-  `OilProduced=[10.0, 20.0, 30.0]`, assert `cum_oil=[10.0, 30.0, 60.0]` (TR-03).
-- `@pytest.mark.unit` — Given a well with `OilProduced=[10.0, 0.0, 5.0]` (shut-in
-  month), assert `cum_oil=[10.0, 10.0, 15.0]` — flat during zero month (TR-08).
-- `@pytest.mark.unit` — Given two wells in the same partition, assert cumulative values
-  are computed independently per well (not summed across wells).
-- `@pytest.mark.unit` — Assert `cum_oil` is monotonically non-decreasing per well
-  (TR-03): `all(cum_oil.diff().dropna() >= 0)`.
-- `@pytest.mark.unit` — Assert output dtypes for `cum_oil`, `cum_gas`, `cum_water` are
-  `pd.Float64Dtype()`.
-- `@pytest.mark.unit` — Meta consistency (TR-23): call `_add_cumulative_features` on an
-  empty DataFrame matching the input schema and assert column names and dtypes match the
-  `meta=` argument for `map_partitions`.
+Null values in `OilProduced`/`GasProduced`/`WaterProduced` must propagate through
+cumsum — a null period should produce a null cumulative value for that row (not
+skip it). Use `skipna=False` in `cumsum()`.
 
-**Cumulative flat periods (TR-08):**
+### Domain constraint (TR-03, TR-08):
+Since the input is sorted and cumsum is monotone by definition, the monotonicity
+guarantee is inherently satisfied if the input data is non-negative (which the
+transform stage guarantees by replacing negative values with NA). Shut-in months
+with `OilProduced=0` produce a flat cumulative segment (previous value repeated),
+which is the correct domain behavior.
 
-- `@pytest.mark.unit` — Synthetic sequence: zero-production months mid-sequence; assert
-  cumulative stays flat during zeros (TR-08a).
-- `@pytest.mark.unit` — Synthetic sequence: zero-production months at the start (well
-  not yet online); assert cumulative is 0 during those months (TR-08b).
-- `@pytest.mark.unit` — Synthetic sequence: production resumes after shut-in; assert
-  cumulative resumes correctly from the flat value (TR-08c).
+**Meta derivation:**
+Derive meta by calling `_add_cumulative_features(ddf._meta.copy())` before the
+`map_partitions` call (TR-23).
 
-**Definition of done:** `_add_cumulative_features` implemented, all test cases pass,
-ruff and mypy report no errors, `requirements.txt` updated with all third-party packages
-imported in this task.
+**Dependencies:** `pandas`
+
+**Test cases (TR-03, TR-08):**
+- Given a single well with `OilProduced=[100, 200, 150]`, assert
+  `cum_oil=[100, 300, 450]`.
+- Given a well with `OilProduced=[100, 0, 50]` (shut-in in month 2), assert
+  `cum_oil=[100, 100, 150]` — cumulative is flat during shut-in (TR-08a).
+- Given a well with `OilProduced=[0, 0, 100]` (not yet online), assert
+  `cum_oil=[0, 0, 100]` (TR-08b).
+- Given a well with `OilProduced=[100, 0, 0, 200]` (shut-in then resumed), assert
+  `cum_oil=[100, 100, 100, 300]` (TR-08c).
+- Assert `cum_oil` is monotonically non-decreasing for all non-null values (TR-03).
+- Assert that `cum_oil` is `pd.NA` where `OilProduced` is `pd.NA` (null propagation).
+- TR-23: Call on empty DataFrame with correct schema; assert output column list and
+  dtypes match meta.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 03: Implement GOR and water cut feature builder
+## Task FEA-02: Production ratio features (GOR, WOR, WGR, water cut)
 
 **Module:** `cogcc_pipeline/features.py`
 **Function:** `_add_ratio_features(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-Adds `gor` and `water_cut` columns to the partition DataFrame using vectorised
-numpy/pandas operations. Follows the rules from TR-06 and TR-09/TR-10 exactly:
+Partition-level function (called via `map_partitions`) that computes monthly
+production ratios. Must be pure and stateless.
 
-**GOR (`gor = GasProduced / OilProduced`):**
-- `OilProduced > 0`: `gor = GasProduced / OilProduced`
-- `OilProduced == 0` and `GasProduced > 0`: `gor = NaN`
-- `OilProduced == 0` and `GasProduced == 0`: `gor = 0.0` or `NaN` (specify one; prefer `NaN` for mathematical consistency)
-- `OilProduced > 0` and `GasProduced == 0`: `gor = 0.0`
-- Implement using `numpy.where` or `pandas.where` — no `apply`, no `lambda` row-wise.
+### Ratio columns computed:
+- `gor` — Gas-Oil Ratio: `GasProduced / OilProduced` (gas MCF per oil BBL)
+- `water_cut` — Water fraction: `WaterProduced / (OilProduced + WaterProduced)`
+- `wor` — Water-Oil Ratio: `WaterProduced / OilProduced`
+- `wgr` — Water-Gas Ratio: `WaterProduced / GasProduced`
 
-**Water Cut (`water_cut = WaterProduced / (OilProduced + WaterProduced)`):**
-- When `OilProduced + WaterProduced == 0`: `water_cut = NaN` (not an exception).
-- `0.0` and `1.0` are valid values — do not null them (TR-10).
-- Values outside `[0, 1]` after computation: replace with `pd.NA` and log a `WARNING`.
-- Implement using vectorised division and masking — no `apply`.
+### Zero-denominator rules (TR-06, TR-10):
+All divisions must use pandas vectorized division with `np.where` or `.where()` guards:
 
-Returns the augmented DataFrame. Output dtypes: `gor` and `water_cut` both
-`pd.Float64Dtype()`.
+**GOR (`gor`):**
+- `OilProduced > 0` and `GasProduced >= 0` → `GasProduced / OilProduced`
+- `OilProduced == 0` and `GasProduced > 0` → `np.nan` (physically valid pure gas well,
+  result undefined as a ratio)
+- `OilProduced == 0` and `GasProduced == 0` → `np.nan` (shut-in, no ratio defined)
+- `OilProduced > 0` and `GasProduced == 0` → `0.0`
+- Either operand is `pd.NA` → result is `pd.NA`
 
-**Test cases:**
+**Water cut (`water_cut`):**
+- `(OilProduced + WaterProduced) > 0` → `WaterProduced / (OilProduced + WaterProduced)`
+- Both zero → `np.nan`
+- Values of exactly `0.0` and `1.0` are valid (TR-10) — do not flag or replace them.
 
-**GOR tests (TR-06):**
-- `@pytest.mark.unit` — `oil_bbl=0`, `gas_mcf=100.0` → `gor` is `NaN` (TR-06a).
-- `@pytest.mark.unit` — `oil_bbl=0`, `gas_mcf=0` → `gor` is `NaN` or `0.0`, not an
-  exception (TR-06b).
-- `@pytest.mark.unit` — `oil_bbl=100.0`, `gas_mcf=0` → `gor == 0.0` (TR-06c).
-- `@pytest.mark.unit` — `oil_bbl=100.0`, `gas_mcf=500.0` → `gor == 5.0`.
-- `@pytest.mark.unit` — A late-life well with very low `OilProduced` (e.g. 0.1 BBL) and
-  high `GasProduced` produces a legitimately high GOR — assert it is retained as-is (not
-  treated as a data error).
+**WOR (`wor`):**
+- `OilProduced > 0` → `WaterProduced / OilProduced`
+- `OilProduced == 0` → `np.nan`
 
-**Water cut tests (TR-10):**
-- `@pytest.mark.unit` — `water_bbl=0`, `oil_bbl=100.0` → `water_cut == 0.0` (TR-10a).
-- `@pytest.mark.unit` — `water_bbl=500.0`, `oil_bbl=0` → `water_cut == 1.0` (TR-10b).
-- `@pytest.mark.unit` — `water_bbl=0`, `oil_bbl=0` → `water_cut is NaN`.
-- `@pytest.mark.unit` — Only values outside `[0, 1]` are treated as invalid (TR-10c).
+**WGR (`wgr`):**
+- `GasProduced > 0` → `WaterProduced / GasProduced`
+- `GasProduced == 0` → `np.nan`
 
-**Meta consistency (TR-23):**
-- `@pytest.mark.unit` — Call `_add_ratio_features` on an empty DataFrame matching input
-  schema; assert the column list and dtypes match the `meta=` argument for
-  `map_partitions`.
+### Implementation constraint:
+Use `pd.Series.where()` or `np.where()` for all zero-denominator guards —
+never use Python division directly on a column without guarding.
+No per-row apply. All operations vectorized.
 
-**Physical bounds (TR-01):**
-- `@pytest.mark.unit` — Assert `gor` is always non-negative where not `NaN`.
-- `@pytest.mark.unit` — Assert `water_cut` is always in `[0, 1]` where not `NaN`.
+**Meta derivation:**
+Derive meta by calling `_add_ratio_features(ddf._meta.copy())` before `map_partitions`
+(TR-23).
 
-**Definition of done:** `_add_ratio_features` implemented, all test cases pass (including
-TR-01, TR-06, TR-09d, TR-09e, TR-10), ruff and mypy report no errors, `requirements.txt`
-updated with all third-party packages imported in this task.
+**Dependencies:** `pandas`, `numpy`
+
+**Test cases (TR-06, TR-09, TR-10):**
+- GOR: `OilProduced=100, GasProduced=500` → `gor=5.0` (TR-09d).
+- GOR: `OilProduced=0, GasProduced=500` → `gor=NaN` (not exception, TR-06a).
+- GOR: `OilProduced=0, GasProduced=0` → `gor=NaN` (TR-06b).
+- GOR: `OilProduced=100, GasProduced=0` → `gor=0.0` (TR-06c).
+- Water cut: `WaterProduced=0, OilProduced=100` → `water_cut=0.0` (TR-10a).
+- Water cut: `WaterProduced=200, OilProduced=0` → `water_cut=1.0` (TR-10b, valid
+  end-of-life well state — do not flag or null).
+- Water cut: `WaterProduced=75, OilProduced=25` → `water_cut=0.75` (TR-09e).
+- WOR: `OilProduced=0, WaterProduced=50` → `wor=NaN`.
+- WOR: `OilProduced=100, WaterProduced=50` → `wor=0.5`.
+- Assert no `ZeroDivisionError` or unhandled `RuntimeWarning` for any zero combination.
+- TR-23: Call on empty DataFrame; assert output schema matches meta.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 04: Implement decline rate feature builder
+## Task FEA-03: Decline rate feature
 
 **Module:** `cogcc_pipeline/features.py`
 **Function:** `_add_decline_rates(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-Adds `decline_rate` column using vectorised per-well computation:
+Partition-level function (called via `map_partitions`) that computes period-over-period
+decline rates for oil and gas production per well. Must be pure and stateless.
 
-1. Compute raw pct_change per well using
-   `groupby("well_id")["OilProduced"].transform(lambda s: s.pct_change() * -1)`.
-2. Replace `inf` and `-inf` values with `np.nan` using
-   `np.where(np.isinf(raw), np.nan, raw)` before clipping.
-3. Clip to `[-1.0, 10.0]` using `.clip(-1.0, 10.0)`.
-4. Return the augmented DataFrame. Output dtype: `pd.Float64Dtype()`.
+### Decline rate columns computed:
+- `decline_rate_oil` — month-over-month change in `OilProduced` per well:
+  `(OilProduced_t - OilProduced_{t-1}) / OilProduced_{t-1}`
+  where `t` is the current month and `t-1` is the prior month for the same well.
+- `decline_rate_gas` — same formula applied to `GasProduced`.
 
-**Test cases (TR-07):**
+### Formula derivation:
+Use `df.groupby(level="well_id", group_keys=False)["OilProduced"].pct_change()`.
+`pct_change()` computes `(current - previous) / previous`, which is the
+period-over-period decline rate. The first record per well has no prior period →
+result is `NaN`.
 
-- `@pytest.mark.unit` — Given `OilProduced=[100.0, 50.0, 200.0]` for one well, assert
-  `decline_rate[1] == 0.5` (50% decline), `decline_rate[2] == -3.0` (clipped to max
-  growth: 200 from 50 = -300% raw, clipped to -1.0 at lower bound — verify clip
-  direction carefully against the formula).
-- `@pytest.mark.unit` — A decline rate below `-1.0` is clipped to exactly `-1.0`
-  (TR-07a).
-- `@pytest.mark.unit` — A decline rate above `10.0` is clipped to exactly `10.0`
-  (TR-07b).
-- `@pytest.mark.unit` — A value within `[-1.0, 10.0]` passes through unchanged (TR-07c).
-- `@pytest.mark.unit` — Two consecutive zero-production months (shut-in) do not produce
-  an unclipped extreme value before clipping: verify the `inf` → `NaN` handling fires
-  before clip (TR-07d).
-- `@pytest.mark.unit` — Two wells in the same partition produce independent decline
-  rates (no cross-well contamination).
-- `@pytest.mark.unit` — Meta consistency (TR-23): call `_add_decline_rates` on an empty
-  DataFrame matching input schema; assert column list and dtypes match `meta=`.
+### Zero prior-period handling (TR-07d):
+If `OilProduced_{t-1} == 0` (shut-in well), `pct_change()` will produce `inf`
+or `nan`. Apply the following rule before clipping:
+- If prior period is 0 and current period is also 0 → result is `0.0` (both shut-in).
+- If prior period is 0 and current period is > 0 → result is `np.nan` (well coming
+  back online — rate is undefined, not extreme). Do not let it produce `inf`.
+Replace `inf` and `-inf` with `np.nan` before clipping.
 
-**Definition of done:** `_add_decline_rates` implemented, all test cases pass (including
-TR-07), ruff and mypy report no errors, `requirements.txt` updated with all third-party
-packages imported in this task.
+### Clip bounds (TR-07):
+After computing the raw decline rate (with inf replaced by nan), clip to `[-1.0, 10.0]`:
+- Values below `-1.0` → clipped to exactly `-1.0` (TR-07a).
+- Values above `10.0` → clipped to exactly `10.0` (TR-07b).
+- Values within `[-1.0, 10.0]` → pass through unchanged (TR-07c).
+- `NaN` values → remain `NaN` after clipping (do not clip NaN to a bound).
 
----
+**Meta derivation:**
+Derive meta by calling `_add_decline_rates(ddf._meta.copy())` before `map_partitions`
+(TR-23).
 
-## Task 05: Implement rolling average feature builder
+**Dependencies:** `pandas`, `numpy`
 
-**Module:** `cogcc_pipeline/features.py`
-**Function:** `_add_rolling_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame`
+**Test cases (TR-07, TR-09):**
+- Given `OilProduced=[100, 80, 60]` for one well, assert
+  `decline_rate_oil=[NaN, -0.2, -0.25]`.
+- A decline rate of `-2.0` (below clip bound) → clipped to `-1.0` (TR-07a).
+- A decline rate of `15.0` (above clip bound) → clipped to `10.0` (TR-07b).
+- A decline rate of `0.5` (within bounds) → passes through as `0.5` (TR-07c).
+- Prior period `OilProduced=0`, current `OilProduced=0` → `decline_rate_oil=0.0`
+  (not inf, not NaN — shut-in remains 0 — TR-07d).
+- Prior period `OilProduced=0`, current `OilProduced=100` → `decline_rate_oil=NaN`
+  (well resuming, undefined rate — TR-07d).
+- Assert no `inf` or `-inf` in output (all replaced before clip).
+- Assert first record per well is always `NaN` (no prior period).
+- TR-23: Call on empty DataFrame; assert output schema matches meta.
 
-**Description:**
-For each window `w` in `windows`, adds three rolling average columns for
-`OilProduced`, `GasProduced`, `WaterProduced` per well:
-- `oil_rolling_{w}m`
-- `gas_rolling_{w}m`
-- `water_rolling_{w}m`
-
-Uses `groupby("well_id")[col].transform(lambda s: s.rolling(w, min_periods=1).mean())`
-for each column. When the available history is shorter than the window, `min_periods=1`
-ensures a partial-window mean is returned (not `NaN`). All rolling average columns have
-dtype `pd.Float64Dtype()`.
-
-**Test cases (TR-09):**
-
-- `@pytest.mark.unit` — Given a well with `OilProduced=[10.0, 20.0, 30.0, 40.0]` and
-  `window=3`, assert `oil_rolling_3m=[10.0, 15.0, 20.0, 30.0]` (hand-computed 3-month
-  rolling mean) (TR-09a).
-- `@pytest.mark.unit` — Given a well with only 2 months of history and `window=3`,
-  assert the result is a partial-window mean (not `NaN` or zero) for both months
-  (TR-09b).
-- `@pytest.mark.unit` — For `window=6`, verify a 6-month rolling average against a
-  known sequence of 8 months (TR-09a).
-- `@pytest.mark.unit` — Two wells in the same partition produce independent rolling
-  means.
-- `@pytest.mark.unit` — Meta consistency (TR-23): call `_add_rolling_features` on an
-  empty DataFrame matching input schema; assert column list and dtypes match `meta=`.
-
-**Definition of done:** `_add_rolling_features` implemented, all test cases pass
-(including TR-09a, TR-09b), ruff and mypy report no errors, `requirements.txt` updated
-with all third-party packages imported in this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 06: Implement lag feature builder
+## Task FEA-04: Rolling average features
 
 **Module:** `cogcc_pipeline/features.py`
-**Function:** `_add_lag_features(df: pd.DataFrame, lags: list[int]) -> pd.DataFrame`
+**Function:** `_add_rolling_features(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-For each lag `l` in `lags`, adds `oil_lag_{l}m` column:
-`groupby("well_id")["OilProduced"].transform(lambda s: s.shift(l))`
+Partition-level function (called via `map_partitions`) that computes rolling window
+averages for oil, gas, and water production per well. Must be pure and stateless.
 
-The first `l` records per well will be `NaN` (no prior history). All lag columns have
-dtype `pd.Float64Dtype()`. Lag-1 feature for month N must equal raw `OilProduced` for
-month N-1 (TR-09c).
+### Rolling columns computed (all use `min_periods=1` unless specified otherwise):
+- `oil_roll3` — 3-month rolling mean of `OilProduced` per well
+- `oil_roll6` — 6-month rolling mean of `OilProduced` per well
+- `oil_roll12` — 12-month rolling mean of `OilProduced` per well
+- `gas_roll3`, `gas_roll6`, `gas_roll12` — same for `GasProduced`
+- `water_roll3`, `water_roll6`, `water_roll12` — same for `WaterProduced`
 
-**Test cases (TR-09):**
+### Rolling window specification (TR-09b):
+Use `df.groupby(level="well_id", group_keys=False)["OilProduced"].rolling(window=3, min_periods=1).mean()`.
+- `min_periods=1`: When fewer than `window` prior periods exist (e.g., the first 2
+  months of a well's life), the rolling function uses the available periods only —
+  not `NaN` and not `0`.
+- Exception: If the caller explicitly requires `NaN` for partial windows, the task
+  spec takes precedence over this default — use `min_periods=window` in that case.
+  **This pipeline uses `min_periods=1`** — partial windows are computed from available data.
 
-- `@pytest.mark.unit` — Given `OilProduced=[10.0, 20.0, 30.0]` with `lag=1`, assert
-  `oil_lag_1m=[NaN, 10.0, 20.0]` (TR-09c).
-- `@pytest.mark.unit` — Given `lag=3`, assert first 3 values are `NaN` and 4th value
-  equals `OilProduced[0]`.
-- `@pytest.mark.unit` — Two wells in the same partition produce independent lag features.
-- `@pytest.mark.unit` — Meta consistency (TR-23): call `_add_lag_features` on an empty
-  DataFrame matching input schema; assert column list and dtypes match `meta=`.
+### Implementation constraint:
+Use `groupby(...).rolling(...)` — do not use `expanding()` or per-group Python loops.
+No apply, no iterrows.
 
-**Definition of done:** `_add_lag_features` implemented, all test cases pass (including
-TR-09c), ruff and mypy report no errors, `requirements.txt` updated with all third-party
-packages imported in this task.
+**Meta derivation:**
+Derive meta by calling `_add_rolling_features(ddf._meta.copy())` before `map_partitions`
+(TR-23).
+
+**Dependencies:** `pandas`
+
+**Test cases (TR-09a, TR-09b):**
+- Given `OilProduced=[100, 200, 300, 400]` for one well:
+  - `oil_roll3[0]` = 100.0 (only 1 period available, min_periods=1)
+  - `oil_roll3[1]` = 150.0 (mean of 100, 200)
+  - `oil_roll3[2]` = 200.0 (mean of 100, 200, 300)
+  - `oil_roll3[3]` = 300.0 (mean of 200, 300, 400)
+- Given `GasProduced=[500, 600, 700]`:
+  - `gas_roll6[0]` = 500.0, `gas_roll6[1]` = 550.0, `gas_roll6[2]` = 600.0
+    (fewer than 6 periods → uses min_periods=1)
+- TR-09b: For a well with only 2 months of history, assert `oil_roll3` at month 2
+  equals the mean of months 1 and 2 (not NaN, not 0).
+- Assert all rolling columns are present in the output DataFrame.
+- Assert no `oil_roll3` value is negative when all input is non-negative.
+- TR-23: Call on empty DataFrame; assert output schema matches meta.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 07: Implement partition-level features orchestrator (map_partitions callback)
+## Task FEA-05: Lag features
 
 **Module:** `cogcc_pipeline/features.py`
-**Function:** `_engineer_features_partition(df: pd.DataFrame, windows: list[int], lags: list[int]) -> pd.DataFrame`
+**Function:** `_add_lag_features(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-Applied via `map_partitions` to each Dask partition. Executes all feature engineering in
-order:
-1. `df = _add_cumulative_features(df)`
-2. `df = _add_ratio_features(df)`
-3. `df = _add_decline_rates(df)`
-4. `df = _add_rolling_features(df, windows)`
-5. `df = _add_lag_features(df, lags)`
-6. Return the augmented DataFrame.
+Partition-level function (called via `map_partitions`) that computes 1-period lag
+features for oil, gas, and water production per well. Must be pure and stateless.
 
-The `meta=` argument for `ddf.map_partitions(_engineer_features_partition, windows, lags, meta=meta)`
-must be derived by calling `_engineer_features_partition(ddf._meta.copy(), windows, lags)`.
+### Lag columns computed:
+- `oil_lag1` — previous month's `OilProduced` for the same well
+- `gas_lag1` — previous month's `GasProduced` for the same well
+- `water_lag1` — previous month's `WaterProduced` for the same well
+
+### Implementation:
+Use `df.groupby(level="well_id", group_keys=False)["OilProduced"].shift(1)`.
+The first record per well → `NaN` (no prior period to lag from).
+
+### Correctness constraint (TR-09c):
+The lag-1 value at month N must equal the raw production value at month N-1.
+This must be verified for at least 3 consecutive months in the test cases.
+
+**Meta derivation:**
+Derive meta by calling `_add_lag_features(ddf._meta.copy())` before `map_partitions`
+(TR-23).
+
+**Dependencies:** `pandas`
+
+**Test cases (TR-09c):**
+- Given `OilProduced=[100, 200, 300]` for one well:
+  - `oil_lag1[0]` = NaN (no prior)
+  - `oil_lag1[1]` = 100.0 (previous month's value)
+  - `oil_lag1[2]` = 200.0 (previous month's value)
+- Given 2 wells interleaved in the same partition, assert lags do not bleed across
+  well boundaries (well A's first record has NaN lag, not well B's last value).
+- Assert `oil_lag1` dtype is `float64` (NaN forces float even if input is Int64).
+- TR-23: Call on empty DataFrame; assert output schema matches meta.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task FEA-06: Categorical encoding and days normalization
+
+**Module:** `cogcc_pipeline/features.py`
+**Function:** `_add_encoded_features(df: pd.DataFrame) -> pd.DataFrame`
+
+**Description:**
+Partition-level function (called via `map_partitions`) that adds ML-friendly encoded
+columns for categorical and count features. Must be pure and stateless.
+
+### Encoded columns computed:
+
+**`wellstatus_encoded`** — ordinal integer encoding of `WellStatus` for ML use.
+Map the declared category values to integers in this order (consistent across all wells):
+`AB=0, AC=1, DG=2, PA=3, PR=4, SI=5, SO=6, TA=7, WO=8`.
+If `WellStatus` is `pd.NA` → `wellstatus_encoded = -1` (sentinel for unknown).
+Result dtype: `Int64` (nullable integer, to accommodate the `-1` sentinel and NA cases).
+
+**`days_produced_norm`** — `DaysProduced` normalized to [0, 1] by dividing by 31.0:
+`DaysProduced / 31.0`. If `DaysProduced` is NA → `days_produced_norm = pd.NA`.
+A value of `0.0` is valid (well did not produce in this month).
+Result dtype: `float64`.
+
+### Implementation constraint:
+Use a pandas categorical `.cat.codes` mapping or `pd.Categorical(...).codes` for
+`WellStatus` encoding — not a Python dict with per-row lookup.
+
+**Meta derivation:**
+Derive meta by calling `_add_encoded_features(ddf._meta.copy())` before `map_partitions`
+(TR-23).
+
+**Dependencies:** `pandas`
 
 **Test cases:**
+- Assert `WellStatus="AC"` → `wellstatus_encoded=1`.
+- Assert `WellStatus="SI"` → `wellstatus_encoded=5`.
+- Assert `WellStatus=pd.NA` → `wellstatus_encoded=-1`.
+- Assert `DaysProduced=31` → `days_produced_norm=1.0`.
+- Assert `DaysProduced=0` → `days_produced_norm=0.0`.
+- Assert `DaysProduced=pd.NA` → `days_produced_norm=pd.NA`.
+- Assert `days_produced_norm` dtype is `float64`.
+- Assert `wellstatus_encoded` dtype is `Int64`.
+- TR-23: Call on empty DataFrame; assert output schema matches meta.
 
-- `@pytest.mark.unit` — Given a synthetic single-well partition, assert all expected
-  output columns are present (TR-19): `OilProduced`, `GasProduced`, `WaterProduced`,
-  `cum_oil`, `cum_gas`, `cum_water`, `gor`, `water_cut`, `decline_rate`,
-  `oil_rolling_3m`, `oil_rolling_6m`, `gas_rolling_3m`, `gas_rolling_6m`,
-  `water_rolling_3m`, `water_rolling_6m`, `oil_lag_1m`, `oil_lag_3m`.
-- `@pytest.mark.unit` — Verify formula correctness for GOR, water cut, and 3-month
-  rolling against hand-computed values (TR-09d, TR-09e).
-- `@pytest.mark.unit` — Meta consistency (TR-23): call `_engineer_features_partition` on
-  `ddf._meta.copy()` and assert column names, order, and dtypes match the `meta=`
-  argument passed to `map_partitions`.
-
-**Definition of done:** `_engineer_features_partition` implemented, all test cases pass
-(including TR-09, TR-19, TR-23), ruff and mypy report no errors, `requirements.txt`
-updated with all third-party packages imported in this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 08: Implement features output validator
+## Task FEA-07: Features pipeline assembler
 
 **Module:** `cogcc_pipeline/features.py`
-**Function:** `validate_feature_output(ddf: dask.dataframe.DataFrame, config: dict) -> None`
+**Function:** `run_features(config_path: str = "config/config.yaml") -> None`
 
 **Description:**
-Validates the feature-engineered Dask DataFrame before writing:
-1. Assert all required output columns are present (TR-19). Raise `FeaturesError` listing
-   missing columns if not.
-2. Assert `GOR` is non-negative where not null (TR-01). Log `WARNING` for violations.
-3. Assert `water_cut` is in `[0, 1]` where not null (TR-01). Log `WARNING` for violations.
-4. Assert `decline_rate` is within `[-1.0, 10.0]` where not null (TR-07). Log `WARNING`
-   for violations.
-5. Assert schema is consistent across a sample of 3 partitions (TR-14): column names and
-   dtypes are identical. Raise `FeaturesError` if schema drift is detected.
+Top-level entry point for the features stage. Orchestrates all feature computation
+steps and writes ML-ready Parquet to `data/features/`.
 
-All assertions use `dask.compute()` with batched calls — never sequential `.compute()`.
+### Processing steps (in order):
+
+1. `load_config(config_path)` from `cogcc_pipeline.utils`.
+2. Read `data/processed/` with `dd.read_parquet(processed_dir)` — sorted by
+   `production_date` within each partition (transform guarantee).
+3. Apply `_add_cumulative_features` via `map_partitions`.
+4. Apply `_add_ratio_features` via `map_partitions`.
+5. Apply `_add_decline_rates` via `map_partitions`.
+6. Apply `_add_rolling_features` via `map_partitions`.
+7. Apply `_add_lag_features` via `map_partitions`.
+8. Apply `_add_encoded_features` via `map_partitions`.
+9. **Repartition:** `ddf.repartition(npartitions=get_partition_count(n))` where
+   `n` is derived from `len(list(Path(processed_dir).glob("*.parquet")))`.
+   Repartition must be the last operation before writing (ADR-004).
+10. **Write Parquet:** `ddf.to_parquet(features_dir, write_index=True, overwrite=True)`.
+11. Log total feature columns in output schema.
+
+### Scheduler:
+Reuse existing Dask `Client`. Do not initialize a new cluster.
+
+### meta= derivation for each map_partitions call:
+For each of the 6 `map_partitions` calls, derive meta by applying the partition
+function to `ddf._meta.copy()` at the time of chaining. Chain all 6
+`map_partitions` calls lazily before repartition — do not compute between calls.
+
+**Error handling:**
+- If `processed_dir` has no Parquet files → log WARNING and return.
+- Propagate any exception from feature functions; log ERROR with function name.
+
+**Dependencies:** `dask.dataframe`, `pathlib`, `logging`, `cogcc_pipeline.utils`
 
 **Test cases:**
+- Given synthetic processed Parquet (1 well × 12 months), assert `run_features`
+  writes Parquet to `features_dir` without error.
+- Assert the Parquet output is readable by `dd.read_parquet` (TR-18).
+- TR-19: Read the features Parquet and assert ALL of the following columns are present:
+  `production_date`, `OilProduced`, `GasProduced`, `WaterProduced`,
+  `cum_oil`, `cum_gas`, `cum_water`, `gor`, `water_cut`, `wor`, `wgr`,
+  `decline_rate_oil`, `decline_rate_gas`,
+  `oil_roll3`, `oil_roll6`, `oil_roll12`,
+  `gas_roll3`, `gas_roll6`, `gas_roll12`,
+  `water_roll3`, `water_roll6`, `water_roll12`,
+  `oil_lag1`, `gas_lag1`, `water_lag1`,
+  `wellstatus_encoded`, `days_produced_norm`.
+- TR-17: Assert `run_features` does not call `.compute()` before the final write.
+- Given an empty `processed_dir`, assert `run_features` returns without raising.
 
-- `@pytest.mark.unit` — Given a Dask DataFrame with all required columns, assert no
-  exception is raised (TR-19).
-- `@pytest.mark.unit` — Given a Dask DataFrame missing `gor`, assert `FeaturesError` is
-  raised.
-- `@pytest.mark.unit` — Given a DataFrame with `gor=-1.0`, assert a `WARNING` is
-  logged.
-- `@pytest.mark.unit` — Given a DataFrame with `water_cut=1.5`, assert a `WARNING` is
-  logged.
-- `@pytest.mark.unit` — Given a DataFrame with `decline_rate=15.0`, assert a `WARNING`
-  is logged.
-
-**Definition of done:** `validate_feature_output` implemented, all test cases pass (TR-01,
-TR-07, TR-14, TR-19), ruff and mypy report no errors, `requirements.txt` updated with all
-third-party packages imported in this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 09: Implement features stage orchestrator
-
-**Module:** `cogcc_pipeline/features.py`
-**Function:** `run_features(config: dict) -> dask.dataframe.DataFrame`
-
-**Description:**
-Orchestrates the full features stage:
-1. Detect or initialise Dask distributed Client (try `distributed.get_client()`, catch
-   `ValueError`, create `LocalCluster` + `Client` from `config["dask"]`).
-2. Read processed Parquet: `ddf = dd.read_parquet(config["features"]["processed_dir"] + "/production.parquet", engine="pyarrow")`.
-3. Read `windows` from `config["features"]["rolling_windows"]` and `lags` from
-   `config["features"]["lag_periods"]`.
-4. Build `meta` by calling `_engineer_features_partition(ddf._meta.copy(), windows, lags)`.
-5. Apply features: `ddf = ddf.map_partitions(_engineer_features_partition, windows, lags, meta=meta)`.
-6. Call `validate_feature_output(ddf, config)`.
-7. Repartition: `ddf = ddf.repartition(npartitions=max(10, min(ddf.npartitions, 50)))`.
-8. Write: `ddf.to_parquet(config["features"]["output_dir"] + "/production_features.parquet", engine="pyarrow", write_index=True, overwrite=True)`.
-9. Return the Dask DataFrame (do NOT call `.compute()` on the full dataset).
-
-**Non-negotiable:** Do NOT call `.compute()` inside `run_features` except in
-`validate_feature_output` (which batches its calls via `dask.compute()`). Return the
-Dask DataFrame (TR-17).
-
-**Test cases:**
-
-- `@pytest.mark.unit` — Mock all sub-functions; assert `run_features` returns a
-  `dask.dataframe.DataFrame` (TR-17).
-- `@pytest.mark.unit` — Assert `.compute()` is never called on the full dataset inside
-  `run_features` (TR-17).
-- `@pytest.mark.integration` — Run `run_features(config)` against
-  `data/processed/production.parquet/`; assert `data/features/production_features.parquet/`
-  exists and is readable (TR-18).
-
-**Feature column presence (TR-19):**
-
-- `@pytest.mark.integration` — After `run_features`, read the output Parquet and assert
-  all required columns are present: `production_date`, `OilProduced`, `GasProduced`,
-  `WaterProduced`, `cum_oil`, `cum_gas`, `cum_water`, `gor`, `water_cut`,
-  `decline_rate`, `oil_rolling_3m`, `oil_rolling_6m`, `gas_rolling_3m`, `gas_rolling_6m`,
-  `water_rolling_3m`, `water_rolling_6m`, `oil_lag_1m`, `oil_lag_3m`.
-
-**Monotonicity (TR-03):**
-
-- `@pytest.mark.integration` — After `run_features`, sample one well's data from the
-  features Parquet and assert `cum_oil.diff().dropna() >= 0` for all rows.
-
-**Schema stability (TR-14):**
-
-- `@pytest.mark.integration` — Read two different partition files from
-  `data/features/production_features.parquet/`; assert column names and dtypes are
-  identical.
-
-**Parquet readability (TR-18):**
-
-- `@pytest.mark.integration` — After `run_features`, assert every `.parquet` file in
-  `data/features/production_features.parquet/` is readable by `pd.read_parquet` without
-  error.
-
-**Feature calculation correctness (TR-09) — synthetic end-to-end test:**
-
-- `@pytest.mark.unit` — Create a synthetic processed-schema Dask DataFrame for a single
-  well with 8 months of known `OilProduced`, `GasProduced`, `WaterProduced` values.
-  Call `run_features` (with mocked I/O); assert:
-  - (a) 3-month and 6-month rolling oil, gas, and water averages match hand-computed
-    values for months 3–8 (TR-09a).
-  - (b) First 2 months with `window=3` return partial-window means, not zero or NaN
-    (TR-09b).
-  - (c) `oil_lag_1m` for month N equals `OilProduced` for month N-1 for months 2–8
-    (TR-09c).
-  - (d) `gor` equals `GasProduced / OilProduced` with correct unit handling (TR-09d).
-  - (e) `water_cut` equals `WaterProduced / (OilProduced + WaterProduced)` (TR-09e).
-
-**Definition of done:** `run_features` implemented, all test cases pass (including TR-01,
-TR-03, TR-07, TR-09, TR-14, TR-17, TR-18, TR-19, TR-23), ruff and mypy report no errors,
-`requirements.txt` updated with all third-party packages imported in this task.
-
----
-
-## Task 10: Implement pipeline orchestrator
+## Task FEA-08: Pipeline entry point
 
 **Module:** `cogcc_pipeline/pipeline.py`
-**Functions:**
-- `run_pipeline(stages: list[str] | None = None) -> None`
-- `main() -> None`
+**Function:** `main() -> None`
 
 **Description:**
-`run_pipeline` chains all four stages in order: acquire → ingest → transform → features.
-When `stages` is `None`, all four run. When a subset is provided, only those stages run
-in the declared order (ignore stages not in the list but maintain relative order).
+The registered CLI entry point (`cogcc-pipeline`) that orchestrates all four pipeline
+stages in order. This is the function registered as `cogcc-pipeline` in `pyproject.toml`.
 
-Steps:
-1. Load config from `config.yaml` using `load_config()`.
-2. Call `setup_logging(config)` to configure logging to stdout and `logs/pipeline.log`.
-3. Run `run_acquire(config)` if `"acquire"` in stages. Log per-stage timing.
-4. Initialise Dask distributed Client after acquire completes and before ingest begins:
-   - If `config["dask"]["scheduler"] == "local"`, create `LocalCluster(n_workers=...,
-     threads_per_worker=..., memory_limit=...)` and `Client(cluster)`.
-   - If `config["dask"]["scheduler"]` is a URL (e.g., `"tcp://host:port"`), create
-     `Client(scheduler)`.
-   - Log the dashboard URL at `INFO` level.
-5. Run `run_ingest(config)` if `"ingest"` in stages.
-6. Run `run_transform(config)` if `"transform"` in stages.
-7. Run `run_features(config)` if `"features"` in stages.
-8. On any stage failure, log the error at `ERROR` level and raise `RuntimeError` —
-   preventing downstream stages from running.
-9. Close the Dask Client and cluster on completion or error (use `finally` block).
+### CLI arguments (via `argparse`):
+- `--stages` — space-separated list of stages to run; choices: `acquire`, `ingest`,
+  `transform`, `features`, `all`; default: `all`. When `all` is specified, run all
+  four in order.
+- `--config` — path to `config.yaml`; default: `"config/config.yaml"`.
+- `--log-level` — override the log level from config; choices: `DEBUG`, `INFO`,
+  `WARNING`, `ERROR`; optional.
 
-`main()` is the CLI entry point registered in `pyproject.toml`. It must parse optional
-`--stages` argument (comma-separated string, e.g. `--stages acquire,ingest`). When no
-argument is provided, run all stages.
+### Execution sequence:
+1. Parse CLI arguments.
+2. Load config from `--config`.
+3. Call `setup_logging(log_file, level)` from `cogcc_pipeline.utils` — logging must
+   be configured before any stage runs (ADR-006).
+4. If stages include `acquire`: call `run_acquire(config_path)`. Time the call and
+   log duration as INFO.
+5. Initialize Dask distributed `Client` after acquire completes and before ingest
+   begins (build-env-manifest.md). Use `dask.scheduler` settings from config:
+   - If `dask.scheduler == "local"` → `Client(LocalCluster(n_workers=..., ...))`
+   - If `dask.scheduler` is a URL → `Client(address=url)`
+   Log the Dask dashboard URL after initialization.
+6. If stages include `ingest`: call `run_ingest(config_path)`. Time and log.
+7. If stages include `transform`: call `run_transform(config_path)`. Time and log.
+8. If stages include `features`: call `run_features(config_path)`. Time and log.
+9. On any stage failure, log ERROR with the stage name and exception, then
+   `sys.exit(1)` — downstream stages must not run after an upstream failure.
+10. Close the Dask `Client` on completion or failure.
 
-**Dependencies:** `dask.distributed`, `logging`, `argparse`, `time`
+**Dependencies:** `argparse`, `sys`, `logging`, `time`, `dask.distributed`,
+`cogcc_pipeline.acquire`, `cogcc_pipeline.ingest`, `cogcc_pipeline.transform`,
+`cogcc_pipeline.features`, `cogcc_pipeline.utils`
 
 **Test cases:**
+- Assert `--stages acquire ingest` runs only `run_acquire` and `run_ingest`, not
+  `run_transform` or `run_features` — verify by patching all four stage functions.
+- Assert `--stages all` runs all four stages in order (acquire → ingest → transform
+  → features).
+- Given `run_ingest` raising an exception, assert `run_transform` is never called
+  and `sys.exit(1)` is invoked.
+- Assert the Dask `Client` is closed in both success and failure scenarios
+  (use `try/finally` in implementation).
+- Assert `setup_logging` is called before any stage function is called — verify
+  call order using `pytest-mock` call tracking.
 
-- `@pytest.mark.unit` — Mock all stage `run_*` functions; assert they are called in
-  order when `stages=None`.
-- `@pytest.mark.unit` — Given `stages=["ingest", "transform"]`, assert `run_acquire`
-  and `run_features` are NOT called.
-- `@pytest.mark.unit` — Given a stage that raises `RuntimeError`, assert subsequent
-  stages are not called and the error is re-raised.
-- `@pytest.mark.unit` — Assert that the Dask Client is initialised after acquire and
-  before ingest (mock the Client constructor and verify call order).
-- `@pytest.mark.integration` — Run `main()` end-to-end with `--stages
-  acquire,ingest,transform,features` against real data; assert
-  `data/features/production_features.parquet/` exists and is non-empty.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
-**Definition of done:** `run_pipeline` and `main()` implemented, all test cases pass,
-`cogcc-pipeline` CLI entry point works, `make pipeline` runs end-to-end, ruff and mypy
-report no errors, `requirements.txt` updated with all third-party packages imported in
-this task.
+---
+
+## Task FEA-09: Features stage integration tests
+
+**Module:** `tests/test_features.py`
+**Scope:** TR-01, TR-03, TR-06, TR-07, TR-08, TR-09, TR-10, TR-14, TR-17, TR-18,
+TR-19, TR-23 (from test-requirements.xml)
+
+**Description:**
+Write integration and unit tests covering all domain and technical correctness
+requirements for the features stage. All tests use synthetic data — no real files
+required.
+
+### TR-01 — Physical bound validation
+- Given a synthetic well with one row having `OilProduced=-10` (negative, should have
+  been nulled by transform), assert that `_add_ratio_features` and `_add_cumulative_features`
+  do not propagate or amplify the negative value in GOR or cumulative columns.
+  (Negative values reaching features indicate a transform stage bug — the test
+  documents the contract.)
+
+### TR-03 — Decline curve monotonicity
+- Given a synthetic 12-month well sequence with all positive `OilProduced`, assert
+  that `cum_oil` is monotonically non-decreasing across all 12 rows.
+- Assert `cum_oil[i] >= cum_oil[i-1]` for all `i` in `[1, 11]`.
+
+### TR-06 — GOR zero-denominator
+- `OilProduced=0, GasProduced=500` → `gor=NaN`, no exception (TR-06a).
+- `OilProduced=0, GasProduced=0` → `gor=NaN`, no exception (TR-06b).
+- `OilProduced=100, GasProduced=0` → `gor=0.0` (TR-06c).
+
+### TR-07 — Decline rate clip bounds
+- Synthetic sequence producing raw decline rate of `-2.0` → clipped to `-1.0` (TR-07a).
+- Synthetic sequence producing raw decline rate of `15.0` → clipped to `10.0` (TR-07b).
+- Raw decline rate of `0.3` → passes through as `0.3` (TR-07c).
+- Prior month `OilProduced=0`, current `OilProduced=0` → `decline_rate_oil=0.0`,
+  not `inf` before clipping (TR-07d).
+
+### TR-08 — Cumulative production flat periods
+- Sequence with zero-production mid-months → `cum_oil` flat during those months (TR-08a).
+- Sequence starting with zeros → `cum_oil` starts at 0 and stays 0 until first
+  positive production (TR-08b).
+- Sequence with shut-in then resumption → `cum_oil` resumes correctly from flat
+  value after resumption (TR-08c).
+
+### TR-09 — Feature calculation correctness
+- Rolling 3-month average: hand-compute expected values for a known 6-month sequence
+  and assert exact match (TR-09a).
+- Rolling window larger than history: first 2 months of a well → `oil_roll3` equals
+  partial-window mean, not NaN or 0 (TR-09b, min_periods=1).
+- Lag-1 features: for months 2, 3, and 4, assert `oil_lag1` equals `OilProduced`
+  from months 1, 2, and 3 respectively (TR-09c).
+- GOR formula: confirm the formula is `GasProduced / OilProduced`, not the inverse (TR-09d).
+- Water cut formula: confirm denominator is `OilProduced + WaterProduced`, not just
+  `OilProduced` (TR-09e).
+
+### TR-10 — Water cut boundary values
+- `WaterProduced=0, OilProduced=100` → `water_cut=0.0`, row retained (TR-10a).
+- `WaterProduced=200, OilProduced=0` → `water_cut=1.0`, row retained (TR-10b).
+- Only values outside `[0, 1]` should be considered invalid.
+
+### TR-14 — Schema stability across wells
+- Run `run_features` on 2 wells.
+- Read 2 different partition files and assert identical column names, order, and dtypes.
+
+### TR-18 — Parquet readability
+- After `run_features`, read every file in `features_dir` with `pd.read_parquet`.
+- Assert no exception for any file.
+
+### TR-19 — Feature column presence
+- Given a synthetic single-well 12-month input, run `run_features`.
+- Read the output and assert ALL required columns are present (full list in FEA-07).
+
+### TR-23 — map_partitions meta schema consistency
+- For each of the 6 feature functions (`_add_cumulative_features`,
+  `_add_ratio_features`, `_add_decline_rates`, `_add_rolling_features`,
+  `_add_lag_features`, `_add_encoded_features`):
+  - Call the function on an empty DataFrame with the correct input schema.
+  - Assert the output column list and dtypes match the `meta` argument that would
+    be passed to `map_partitions`.
+
+**Definition of done:** All TR-01, TR-03, TR-06, TR-07, TR-08, TR-09, TR-10, TR-14,
+TR-17, TR-18, TR-19, TR-23 test cases pass, ruff and mypy report no errors,
+requirements.txt updated with all third-party packages imported in this task.

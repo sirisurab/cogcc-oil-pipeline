@@ -1,31 +1,31 @@
-.PHONY: env install acquire ingest transform features pipeline test lint typecheck
+.PHONY: venv install acquire ingest transform features pipeline test lint typecheck
 
-env:
-	python3 -m venv .venv
+venv:
+	python -m venv .venv
 
 install:
-	. .venv/bin/activate && pip install --upgrade pip setuptools wheel && pip install -e ".[dev]"
+	.venv/bin/pip install --upgrade pip && .venv/bin/pip install -e ".[dev]"
 
 acquire:
-	python -m cogcc_pipeline.pipeline --stages acquire
+	cogcc-pipeline --stages acquire
 
 ingest:
-	python -m cogcc_pipeline.pipeline --stages ingest
+	cogcc-pipeline --stages ingest
 
 transform:
-	python -m cogcc_pipeline.pipeline --stages transform
+	cogcc-pipeline --stages transform
 
 features:
-	python -m cogcc_pipeline.pipeline --stages features
+	cogcc-pipeline --stages features
 
-pipeline: acquire ingest transform features
-	cogcc-pipeline
+pipeline:
+	cogcc-pipeline --stages acquire ingest transform features
 
 test:
-	pytest tests/ -v
+	pytest tests/
 
 lint:
-	ruff check cogcc_pipeline/ tests/
+	ruff check cogcc_pipeline/
 
 typecheck:
 	mypy cogcc_pipeline/

@@ -1,332 +1,409 @@
-# Ingest Component Tasks
+# Ingest Stage — Task Specifications
 
-**Pipeline package:** `cogcc_pipeline`
-**Module file:** `cogcc_pipeline/ingest.py`
+## Stage Overview
+
+**Package:** `cogcc_pipeline`
+**Module:** `cogcc_pipeline/ingest.py`
 **Test file:** `tests/test_ingest.py`
+**Input directory:** `data/raw/`
+**Output directory:** `data/interim/` (Parquet files)
+**Scheduler:** Dask distributed scheduler (CPU-bound stage — ADR-001)
 
-## Overview
+The ingest stage reads raw COGCC CSV files from `data/raw/`, enforces the canonical
+schema defined in `references/production-data-dictionary.csv`, filters rows to
+`ReportYear >= 2020`, and writes consolidated partitioned Parquet files to
+`data/interim/`.
 
-The ingest stage reads all raw CSV files from `data/raw/`, validates and enforces the
-canonical schema defined in `references/production-data-dictionary.csv`, filters rows to
-`ReportYear >= 2020`, logs file-level metadata (row counts, file sizes, SHA-256
-checksums), and writes consolidated interim Parquet files to `data/interim/`. The stage
-uses the Dask distributed scheduler; it checks for an existing distributed Client and
-reuses it if present (as set up by `pipeline.py`), or initialises its own `LocalCluster`
-and `Client` if called independently.
+### Canonical column schema
+The following columns and their types are authoritative per
+`references/production-data-dictionary.csv`. All dtype mappings follow ADR-003:
+nullable integer columns use `Int64` (pandas nullable integer); non-nullable integers
+use `int64`; floats use `float64`; strings use `pd.StringDtype()` (`"string"`);
+datetime columns use `datetime64[ns]`; bools use `pd.BooleanDtype()` (`"boolean"`);
+categoricals use `pd.CategoricalDtype(categories=[...], ordered=False)`.
 
----
+| Column | dtype | nullable |
+|---|---|---|
+| DocNum | Int64 | yes |
+| ReportMonth | int64 | no |
+| ReportYear | int64 | no |
+| DaysProduced | Int64 | yes |
+| AcceptedDate | datetime64[ns] | yes |
+| Revised | boolean | yes |
+| OpName | string | yes |
+| OpNumber | Int64 | yes |
+| FacilityId | Int64 | yes |
+| ApiCountyCode | string | no |
+| ApiSequenceNumber | string | no |
+| ApiSidetrack | string | no |
+| Well | string | no |
+| WellStatus | CategoricalDtype(["AB","AC","DG","PA","PR","SI","SO","TA","WO"]) | yes |
+| FormationCode | string | yes |
+| OilProduced | float64 | yes |
+| OilSales | float64 | yes |
+| OilAdjustment | float64 | yes |
+| OilGravity | float64 | yes |
+| GasProduced | float64 | yes |
+| GasSales | float64 | yes |
+| GasBtuSales | float64 | yes |
+| GasUsedOnLease | float64 | yes |
+| GasShrinkage | float64 | yes |
+| GasPressureTubing | float64 | yes |
+| GasPressureCasing | float64 | yes |
+| WaterProduced | float64 | yes |
+| WaterPressureTubing | float64 | yes |
+| WaterPressureCasing | float64 | yes |
+| FlaredVented | float64 | yes |
+| BomInvent | float64 | yes |
+| EomInvent | float64 | yes |
 
-## Canonical Schema
+### Boundary contract delivered by ingest (→ transform)
+- All columns carry data-dictionary dtypes (no inference).
+- Column names match the data dictionary exactly.
+- Nullable absent columns filled with NA (not raised).
+- Non-nullable absent columns raise immediately.
+- Partitioned to `max(10, min(n, 50))` where `n` = number of raw CSV files processed.
+- Sort: unsorted — transform must not assume any sort order.
 
-The following column→dtype mapping is derived from
-`references/production-data-dictionary.csv`. These dtypes must be passed to
-`pd.read_csv(dtype=...)` at read time. Datetime columns are handled via `parse_dates=`.
-`WellStatus` is read as `pd.StringDtype()` at ingest (cast to `CategoricalDtype` in the
-transform stage).
-
-| Column                | pandas dtype              | nullable |
-|-----------------------|---------------------------|----------|
-| DocNum                | `pd.Int64Dtype()`         | yes      |
-| ReportMonth           | `int64`                   | no       |
-| ReportYear            | `int64`                   | no       |
-| DaysProduced          | `pd.Int64Dtype()`         | yes      |
-| AcceptedDate          | `datetime64[ns]`          | yes      |
-| Revised               | `pd.BooleanDtype()`       | yes      |
-| OpName                | `pd.StringDtype()`        | yes      |
-| OpNumber              | `pd.Int64Dtype()`         | yes      |
-| FacilityId            | `pd.Int64Dtype()`         | yes      |
-| ApiCountyCode         | `pd.StringDtype()`        | no       |
-| ApiSequenceNumber     | `pd.StringDtype()`        | no       |
-| ApiSidetrack          | `pd.StringDtype()`        | no       |
-| Well                  | `pd.StringDtype()`        | no       |
-| WellStatus            | `pd.StringDtype()`        | yes      |
-| FormationCode         | `pd.StringDtype()`        | yes      |
-| OilProduced           | `pd.Float64Dtype()`       | yes      |
-| OilSales              | `pd.Float64Dtype()`       | yes      |
-| OilAdjustment         | `pd.Float64Dtype()`       | yes      |
-| OilGravity            | `pd.Float64Dtype()`       | yes      |
-| GasProduced           | `pd.Float64Dtype()`       | yes      |
-| GasSales              | `pd.Float64Dtype()`       | yes      |
-| GasBtuSales           | `pd.Float64Dtype()`       | yes      |
-| GasUsedOnLease        | `pd.Float64Dtype()`       | yes      |
-| GasShrinkage          | `pd.Float64Dtype()`       | yes      |
-| GasPressureTubing     | `pd.Float64Dtype()`       | yes      |
-| GasPressureCasing     | `pd.Float64Dtype()`       | yes      |
-| WaterProduced         | `pd.Float64Dtype()`       | yes      |
-| WaterPressureTubing   | `pd.Float64Dtype()`       | yes      |
-| WaterPressureCasing   | `pd.Float64Dtype()`       | yes      |
-| FlaredVented          | `pd.Float64Dtype()`       | yes      |
-| BomInvent             | `pd.Float64Dtype()`       | yes      |
-| EomInvent             | `pd.Float64Dtype()`       | yes      |
-
-**Non-negotiable dtype rule:** Never use `"object"` dtype for strings anywhere.
-Always use `pd.StringDtype()`. Never rely on pandas inference — pass explicit `dtype=`
-and `parse_dates=` arguments to `pd.read_csv`.
-
----
-
-## Design Decisions and Constraints
-
-- Raw files may contain records from years prior to 2020. Filter to `ReportYear >= 2020`
-  immediately after reading, inside `read_raw_file`, before any downstream processing.
-- One call to `read_raw_file` per source CSV file. Each call returns a
-  `dask.dataframe.DataFrame` (via `dd.from_delayed`).
-- The consolidated interim output must NOT be one file per source file — apply the
-  repartition formula `max(10, min(ddf.npartitions, 50))` before writing Parquet.
-- Parquet output directory: `data/interim/production.parquet/` (a Dask multi-file
-  Parquet dataset, not a single file).
-- Log file-level metadata: original row count, post-filter row count, file size in bytes,
-  and SHA-256 checksum for each raw CSV, at `INFO` level.
-- The ingest stage must check for an existing distributed Client
-  (`distributed.get_client()`, catching `ValueError`); reuse it if present, otherwise
-  create its own `LocalCluster` + `Client` from `config["dask"]` settings.
+### Data filtering constraint
+After reading each raw file, filter to rows where `ReportYear >= 2020` before any
+further processing. Raw ECMC files may contain historical rows from earlier years.
 
 ---
 
-## Task 01: Implement raw file metadata logger
+## Task ING-01: Data dictionary loader
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `log_file_metadata(path: Path) -> dict`
+**Function:** `load_data_dictionary(dict_path: str) -> dict[str, dict]`
 
 **Description:**
-Computes and logs file-level metadata for a raw CSV file:
-- `file_path`: the absolute path as a string
-- `file_size_bytes`: `path.stat().st_size`
-- `sha256`: hex-digest SHA-256 checksum of file contents
-- `row_count_raw`: number of lines in the file minus 1 (header)
+Read `references/production-data-dictionary.csv` and return a lookup dict keyed by
+column name. Each value is a dict with keys: `dtype` (string token from the CSV),
+`nullable` (bool), `categories` (list of strings or empty list).
 
-Returns a `dict` with the four keys above. Logs all four values at `INFO` level.
+The data dictionary CSV columns are: `column, description, dtype, nullable, categories`.
+- `nullable` is `"yes"` in the CSV → map to Python `True`; `"no"` → `False`.
+- `categories` is a pipe-separated string (e.g. `"AB|AC|DG"`) or empty → map to list
+  of strings or empty list.
 
-**Dependencies:** `hashlib`, `pathlib`, `logging`
-
-**Test cases:**
-
-- `@pytest.mark.unit` — Given a small temp CSV file with a known SHA-256 digest, assert
-  the returned dict contains the correct `sha256` hex string.
-- `@pytest.mark.unit` — Given a temp file with a header + 5 data rows, assert
-  `row_count_raw == 5`.
-- `@pytest.mark.unit` — Given a temp file, assert `file_size_bytes` equals
-  `os.path.getsize(path)`.
-
-**Definition of done:** `log_file_metadata` implemented, all test cases pass, ruff and
-mypy report no errors, `requirements.txt` updated with all third-party packages imported
-in this task.
-
----
-
-## Task 02: Implement raw CSV file reader with schema enforcement
-
-**Module:** `cogcc_pipeline/ingest.py`
-**Function:** `read_raw_file(path: Path, config: dict) -> pd.DataFrame`
-
-**Description:**
-Reads a single raw CSV file into a pandas DataFrame with the following steps:
-1. Build the `dtype` dict from the canonical schema table (all columns except
-   `AcceptedDate`). Pass to `pd.read_csv(dtype=dtype_map, parse_dates=["AcceptedDate"],
-   encoding="utf-8-sig")`. The `encoding="utf-8-sig"` handles BOM characters common in
-   ECMC downloads.
-2. Immediately after reading, filter rows to `ReportYear >= config["ingest"]["start_year"]`
-   using a boolean mask (vectorised — no `apply` or loop).
-3. Drop rows where both `ApiCountyCode` and `ApiSequenceNumber` are null (cannot
-   identify a well without at least one API component).
-4. Log a `WARNING` if any non-nullable column contains nulls after reading.
-5. Return the filtered `pd.DataFrame`.
-
-**Important dtype rules:**
-- Pass `dtype=` explicitly. Never rely on pandas inference.
-- `WellStatus` must be read as `pd.StringDtype()` (cast to `CategoricalDtype` in transform).
-- `AcceptedDate` is handled via `parse_dates=["AcceptedDate"]` not the dtype map.
+This function is called once at stage startup and the result is passed to all
+schema-enforcement functions. It must not be called per-partition.
 
 **Error handling:**
-- Raise `IngestError` (see Task 03) if the file is missing required columns after read.
-- Catch `UnicodeDecodeError`; retry with `encoding="latin-1"` once before raising
-  `IngestError`.
+- If `dict_path` does not exist → raise `FileNotFoundError`.
+- If the CSV is missing any of the required header columns → raise `ValueError`.
 
-**Dependencies:** `pandas`, `pathlib`, `logging`
+**Dependencies:** `pandas`, `pathlib`
 
 **Test cases:**
+- Given the real `references/production-data-dictionary.csv`, assert the returned dict
+  has 33 keys (one per column in the data dictionary).
+- Assert that `result["OilProduced"]["dtype"] == "float"` and
+  `result["OilProduced"]["nullable"] == True`.
+- Assert that `result["ReportYear"]["nullable"] == False`.
+- Assert that `result["WellStatus"]["categories"] == ["AB","AC","DG","PA","PR","SI","SO","TA","WO"]`.
+- Assert that `result["OilProduced"]["categories"] == []`.
+- Given a path to a non-existent file, assert `FileNotFoundError` is raised.
 
-- `@pytest.mark.unit` — Given a temp CSV with all canonical columns, assert the returned
-  DataFrame has correct dtypes for `DocNum` (`Int64`), `OilProduced` (`Float64`),
-  `Revised` (`boolean`), `ApiCountyCode` (`StringDtype`), and `AcceptedDate`
-  (`datetime64[ns]`).
-- `@pytest.mark.unit` — Given a CSV containing rows with `ReportYear=2018` and
-  `ReportYear=2021`, assert only the 2021 rows appear in the output (TR-04 prerequisite).
-- `@pytest.mark.unit` — Given a CSV missing `ApiCountyCode` column entirely, assert
-  `IngestError` is raised.
-- `@pytest.mark.unit` — Given a CSV where both `ApiCountyCode` and `ApiSequenceNumber`
-  are null for some rows, assert those rows are dropped.
-- `@pytest.mark.unit` — Given a CSV with a BOM (`\ufeff`) at the start, assert the
-  function reads it without error and column names are not prefixed with `\ufeff`.
-
-**Definition of done:** `read_raw_file` implemented, all test cases pass, ruff and mypy
-report no errors, `requirements.txt` updated with all third-party packages imported in
-this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 03: Implement IngestError and Dask delayed reader
+## Task ING-02: dtype mapper
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Classes/Functions:**
-- `class IngestError(RuntimeError)` — raised on unrecoverable ingest failures
-- `make_delayed_df(path: Path, config: dict) -> dask.dataframe.DataFrame`
+**Function:** `map_dtype(dtype_token: str, nullable: bool, categories: list[str]) -> object`
 
 **Description:**
-`IngestError` is a thin subclass of `RuntimeError` with no additional attributes.
+Map a data-dictionary dtype token string to the correct pandas dtype object, respecting
+nullability per ADR-003 rules. Returns a pandas dtype object suitable for use in
+`pd.read_csv(dtype=...)` and for Dask schema enforcement.
 
-`make_delayed_df` wraps `read_raw_file` in a `dask.delayed` call and constructs a
-`dask.dataframe.DataFrame` via `dd.from_delayed`:
-1. Build `meta` by calling `read_raw_file` on a small representative sample (first 5
-   rows of the file, or an empty DataFrame constructed from the canonical schema). The
-   meta must match the function output exactly in column names, column order, and dtypes.
-   **Do not manually reorder columns** — derive meta by calling the reader on a minimal
-   real input.
-2. Call `dd.from_delayed([delayed(read_raw_file)(path, config)], meta=meta)`.
-3. Return the resulting Dask DataFrame.
+### Mapping rules
+| dtype_token | nullable | pandas dtype |
+|---|---|---|
+| `"int"` | `False` | `np.dtype("int64")` |
+| `"int"` | `True` | `pd.Int64Dtype()` |
+| `"Int64"` | `True` | `pd.Int64Dtype()` |
+| `"float"` | any | `np.dtype("float64")` |
+| `"string"` | any | `pd.StringDtype()` |
+| `"datetime"` | any | `"datetime64[ns]"` (string token, applied post-load via `pd.to_datetime`) |
+| `"bool"` | any | `pd.BooleanDtype()` |
+| `"categorical"` | any | `pd.CategoricalDtype(categories=categories, ordered=False)` |
 
-**Non-negotiable:** The `meta=` argument must match `read_raw_file`'s output exactly.
-Build meta from the function on an empty or minimal real input, not a manually constructed
-dict. Any column-order mismatch causes a Dask metadata mismatch error at compute time.
+- `datetime` columns must NOT be passed to `pd.read_csv(dtype=...)` — they must be
+  loaded as string first and converted via `pd.to_datetime(..., errors="coerce")` after
+  the initial CSV read.
+- Categorical columns must load as `string` first, then be cast to
+  `pd.CategoricalDtype` after values outside the declared set are replaced with `NA`.
 
-**Dependencies:** `dask`, `dask.dataframe`, `pathlib`
+**Error handling:**
+- Unknown `dtype_token` → raise `ValueError` naming the unknown token.
+
+**Dependencies:** `pandas`, `numpy`
 
 **Test cases:**
+- Assert `map_dtype("int", False, [])` returns `np.dtype("int64")`.
+- Assert `map_dtype("int", True, [])` returns `pd.Int64Dtype()`.
+- Assert `map_dtype("float", True, [])` returns `np.dtype("float64")`.
+- Assert `map_dtype("string", True, [])` returns `pd.StringDtype()`.
+- Assert `map_dtype("bool", True, [])` returns `pd.BooleanDtype()`.
+- Assert `map_dtype("categorical", True, ["AB","AC"])` returns
+  `pd.CategoricalDtype(categories=["AB","AC"], ordered=False)`.
+- Assert `map_dtype("datetime", True, [])` returns the string token `"datetime64[ns]"`.
+- Assert `map_dtype("unknown_token", False, [])` raises `ValueError`.
 
-- `@pytest.mark.unit` — Given a valid temp CSV, assert `make_delayed_df` returns a
-  `dask.dataframe.DataFrame` (not a pandas DataFrame), verifying TR-17.
-- `@pytest.mark.unit` — Assert the returned Dask DataFrame's `dtypes` dict matches the
-  canonical schema dtype map for all columns present in the test CSV.
-- `@pytest.mark.unit` — Assert that calling `.compute()` on the result returns a pandas
-  DataFrame with the expected row count.
-
-**Definition of done:** `IngestError` and `make_delayed_df` implemented, all test cases
-pass, ruff and mypy report no errors, `requirements.txt` updated with all third-party
-packages imported in this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 04: Implement schema validator
+## Task ING-03: Schema enforcer (partition-level)
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `validate_schema(ddf: dask.dataframe.DataFrame) -> None`
+**Function:** `enforce_schema(df: pd.DataFrame, data_dict: dict[str, dict]) -> pd.DataFrame`
 
 **Description:**
-Validates that a Dask DataFrame matches the canonical schema. Checks:
-1. All expected columns are present. Raises `IngestError` listing missing columns if not.
-2. Each column's dtype matches the expected dtype from the canonical schema. Logs a
-   `WARNING` (does not raise) for dtype mismatches — mismatches are logged and flagged but
-   do not abort the pipeline, since Dask's `from_delayed` may slightly vary nullable
-   integer representation.
-3. Logs a summary at `INFO` level: column count, row count estimate (via
-   `ddf.npartitions` — never call `ddf.shape[0].compute()`), and any warnings.
+Accept a raw pandas DataFrame (as produced by reading one CSV partition) and return a
+DataFrame with the canonical schema enforced. This function is called inside a
+`ddf.map_partitions(enforce_schema, data_dict)` call — it must be pure and stateless.
 
-**Note:** Use `max(1, ddf.npartitions // 10)` for any partition-based estimation. Never
-call `ddf.shape[0].compute()`.
+### Processing steps (applied in this order):
 
-**Dependencies:** `dask.dataframe`, `logging`
+1. **Absent column handling:**
+   - For each column in `data_dict`:
+     - If the column is absent from `df.columns`:
+       - If `nullable=False` → raise `KeyError` naming the column and the file.
+       - If `nullable=True` → add the column as an all-`NA` Series at the correct dtype.
+
+2. **Datetime columns:** Convert `AcceptedDate` using
+   `pd.to_datetime(df["AcceptedDate"], errors="coerce")` — invalid strings become `NaT`.
+
+3. **Categorical columns:** For `WellStatus`:
+   - Replace any values not in the declared category set with `pd.NA`.
+   - Cast to `pd.CategoricalDtype(categories=[...], ordered=False)`.
+
+4. **Non-datetime, non-categorical columns:** Cast to the pandas dtype returned by
+   `map_dtype`. Use `pd.array(..., dtype=...).astype(dtype)` pattern to preserve
+   nullable semantics.
+
+5. **Column selection and ordering:** Return only the columns declared in `data_dict`,
+   in the order they appear in the data dictionary.
+
+**Error handling:**
+- Non-nullable column absent from source DataFrame → `KeyError` with the column name.
+- Cast failure for a non-nullable column → propagate the original exception; do not
+  silently swallow casting errors.
+- Cast failure for a nullable column → coerce invalid values to `NA` rather than
+  raising.
+
+**Dependencies:** `pandas`, `numpy`
 
 **Test cases:**
+- Given a DataFrame with all expected columns and correct values, assert the returned
+  DataFrame has identical dtypes per the data dictionary mapping.
+- Given a DataFrame missing a nullable column (`OilProduced`), assert the returned
+  DataFrame contains `OilProduced` as all-NA float64 column.
+- Given a DataFrame missing a non-nullable column (`ReportYear`), assert `KeyError`
+  is raised.
+- Given a DataFrame with `WellStatus` containing an invalid value `"XX"`, assert it
+  is replaced with `pd.NA` and the column dtype is categorical.
+- Given a DataFrame with `AcceptedDate` as `"not-a-date"`, assert the value becomes
+  `NaT` and no exception is raised.
+- Assert that the output DataFrame has columns in the exact order declared in the
+  data dictionary.
 
-- `@pytest.mark.unit` — Given a Dask DataFrame with all canonical columns and correct
-  dtypes, assert `validate_schema` returns without raising.
-- `@pytest.mark.unit` — Given a Dask DataFrame missing `OilProduced`, assert
-  `IngestError` is raised and the error message mentions `OilProduced`.
-- `@pytest.mark.unit` — Given a Dask DataFrame with `DocNum` as `int64` instead of
-  `Int64`, assert a `WARNING` is logged (not an exception).
-
-**Definition of done:** `validate_schema` implemented, all test cases pass, ruff and mypy
-report no errors, `requirements.txt` updated with all third-party packages imported in
-this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 05: Implement interim Parquet writer
+## Task ING-04: Raw CSV reader
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `write_interim(ddf: dask.dataframe.DataFrame, config: dict) -> None`
+**Function:** `read_raw_csv(file_path: Path, data_dict: dict[str, dict]) -> dd.DataFrame`
 
 **Description:**
-Writes a Dask DataFrame to the interim Parquet dataset:
-1. Compute target partition count: `max(10, min(ddf.npartitions, 50))`.
-2. Repartition: `ddf = ddf.repartition(npartitions=target_n)`.
-3. Write: `ddf.to_parquet(config["ingest"]["interim_dir"] + "/production.parquet",
-   engine="pyarrow", write_index=False, overwrite=True)`.
-4. Log the number of partitions written and the output path at `INFO` level.
+Read a single raw CSV file from `data/raw/` into a Dask DataFrame and apply
+`enforce_schema` via `map_partitions`. Returns a Dask DataFrame — does NOT call
+`.compute()`.
 
-**Important:** Never write one file per source entity. Never write more than 50 Parquet
-files. The repartition step is mandatory before `to_parquet`.
+### Processing steps:
+1. Use `dd.read_csv(file_path, dtype=str, assume_missing=True)` to load all columns
+   as strings initially — this avoids pandas inference problems on mixed-type columns.
+2. Derive the `meta` argument for `map_partitions` by calling `enforce_schema` on
+   `ddf._meta.copy()` (an empty DataFrame with the inferred column names as string type).
+   Never construct meta manually.
+3. Apply `ddf.map_partitions(enforce_schema, data_dict, meta=meta)`.
+4. Return the resulting Dask DataFrame without calling `.compute()`.
 
-**Dependencies:** `dask.dataframe`, `pathlib`, `logging`
+### Year filter:
+After `map_partitions`, apply the year filter:
+`ddf = ddf[ddf["ReportYear"] >= 2020]`
+The filter must be applied as a lazy Dask operation — do not compute before filtering.
+
+**Error handling:**
+- If `file_path` does not exist → raise `FileNotFoundError`.
+- Propagate any `KeyError` raised by `enforce_schema` for missing non-nullable columns.
+
+**Dependencies:** `dask.dataframe`, `pandas`, `pathlib`
 
 **Test cases:**
+- Given a temporary CSV file with all canonical columns and 10 rows (mix of years 2019
+  and 2021), assert the returned Dask DataFrame has `ReportYear >= 2020` only (i.e.,
+  rows with year 2019 are excluded) — verify by computing row count.
+- Assert the return type is `dask.dataframe.DataFrame` (not `pd.DataFrame`).
+- Assert all returned column dtypes match the data dictionary after `.compute()`.
+- Given a CSV missing a non-nullable column (`Well`), assert `KeyError` is propagated.
+- TR-17: Assert the function returns a Dask DataFrame without calling `.compute()`
+  internally (verify by patching `dask.dataframe.DataFrame.compute` and asserting
+  it is never called during `read_raw_csv`).
 
-- `@pytest.mark.unit` — Given a Dask DataFrame with 3 partitions, assert
-  `write_interim` writes at least 10 Parquet files (repartition up to min 10).
-- `@pytest.mark.unit` — Given a Dask DataFrame with 200 partitions, assert
-  `write_interim` writes at most 50 Parquet files.
-- `@pytest.mark.integration` — After `write_interim`, assert the output directory
-  contains `.parquet` files; read them back with `pd.read_parquet` and assert no error
-  (TR-18). Assert all expected columns are present (TR-22).
-
-**Definition of done:** `write_interim` implemented, all test cases pass, ruff and mypy
-report no errors, `requirements.txt` updated with all third-party packages imported in
-this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 06: Implement ingest stage orchestrator
+## Task ING-05: Multi-file ingest runner
 
 **Module:** `cogcc_pipeline/ingest.py`
-**Function:** `run_ingest(config: dict) -> dask.dataframe.DataFrame`
+**Function:** `run_ingest(config_path: str = "config/config.yaml") -> None`
 
 **Description:**
-Orchestrates the full ingest stage:
-1. Detect or initialise Dask distributed Client:
-   - Call `distributed.get_client()`; if `ValueError` is raised (no running client),
-     create a `LocalCluster` and `Client` using `config["dask"]` settings
-     (`n_workers`, `threads_per_worker`, `memory_limit`). Log the dashboard URL.
-2. Discover raw CSV files: glob `config["ingest"]["raw_dir"]` for `*.csv` files.
-   Raise `IngestError` if no files are found.
-3. For each discovered file, call `log_file_metadata(path)` and
-   `make_delayed_df(path, config)`.
-4. Concatenate all Dask DataFrames: `ddf = dd.concat(ddf_list)`.
-5. Call `validate_schema(ddf)`.
-6. Call `write_interim(ddf, config)`.
-7. Return the Dask DataFrame (before `.compute()`).
+Top-level entry point for the ingest stage. Reads all CSV files from `data/raw/`,
+concatenates them into a single Dask DataFrame, applies schema enforcement and year
+filtering, repartitions, and writes to `data/interim/` as Parquet.
 
-**Non-negotiable:** Do NOT call `.compute()` inside `run_ingest`. Return the Dask
-DataFrame. Verify via TR-17.
+### Processing steps:
+1. Call `load_config(config_path)` (reuse from `cogcc_pipeline/acquire.py` or place
+   a shared config loader in a utility module — see Task ING-06).
+2. Load the data dictionary via `load_data_dictionary`.
+3. Discover all `*.csv` files in `raw_dir` using `pathlib.Path.glob("*.csv")`.
+   If no files are found, log a WARNING and return — do not raise.
+4. For each CSV file, call `read_raw_csv(file_path, data_dict)` to get a lazy Dask
+   DataFrame.
+5. Concatenate all lazy Dask DataFrames with `dd.concat(dfs, ignore_unknown_divisions=True)`.
+6. Compute partition count: `n = len(csv_files)`;
+   `n_partitions = max(10, min(n, 50))`.
+7. Call `ddf.repartition(npartitions=n_partitions)` — this must be the last operation
+   before writing (ADR-004).
+8. Write to `interim_dir` using `ddf.to_parquet(interim_dir, write_index=False,
+   overwrite=True, schema="infer")`.
+9. Log total rows written (from partition metadata, not by calling `.compute()`).
 
-**Dependencies:** `dask`, `dask.dataframe`, `distributed`, `pathlib`, `logging`
+### Scheduler:
+Use the Dask distributed scheduler. If a `Client` is already running (initialized by
+the pipeline entry point), reuse it. Do not initialize a new cluster inside this
+function.
+
+**Error handling:**
+- No CSV files found in `raw_dir` → log WARNING and return (not an error).
+- Any `KeyError` from `enforce_schema` → log ERROR with the offending filename and
+  re-raise to stop the stage.
+
+**Dependencies:** `dask.dataframe`, `dask.distributed`, `pandas`, `pathlib`, `logging`
 
 **Test cases:**
+- Given 2 synthetic CSV files in a temp `raw_dir` (one for 2020, one for 2021, each
+  with 5 rows), assert that `run_ingest` creates at least one Parquet file in
+  `interim_dir`.
+- Assert the Parquet output is readable by `dd.read_parquet` without error (TR-18).
+- Assert the union of all Parquet rows has `ReportYear >= 2020` only.
+- Given an empty `raw_dir`, assert `run_ingest` returns without raising and no Parquet
+  files are written.
+- Assert the number of Parquet partition files equals `max(10, min(n, 50))` where
+  `n` is the number of input CSV files.
+- TR-17: Assert `run_ingest` does not call `.compute()` before the final write —
+  patch `dask.dataframe.DataFrame.compute` and assert 0 calls.
 
-- `@pytest.mark.unit` — Mock `log_file_metadata`, `make_delayed_df`, `validate_schema`,
-  `write_interim`; assert `run_ingest` returns a `dask.dataframe.DataFrame`.
-- `@pytest.mark.unit` — Given no CSV files in raw dir, assert `IngestError` is raised.
-- `@pytest.mark.unit` — Assert `run_ingest` does not call `.compute()` on any
-  intermediate result (mock Dask DataFrame and assert `.compute()` is never invoked).
-- `@pytest.mark.integration` — Run `run_ingest(config)` against `data/raw/`; assert
-  `data/interim/production.parquet/` exists and is readable (TR-18). Sample 3 partitions
-  and assert all expected columns are present (TR-22).
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
-**Schema completeness test (TR-22):**
+---
 
-- `@pytest.mark.integration` — After `run_ingest`, read at least 3 partitions from
-  `data/interim/production.parquet/` using `pd.read_parquet`. Assert that each partition
-  contains all of the following columns: `ApiCountyCode`, `ApiSequenceNumber`,
-  `ReportYear`, `ReportMonth`, `OilProduced`, `OilSales`, `GasProduced`, `GasSales`,
-  `FlaredVented`, `GasUsedOnLease`, `WaterProduced`, `DaysProduced`, `Well`, `OpName`,
-  `OpNumber`, `DocNum`. Assert no expected column is missing or renamed in any sampled
-  partition.
+## Task ING-06: Shared utilities module
 
-**Parquet readability test (TR-18):**
+**Module:** `cogcc_pipeline/utils.py`
+**Functions:**
+- `load_config(config_path: str) -> dict`
+- `setup_logging(log_file: str, level: str) -> None`
+- `get_partition_count(n: int) -> int`
 
-- `@pytest.mark.integration` — After `run_ingest`, assert every `.parquet` file in
-  `data/interim/production.parquet/` is readable by `pd.read_parquet` without raising an
-  exception.
+**Description:**
+Extract shared utility functions used across pipeline stages into a single module.
+This avoids circular imports and duplication between `acquire.py` and `ingest.py`.
 
-**Definition of done:** `run_ingest` implemented, all test cases pass (including TR-17,
-TR-18, TR-22), ruff and mypy report no errors, `requirements.txt` updated with all
-third-party packages imported in this task.
+### `load_config(config_path: str) -> dict`
+Identical to the function specified in ACQ-02 but located in `utils.py`.
+The acquire module must import it from `utils.py`. Update `acquire.py` to remove its
+own copy of this function and use `from cogcc_pipeline.utils import load_config`.
+
+### `setup_logging(log_file: str, level: str) -> None`
+Configure a root logger with two handlers (ADR-006):
+- `StreamHandler` → console (stdout)
+- `FileHandler` → `log_file` path
+Both handlers must use the same format: `"%(asctime)s %(levelname)s %(name)s — %(message)s"`.
+The log output directory must be created if it does not exist.
+This function is idempotent — calling it twice must not add duplicate handlers.
+
+### `get_partition_count(n: int) -> int`
+Return `max(10, min(n, 50))`. This formula is used by every stage that writes
+Parquet output (ADR-004).
+
+**Error handling:**
+- `load_config`: `FileNotFoundError` on missing file; `KeyError` on missing required sections.
+- `setup_logging`: `OSError` on unwritable log directory → propagate.
+
+**Dependencies:** `pyyaml`, `logging`, `pathlib`, `datetime`
+
+**Test cases:**
+- Assert `get_partition_count(3)` returns `10`.
+- Assert `get_partition_count(25)` returns `25`.
+- Assert `get_partition_count(100)` returns `50`.
+- Assert `get_partition_count(10)` returns `10`.
+- Assert `get_partition_count(50)` returns `50`.
+- Given a valid config YAML, assert `load_config` returns a dict with required keys.
+- Assert `setup_logging` creates the log directory if it does not exist.
+- Assert `setup_logging` called twice on the same logger does not add duplicate handlers.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task ING-07: Ingest stage integration tests
+
+**Module:** `tests/test_ingest.py`
+**Scope:** TR-17, TR-18, TR-22 (from test-requirements.xml)
+
+**Description:**
+Write integration-level tests covering the full ingest output contract.
+All tests use synthetic CSV data in a temp directory — no real data files required.
+
+### TR-22 — Schema completeness across partitions
+- Create a synthetic temp directory with 3 CSV files, each containing all canonical
+  columns.
+- Run `run_ingest` to produce Parquet output in a temp `interim_dir`.
+- Read at least 3 Parquet partition files individually using `pd.read_parquet`.
+- For each partition, assert that ALL of the following columns are present:
+  `ApiCountyCode`, `ApiSequenceNumber`, `ReportYear`, `ReportMonth`, `OilProduced`,
+  `OilSales`, `GasProduced`, `GasSales`, `FlaredVented`, `GasUsedOnLease`,
+  `WaterProduced`, `DaysProduced`, `Well`, `OpName`, `OpNumber`, `DocNum`.
+- Assert no expected column is missing or renamed in any sampled partition.
+
+### TR-18 — Parquet readability
+- After `run_ingest` completes, read every Parquet file in `interim_dir` using
+  `pd.read_parquet` in a fresh read (simulate a new process by using a separate
+  `pd.read_parquet` call with no caching).
+- Assert no `pyarrow.ArrowInvalid` or `OSError` is raised for any file.
+
+### Additional schema dtype test
+- After `run_ingest`, read one partition and assert column dtypes match expected:
+  - `ReportYear` is `int64`
+  - `OilProduced` is `float64`
+  - `ApiCountyCode` dtype is `object` or `string`
+  - `WellStatus` is categorical
+
+**Definition of done:** All TR-17, TR-18, TR-22 test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.

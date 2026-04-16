@@ -1,139 +1,135 @@
-"""Pipeline orchestrator: chains acquire → ingest → transform → features."""
-
-from __future__ import annotations
+"""CLI entry point for the COGCC production data pipeline."""
 
 import argparse
 import logging
+import sys
 import time
+
+from cogcc_pipeline.utils import load_config, setup_logging
 
 logger = logging.getLogger(__name__)
 
-ALL_STAGES = ["acquire", "ingest", "transform", "features"]
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="COGCC production data pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--stages",
+        nargs="+",
+        choices=["acquire", "ingest", "transform", "features", "all"],
+        default=["all"],
+        help="Stages to run (default: all)",
+    )
+    parser.add_argument(
+        "--config",
+        default="config/config.yaml",
+        help="Path to config YAML (default: config/config.yaml)",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=None,
+        help="Override the log level from config",
+    )
+    return parser.parse_args(argv)
 
 
-def run_pipeline(stages: list[str] | None = None) -> None:
-    """Run the full pipeline or a subset of stages.
+def main(argv: list[str] | None = None) -> None:
+    """CLI entry point registered as cogcc-pipeline in pyproject.toml."""
+    args = _parse_args(argv)
 
-    Args:
-        stages: List of stage names to run, or None to run all stages in order.
-
-    Raises:
-        RuntimeError: If any stage fails (prevents downstream stages from running).
-    """
-    from cogcc_pipeline.acquire import load_config, run_acquire, setup_logging
-
-    config = load_config("config.yaml")
-    setup_logging(config)
-
-    if stages is None:
-        stages_to_run = list(ALL_STAGES)
+    # Determine which stages to run
+    if "all" in args.stages:
+        stages_to_run = ["acquire", "ingest", "transform", "features"]
     else:
-        stages_to_run = [s for s in ALL_STAGES if s in stages]
+        stages_to_run = args.stages
 
-    logger.info("Pipeline starting with stages: %s", stages_to_run)
+    # Load config
+    config = load_config(args.config)
+
+    # Configure logging before any stage runs (ADR-006)
+    log_cfg = config["logging"]
+    log_level = args.log_level or log_cfg.get("level", "INFO")
+    setup_logging(log_file=log_cfg["log_file"], level=log_level)
+
+    logger.info("Starting COGCC pipeline — stages: %s", stages_to_run)
 
     client = None
-    cluster = None
 
     try:
-        # Run acquire with Dask threaded scheduler (no distributed Client)
+        # Run acquire (I/O-bound, uses Dask threaded scheduler — no distributed Client needed)
         if "acquire" in stages_to_run:
-            t0 = time.time()
-            logger.info("Stage: acquire")
-            try:
-                from cogcc_pipeline.acquire import run_acquire
-                run_acquire(config)
-            except Exception as exc:
-                logger.error("Stage acquire failed: %s", exc)
-                raise RuntimeError(f"Stage acquire failed: {exc}") from exc
-            logger.info("Stage acquire completed in %.1fs", time.time() - t0)
+            from cogcc_pipeline.acquire import run_acquire
 
-        # Initialise Dask distributed Client before ingest
-        if any(s in stages_to_run for s in ["ingest", "transform", "features"]):
+            t0 = time.time()
+            try:
+                run_acquire(args.config)
+            except Exception as exc:
+                logger.error("Stage 'acquire' failed: %s", exc)
+                sys.exit(1)
+            logger.info("Stage 'acquire' completed in %.1f s", time.time() - t0)
+
+        # Initialize Dask distributed Client for CPU-bound stages
+        if any(s in stages_to_run for s in ("ingest", "transform", "features")):
+            from dask.distributed import Client, LocalCluster
+
             dask_cfg = config["dask"]
             scheduler = dask_cfg.get("scheduler", "local")
 
             if scheduler == "local":
-                from distributed import Client, LocalCluster
                 cluster = LocalCluster(
-                    n_workers=dask_cfg.get("n_workers", 2),
-                    threads_per_worker=dask_cfg.get("threads_per_worker", 2),
+                    n_workers=dask_cfg.get("n_workers", 4),
+                    threads_per_worker=dask_cfg.get("threads_per_worker", 1),
                     memory_limit=dask_cfg.get("memory_limit", "3GB"),
+                    dashboard_address=f":{dask_cfg.get('dashboard_port', 8787)}",
                 )
                 client = Client(cluster)
             else:
-                from distributed import Client
-                client = Client(scheduler)
+                client = Client(address=scheduler)
 
-            logger.info("Dask Client initialised: dashboard at %s", client.dashboard_link)
+            logger.info("Dask dashboard: %s", client.dashboard_link)
 
         if "ingest" in stages_to_run:
+            from cogcc_pipeline.ingest import run_ingest
+
             t0 = time.time()
-            logger.info("Stage: ingest")
             try:
-                from cogcc_pipeline.ingest import run_ingest
-                run_ingest(config)
+                run_ingest(args.config)
             except Exception as exc:
-                logger.error("Stage ingest failed: %s", exc)
-                raise RuntimeError(f"Stage ingest failed: {exc}") from exc
-            logger.info("Stage ingest completed in %.1fs", time.time() - t0)
+                logger.error("Stage 'ingest' failed: %s", exc)
+                sys.exit(1)
+            logger.info("Stage 'ingest' completed in %.1f s", time.time() - t0)
 
         if "transform" in stages_to_run:
+            from cogcc_pipeline.transform import run_transform
+
             t0 = time.time()
-            logger.info("Stage: transform")
             try:
-                from cogcc_pipeline.transform import run_transform
-                run_transform(config)
+                run_transform(args.config)
             except Exception as exc:
-                logger.error("Stage transform failed: %s", exc)
-                raise RuntimeError(f"Stage transform failed: {exc}") from exc
-            logger.info("Stage transform completed in %.1fs", time.time() - t0)
+                logger.error("Stage 'transform' failed: %s", exc)
+                sys.exit(1)
+            logger.info("Stage 'transform' completed in %.1f s", time.time() - t0)
 
         if "features" in stages_to_run:
-            t0 = time.time()
-            logger.info("Stage: features")
-            try:
-                from cogcc_pipeline.features import run_features
-                run_features(config)
-            except Exception as exc:
-                logger.error("Stage features failed: %s", exc)
-                raise RuntimeError(f"Stage features failed: {exc}") from exc
-            logger.info("Stage features completed in %.1fs", time.time() - t0)
+            from cogcc_pipeline.features import run_features
 
-        logger.info("Pipeline completed successfully.")
+            t0 = time.time()
+            try:
+                run_features(args.config)
+            except Exception as exc:
+                logger.error("Stage 'features' failed: %s", exc)
+                sys.exit(1)
+            logger.info("Stage 'features' completed in %.1f s", time.time() - t0)
+
+        logger.info("Pipeline complete.")
 
     finally:
         if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
-        if cluster is not None:
-            try:
-                cluster.close()
-            except Exception:
-                pass
-
-
-def main() -> None:
-    """CLI entry point for cogcc-pipeline."""
-    parser = argparse.ArgumentParser(
-        prog="cogcc-pipeline",
-        description="COGCC oil and gas production data pipeline",
-    )
-    parser.add_argument(
-        "--stages",
-        type=str,
-        default=None,
-        help="Comma-separated list of stages to run (e.g. acquire,ingest). Default: all stages.",
-    )
-    args = parser.parse_args()
-
-    stages: list[str] | None = None
-    if args.stages:
-        stages = [s.strip() for s in args.stages.split(",")]
-
-    run_pipeline(stages=stages)
+            client.close()
+            logger.info("Dask client closed.")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,6 @@
 # Task Index
 
-| File | Description |
-|------|-------------|
-| `tasks/acquire_tasks.md` | Data acquisition: download annual ZIP archives and current-year monthly CSV from ECMC; parallel Dask threaded downloads; idempotent file validity checking; project scaffold (pyproject.toml, Makefile, config.yaml) |
-| `tasks/ingest_tasks.md`  | Data ingestion: read raw CSVs with explicit schema enforcement from the data dictionary; filter to ReportYear >= 2020; validate schema; log file metadata (row counts, checksums); write consolidated interim Parquet dataset |
-| `tasks/transform_tasks.md` | Data transformation and cleaning: construct well_id and production_date derived columns; deduplicate; clean production volumes (negatives, outliers, zero-preservation); cast WellStatus to categorical; set_index shuffle; repartition; sort within partitions; write processed Parquet dataset |
-| `tasks/features_tasks.md` | Feature engineering: cumulative production (Np, Gp, Wp); GOR; water cut; decline rates (clipped); rolling averages; lag features; output validation; write ML-ready feature-matrix Parquet dataset; pipeline orchestrator (pipeline.py) and CLI entry point |
+- tasks/acquire_tasks.md    <- all acquire stage tasks: project scaffolding, config loader, URL builder, file validity checker, single-file downloader with retry, parallel acquire runner, and acquire integration tests
+- tasks/ingest_tasks.md     <- all ingest stage tasks: data dictionary loader, dtype mapper, schema enforcer, raw CSV reader, multi-file ingest runner, shared utilities module, and ingest integration tests
+- tasks/transform_tasks.md  <- all transform stage tasks: derived column derivation, production volume cleaning, operator name normalization, deduplication, well completeness check, transform pipeline assembler, and transform integration tests
+- tasks/features_tasks.md   <- all features stage tasks: cumulative production, ratio features (GOR/WOR/WGR/water cut), decline rates, rolling averages, lag features, categorical encoding, features pipeline assembler, CLI entry point, and features integration tests

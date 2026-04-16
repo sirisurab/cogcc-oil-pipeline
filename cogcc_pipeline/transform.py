@@ -1,297 +1,306 @@
-"""Transform stage: clean, deduplicate, construct derived columns, write processed Parquet."""
-
-from __future__ import annotations
+"""Transform stage: clean, validate, derive columns, and write processed Parquet."""
 
 import logging
+from pathlib import Path
 
-import dask
 import dask.dataframe as dd
-import numpy as np
 import pandas as pd
+
+from cogcc_pipeline.utils import get_partition_count, load_config
 
 logger = logging.getLogger(__name__)
 
-WELL_STATUS_CATEGORIES = ["AB", "AC", "DG", "PA", "PR", "SI", "SO", "TA", "WO"]
-WELL_STATUS_DTYPE = pd.CategoricalDtype(categories=WELL_STATUS_CATEGORIES, ordered=False)
+_VOLUME_COLS = [
+    "OilProduced",
+    "OilSales",
+    "GasProduced",
+    "GasSales",
+    "GasUsedOnLease",
+    "FlaredVented",
+    "WaterProduced",
+]
+_PRESSURE_COLS = [
+    "GasPressureTubing",
+    "GasPressureCasing",
+    "WaterPressureTubing",
+    "WaterPressureCasing",
+]
+_LEGAL_SUFFIXES = [", LLC", ", INC.", ", INC", ", LP", ", LTD", ", CORP", ", CO.", ", CO"]
 
-OIL_OUTLIER_THRESHOLD = 50_000.0  # BBL — single-well monthly upper limit
+
+# ---------------------------------------------------------------------------
+# TRN-01: Derive entity key and production date
+# ---------------------------------------------------------------------------
 
 
-class TransformError(RuntimeError):
-    """Raised on unrecoverable transform failures."""
+def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add well_id (canonical entity key) and production_date columns.
 
-
-def _build_well_id(df: pd.DataFrame) -> pd.Series:
-    """Build composite well_id: '05-{ApiCountyCode}-{ApiSequenceNumber}-{ApiSidetrack}'.
-
-    ApiSidetrack is zero-padded to 2 digits; null sidetrack → '00'.
-
-    Returns:
-        pd.Series of dtype pd.StringDtype().
+    Pure and stateless — called via map_partitions.
     """
-    county = df["ApiCountyCode"].fillna("")
-    seq = df["ApiSequenceNumber"].fillna("")
-    sidetrack = df["ApiSidetrack"].str.zfill(2).where(df["ApiSidetrack"].notna(), other="00")
-    result = "05-" + county + "-" + seq + "-" + sidetrack
-    return result.astype(pd.StringDtype())
+    county = df["ApiCountyCode"].fillna("").str.zfill(2)
+    seq = df["ApiSequenceNumber"].fillna("").str.zfill(5)
+    sidetrack = df["ApiSidetrack"].fillna("00").str.zfill(2)
 
-
-def _build_production_date(df: pd.DataFrame) -> pd.Series:
-    """Build production_date (datetime64[ns]) from ReportYear and ReportMonth.
-
-    Invalid year/month combinations produce NaT.
-    """
-    result = pd.to_datetime(
-        {"year": df["ReportYear"], "month": df["ReportMonth"], "day": 1},
-        errors="coerce",
+    df = df.copy()
+    df["well_id"] = county + seq + sidetrack
+    df["production_date"] = pd.to_datetime(
+        {"year": df["ReportYear"], "month": df["ReportMonth"], "day": 1}
     )
-    return result
-
-
-def _deduplicate(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove duplicate rows, keeping the one with the most recent AcceptedDate.
-
-    Deduplication key: ApiCountyCode, ApiSequenceNumber, ReportYear, ReportMonth.
-    Idempotent: calling twice produces the same result.
-    """
-    dup_cols = ["ApiCountyCode", "ApiSequenceNumber", "ReportYear", "ReportMonth"]
-    if "AcceptedDate" in df.columns:
-        df = df.sort_values("AcceptedDate", ascending=False, na_position="last")
-    df = df.drop_duplicates(subset=dup_cols, keep="first")
     return df
+
+
+# ---------------------------------------------------------------------------
+# TRN-02: Production volume validation and cleaning
+# ---------------------------------------------------------------------------
 
 
 def _clean_production_volumes(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean OilProduced, GasProduced, WaterProduced columns.
+    """Enforce physical and domain validity rules on production volume columns.
 
-    Rules:
-    - Negative → pd.NA (TR-01)
-    - Zero preserved as 0.0 (TR-05)
-    - OilProduced > 50,000 BBL → pd.NA + WARNING (TR-02)
-    - DaysProduced=0 with non-zero volumes → WARNING only
+    Pure and stateless — called via map_partitions.
     """
     df = df.copy()
-    vol_cols = ["OilProduced", "GasProduced", "WaterProduced"]
 
-    for col in vol_cols:
-        if col not in df.columns:
-            continue
-        neg_mask = df[col].notna() & (df[col] < 0)
-        if neg_mask.any():
-            df.loc[neg_mask, col] = pd.NA
+    # Rule 1: Replace negative values with NA (TR-01, TR-05)
+    for col in _VOLUME_COLS:
+        if col in df.columns:
+            df[col] = df[col].where(df[col].isna() | (df[col] >= 0), other=pd.NA)  # type: ignore[call-overload]
 
-    # Oil outlier check
+    # Rule 2: Oil unit flag (TR-02)
     if "OilProduced" in df.columns:
-        outlier_mask = df["OilProduced"].notna() & (df["OilProduced"] > OIL_OUTLIER_THRESHOLD)
-        if outlier_mask.any():
-            n_outliers = int(outlier_mask.sum())
-            bad_vals = df.loc[outlier_mask, "OilProduced"].tolist()
-            logger.warning(
-                "OilProduced outlier: %d rows exceed %s BBL (values: %s) — replacing with NA",
-                n_outliers,
-                OIL_OUTLIER_THRESHOLD,
-                bad_vals[:5],
-            )
-            df.loc[outlier_mask, "OilProduced"] = pd.NA
+        df["oil_unit_flag"] = df["OilProduced"].fillna(0) > 50_000
 
-    # Days consistency check (warning only)
+    # Rule 3: Pressure column negative replacement (TR-01)
+    for col in _PRESSURE_COLS:
+        if col in df.columns:
+            df[col] = df[col].where(df[col].isna() | (df[col] >= 0), other=pd.NA)  # type: ignore[call-overload]
+
+    # Rule 4: DaysProduced range validation
     if "DaysProduced" in df.columns:
-        days_zero = df["DaysProduced"].notna() & (df["DaysProduced"] == 0)
-        for col in vol_cols:
-            if col not in df.columns:
-                continue
-            nonzero_prod = df[col].notna() & (df[col] != 0)
-            flag = days_zero & nonzero_prod
-            if flag.any():
-                logger.warning(
-                    "DaysProduced=0 but %s is non-zero for %d rows (data quality flag)",
-                    col,
-                    flag.sum(),
-                )
+        dp = df["DaysProduced"]
+        df["DaysProduced"] = dp.where(dp.isna() | ((dp >= 0) & (dp <= 31)), other=pd.NA)  # type: ignore[call-overload]
 
     return df
 
 
-def _cast_well_status(df: pd.DataFrame) -> pd.DataFrame:
-    """Cast WellStatus to CategoricalDtype; unknown values → pd.NA."""
-    df = df.copy()
-    if "WellStatus" not in df.columns:
-        return df
-    valid_mask = df["WellStatus"].isin(WELL_STATUS_CATEGORIES)
-    df["WellStatus"] = df["WellStatus"].where(valid_mask, other=np.nan)
-    df["WellStatus"] = df["WellStatus"].astype(WELL_STATUS_DTYPE)
-    return df
+# ---------------------------------------------------------------------------
+# TRN-03: Operator name normalization
+# ---------------------------------------------------------------------------
 
 
-def _transform_partition(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply full per-partition transformation chain.
+def _normalize_operator_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize OpName values for grouping consistency.
 
-    Order: deduplicate → clean volumes → build well_id → build production_date →
-    cast WellStatus → drop ReportYear/ReportMonth.
+    Pure and stateless — called via map_partitions.
     """
-    df = _deduplicate(df)
-    df = _clean_production_volumes(df)
-    df["well_id"] = _build_well_id(df)
-    # Insert well_id as first column
-    cols = ["well_id"] + [c for c in df.columns if c != "well_id"]
-    df = df[cols]
-    df["production_date"] = _build_production_date(df)
-    # Insert production_date after well_id
-    remaining = [c for c in df.columns if c not in ("well_id", "production_date")]
-    df = df[["well_id", "production_date"] + remaining]
-    df = _cast_well_status(df)
-    df = df.drop(columns=["ReportYear", "ReportMonth"], errors="ignore")
+    df = df.copy()
+
+    if "OpName" not in df.columns:
+        return df
+
+    s = df["OpName"]
+
+    # Step 1: Strip leading/trailing whitespace
+    s = s.str.strip()
+    # Step 2: Collapse internal multiple spaces
+    s = s.str.replace(r"\s+", " ", regex=True)
+    # Step 3: Uppercase
+    s = s.str.upper()
+    # Step 4: Remove legal suffixes (order matters — longer first to avoid partial matches)
+    for suffix in _LEGAL_SUFFIXES:
+        s = s.str.replace(suffix.upper() + "$", "", regex=True)
+        # Strip trailing comma/space that may remain after suffix removal
+        s = s.str.replace(r"[, ]+$", "", regex=True)
+
+    # Step 5: Empty or NA → NA
+    s = s.str.strip()
+    s = s.where(s.notna() & (s != ""), other=pd.NA)  # type: ignore[call-overload]
+
+    df["OpName"] = s
     return df
+
+
+# ---------------------------------------------------------------------------
+# TRN-04: Deduplication
+# ---------------------------------------------------------------------------
+
+
+def _deduplicate(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove exact duplicates and apply well-month revision deduplication.
+
+    Pure and stateless — called via map_partitions.
+    Output row count is always <= input row count (TR-15).
+    """
+    df = df.copy()
+
+    # Rule 1: Exact duplicate removal
+    df = df.drop_duplicates()
+
+    # Rule 2: Well-month revision deduplication
+    key_cols = ["well_id", "ReportYear", "ReportMonth"]
+    # Only apply if all key columns are present
+    if all(c in df.columns for c in key_cols):
+        # Sort: Revised=True rows last, then by AcceptedDate ascending (NA last)
+        has_revised = "Revised" in df.columns
+        has_accepted = "AcceptedDate" in df.columns
+
+        sort_cols: list[str] = []
+        ascending: list[bool] = []
+
+        if has_revised:
+            # Convert Revised to bool-like for sorting (False < True → True rows are kept)
+            df["_revised_sort"] = df["Revised"].fillna(False).astype(bool)
+            sort_cols.append("_revised_sort")
+            ascending.append(True)  # True values come last → kept by drop_duplicates keep="last"
+
+        if has_accepted:
+            sort_cols.append("AcceptedDate")
+            ascending.append(True)
+
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=ascending, na_position="first")
+
+        df = df.drop_duplicates(subset=key_cols, keep="last")
+
+        if "_revised_sort" in df.columns:
+            df = df.drop(columns=["_revised_sort"])
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# TRN-05: Well completeness gap detection
+# ---------------------------------------------------------------------------
 
 
 def check_well_completeness(ddf: dd.DataFrame) -> pd.DataFrame:
-    """Check for gaps in each well's monthly production record.
+    """Compute a summary of wells with unexpected gaps in monthly production records.
 
-    Returns:
-        Summary DataFrame with gap analysis per well.
+    Returns a pandas DataFrame — calls .compute() once on aggregated result.
     """
-    summary = ddf.groupby("well_id")["production_date"].agg(["min", "max", "count"]).compute()
-    summary.columns = ["first_date", "last_date", "actual_months"]
+
+    def _compute_gaps(df: pd.DataFrame) -> pd.DataFrame:
+        """Group-level gap computation applied after groupby."""
+        result_rows = []
+        for well_id, group in df.groupby("well_id"):
+            min_date = group["production_date"].min()
+            max_date = group["production_date"].max()
+            min_yr, min_mo = min_date.year, min_date.month
+            max_yr, max_mo = max_date.year, max_date.month
+            expected = (max_yr * 12 + max_mo) - (min_yr * 12 + min_mo) + 1
+            actual = len(group)
+            if actual < expected:
+                result_rows.append(
+                    {
+                        "well_id": well_id,
+                        "min_date": min_date,
+                        "max_date": max_date,
+                        "expected_months": expected,
+                        "actual_months": actual,
+                        "gap_count": expected - actual,
+                    }
+                )
+        return pd.DataFrame(result_rows)
+
+    # Reset index so well_id is a column
+    ddf_reset = ddf.reset_index()
+
+    # Compute the aggregation by partition, then combine
+    # Use a simple approach: aggregate min/max/count per well via Dask groupby
+    agg = (
+        ddf_reset.groupby("well_id")["production_date"]
+        .agg(["min", "max", "count"])
+        .compute()
+        .reset_index()
+    )
+    agg.columns = ["well_id", "min_date", "max_date", "actual_months"]
 
     def _expected(row: pd.Series) -> int:
-        if pd.isna(row["first_date"]) or pd.isna(row["last_date"]):
-            return 0
-        first = row["first_date"].to_period("M")
-        last = row["last_date"].to_period("M")
-        return int((last - first).n) + 1
-
-    summary["expected_months"] = summary.apply(_expected, axis=1)
-    summary["gap_count"] = summary["expected_months"] - summary["actual_months"]
-
-    wells_with_gaps = summary[summary["gap_count"] > 0]
-    for well_id, row in wells_with_gaps.iterrows():
-        logger.warning(
-            "Well %s has %d production gap(s) between %s and %s",
-            well_id,
-            row["gap_count"],
-            row["first_date"],
-            row["last_date"],
+        return (
+            (row["max_date"].year * 12 + row["max_date"].month)
+            - (row["min_date"].year * 12 + row["min_date"].month)
+            + 1
         )
-    logger.info(
-        "Well completeness: %d wells checked, %d with gaps", len(summary), len(wells_with_gaps)
-    )
-    return summary
+
+    agg["expected_months"] = agg.apply(_expected, axis=1)
+    agg["gap_count"] = agg["expected_months"] - agg["actual_months"]
+
+    gaps = agg[agg["gap_count"] > 0].sort_values("gap_count", ascending=False)
+    return gaps[
+        ["well_id", "min_date", "max_date", "expected_months", "actual_months", "gap_count"]
+    ]
 
 
-def check_data_integrity(
-    interim_ddf: dd.DataFrame,
-    processed_ddf: dd.DataFrame,
-    sample_n: int = 20,
-) -> None:
-    """Spot-check production volumes from interim to processed for a random sample of wells.
+# ---------------------------------------------------------------------------
+# TRN-06: Transform pipeline assembler
+# ---------------------------------------------------------------------------
 
-    Batches both compute calls via dask.compute().
+
+def run_transform(config_path: str = "config/config.yaml") -> None:
+    """Top-level entry point for the transform stage.
+
+    Reads interim Parquet, applies all cleaning/validation/derivation steps,
+    and writes processed Parquet to data/processed/.
     """
-    well_ids_series = (
-        processed_ddf["well_id"]
-        if "well_id" in processed_ddf.columns
-        else processed_ddf.index.to_series()
-    )
-    (well_ids_arr,) = dask.compute(well_ids_series.unique())
-    well_ids = list(well_ids_arr)
+    config = load_config(config_path)
+    trn_cfg = config["transform"]
 
-    import random
+    interim_dir = Path(trn_cfg["interim_dir"])
+    processed_dir = Path(trn_cfg["processed_dir"])
 
-    sample = random.sample(well_ids, min(sample_n, len(well_ids)))
+    parquet_files = list(interim_dir.glob("*.parquet"))
+    if not parquet_files:
+        logger.warning("No Parquet files found in %s — transform skipped", interim_dir)
+        return
 
-    discrepancies = 0
-    for well_id in sample:
-        if "well_id" in interim_ddf.columns:
-            interim_mask = interim_ddf["well_id"] == well_id
-        else:
-            interim_mask = interim_ddf.index == well_id
+    n = len(parquet_files)
 
-        if "well_id" in processed_ddf.columns:
-            processed_mask = processed_ddf["well_id"] == well_id
-        else:
-            processed_mask = processed_ddf.index == well_id
-
-        interim_sum_delayed = interim_ddf[interim_mask]["OilProduced"].sum()
-        processed_sum_delayed = processed_ddf[processed_mask]["OilProduced"].sum()
-
-        interim_sum, processed_sum = dask.compute(interim_sum_delayed, processed_sum_delayed)
-
-        diff = abs(float(interim_sum or 0) - float(processed_sum or 0))
-        if diff > 1e-3:
-            discrepancies += 1
-            logger.warning(
-                "OilProduced discrepancy for well %s: interim=%.4f processed=%.4f diff=%.6f",
-                well_id,
-                interim_sum,
-                processed_sum,
-                diff,
-            )
-
-    logger.info("Integrity check: %d wells checked, %d discrepancies", len(sample), discrepancies)
-
-
-def run_transform(config: dict) -> dd.DataFrame:
-    """Orchestrate the full transform stage.
-
-    Returns:
-        Dask DataFrame (not computed on full dataset).
-    """
     try:
-        from distributed import get_client
+        ddf = dd.read_parquet(str(interim_dir))
 
-        client = get_client()
-        logger.info("Reusing existing Dask client: %s", client)
-    except ValueError:
-        from distributed import Client, LocalCluster
+        # Step 3: Add derived columns
+        meta_derived = _add_derived_columns(ddf._meta.copy())
+        ddf = ddf.map_partitions(_add_derived_columns, meta=meta_derived)
 
-        dask_cfg = config["dask"]
-        cluster = LocalCluster(
-            n_workers=dask_cfg.get("n_workers", 2),
-            threads_per_worker=dask_cfg.get("threads_per_worker", 2),
-            memory_limit=dask_cfg.get("memory_limit", "3GB"),
-        )
-        client = Client(cluster)
-        logger.info("Initialised Dask LocalCluster: dashboard at %s", client.dashboard_link)
+        # Step 4: Clean production volumes
+        meta_cleaned = _clean_production_volumes(ddf._meta.copy())
+        ddf = ddf.map_partitions(_clean_production_volumes, meta=meta_cleaned)
 
-    interim_path = config["transform"]["interim_dir"] + "/production.parquet"
-    ddf = dd.read_parquet(interim_path, engine="pyarrow")
+        # Step 5: Normalize operator names
+        meta_normalized = _normalize_operator_names(ddf._meta.copy())
+        ddf = ddf.map_partitions(_normalize_operator_names, meta=meta_normalized)
 
-    # Keep reference to interim for integrity check
-    interim_ddf = ddf
+        # Step 6: Deduplicate
+        meta_deduped = _deduplicate(ddf._meta.copy())
+        ddf = ddf.map_partitions(_deduplicate, meta=meta_deduped)
 
-    # Derive meta by calling the transform on an empty copy of the schema
-    meta = _transform_partition(ddf._meta.copy())
-    ddf = ddf.map_partitions(_transform_partition, meta=meta)
+        # Step 7: Set index on well_id
+        ddf = ddf.set_index("well_id", sorted=False, drop=True)
 
-    # Filter rows where well_id is null or empty using map_partitions
-    def _filter_empty_well_id(df: pd.DataFrame) -> pd.DataFrame:
-        return df[df["well_id"].notna() & (df["well_id"] != "")]
+        # Step 8: Sort by production_date within partitions
+        ddf = ddf.map_partitions(lambda df: df.sort_values("production_date"))
 
-    filter_meta = meta[meta["well_id"].notna() & (meta["well_id"] != "")]
-    ddf = ddf.map_partitions(_filter_empty_well_id, meta=filter_meta)
+        # Step 11: Well completeness diagnostic (before repartition)
+        try:
+            gaps_df = check_well_completeness(ddf)
+            if gaps_df.empty:
+                logger.info("Well completeness check: no gaps found")
+            else:
+                top10 = gaps_df.head(10)
+                logger.warning("Well completeness gaps found:\n%s", top10.to_string())
+        except Exception as exc:
+            logger.warning("Well completeness check failed (non-blocking): %s", exc)
 
-    # Diagnostic completeness check (does not block pipeline)
-    try:
-        check_well_completeness(ddf)
+        # Step 9: Repartition
+        ddf = ddf.repartition(npartitions=get_partition_count(n))
+
+        # Step 10: Write Parquet
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        ddf.to_parquet(str(processed_dir), write_index=True, overwrite=True)
+
+        logger.info("Transform complete: %d input partitions → %s", n, processed_dir)
+
     except Exception as exc:
-        logger.warning("Well completeness check failed (non-blocking): %s", exc)
-
-    # Final sequence: set_index → repartition → sort within partitions
-    ddf = ddf.set_index("well_id")
-    ddf = ddf.repartition(npartitions=max(10, min(ddf.npartitions, 50)))
-
-    sort_meta = ddf._meta.copy().sort_values("production_date")
-    ddf = ddf.map_partitions(lambda df: df.sort_values("production_date"), meta=sort_meta)
-
-    processed_path = config["transform"]["processed_dir"] + "/production.parquet"
-    ddf.to_parquet(processed_path, engine="pyarrow", write_index=True, overwrite=True)
-    logger.info("Wrote processed Parquet to %s", processed_path)
-
-    # Integrity check (audit step — read back processed)
-    try:
-        processed_ddf = dd.read_parquet(processed_path, engine="pyarrow")
-        check_data_integrity(interim_ddf, processed_ddf)
-    except Exception as exc:
-        logger.warning("Data integrity check failed (non-blocking): %s", exc)
-
-    return ddf
+        logger.error("Transform stage failed: %s", exc)
+        raise

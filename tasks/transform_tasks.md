@@ -1,423 +1,423 @@
-# Transform Component Tasks
+# Transform Stage — Task Specifications
 
-**Pipeline package:** `cogcc_pipeline`
-**Module file:** `cogcc_pipeline/transform.py`
+## Stage Overview
+
+**Package:** `cogcc_pipeline`
+**Module:** `cogcc_pipeline/transform.py`
 **Test file:** `tests/test_transform.py`
+**Input directory:** `data/interim/` (Parquet, output of ingest)
+**Output directory:** `data/processed/` (Parquet, ML-ready)
+**Scheduler:** Dask distributed scheduler (CPU-bound stage — ADR-001)
 
-## Overview
+The transform stage reads the interim Parquet produced by ingest, cleans and validates
+data, derives a synthetic `production_date` column, re-indexes on the entity column,
+sorts by `production_date` within partitions, casts categoricals, and writes
+analysis-ready Parquet to `data/processed/`.
 
-The transform stage reads the consolidated interim Parquet dataset, performs thorough
-data cleaning (deduplication, null handling, outlier removal, type coercion, unit
-validation), constructs a composite `well_id` column, casts `WellStatus` to its
-categorical dtype, sets the index to `well_id` via a distributed shuffle, repartitions,
-sorts within each partition by production date, and writes the processed Parquet dataset
-to `data/processed/`. All transformation logic uses vectorised pandas/numpy operations
-inside `map_partitions` — never `iterrows`, `itertuples`, or Python for-loops over rows.
-The stage uses the Dask distributed scheduler (reuse existing Client or initialise its
-own).
+### Boundary contract received from ingest
+- All columns carry data-dictionary dtypes (no re-casting needed).
+- Column names match the data dictionary exactly.
+- Nullable absent columns are filled with NA (no absent nullable column handling needed).
+- Partitioned to `max(10, min(n, 50))` — no re-partitioning needed before processing.
+- Sort: unsorted — transform must not assume any sort order on input.
 
----
+### Boundary contract delivered by transform (→ features)
+- Entity-indexed on `well_id` (see TRN-01 for derivation).
+- Sorted by `production_date` within each partition.
+- Categoricals cast to declared category sets.
+- Invalid values replaced with the appropriate null sentinel (not dropped).
+- Partitioned to `max(10, min(n, 50))`.
 
-## Derived Column: `well_id`
-
-`well_id` is the composite API well identifier constructed as:
-`"05-" + ApiCountyCode + "-" + ApiSequenceNumber + "-" + ApiSidetrack`
-
-Where `ApiSidetrack` is zero-padded to 2 digits when present; use `"00"` when null.
-`well_id` dtype: `pd.StringDtype()`.
-
----
-
-## Derived Column: `production_date`
-
-Construct a `production_date` column of `datetime64[ns]` from `ReportYear` and
-`ReportMonth` using `pd.to_datetime({"year": df["ReportYear"], "month": df["ReportMonth"], "day": 1})`.
-
----
-
-## Categorical Column: `WellStatus`
-
-`WellStatus` must be cast to `pd.CategoricalDtype(categories=["AB","AC","DG","PA","PR","SI","SO","TA","WO"], ordered=False)`
-in the transform stage, after cleaning. Any value not in this list must be replaced with
-`pd.NA` before casting. Never cast to categorical before cleaning — raw data may contain
-values outside the known set.
+### Key design constraints (from ADRs)
+- ADR-001: Use Dask distributed scheduler. Reuse the existing `Client` — do not
+  initialize a new cluster inside transform functions.
+- ADR-002: All operations must be vectorized. No row iteration. No per-entity Python
+  loops. All grouped operations use Dask/pandas grouped vectorized transforms.
+- ADR-003: Dtype changes are prohibited — the data dictionary is the only source of
+  truth for types. Do not re-infer types from the data.
+- ADR-004: `repartition()` must be the last operation before `to_parquet()`. No
+  operations after repartition.
+- ADR-005: Keep the task graph lazy until the final write. No `.compute()` calls
+  inside transform functions.
 
 ---
 
-## Design Decisions and Constraints
-
-- All transformation logic inside `map_partitions` callbacks must use vectorised
-  pandas/numpy operations. Preference order: built-in pandas/numpy → `groupby().transform()`
-  → `apply(raw=True)` → `apply()`. Never use `iterrows()`, `itertuples()`, or Python
-  for-loops over rows.
-- String filtering must be done inside a `map_partitions` function, not directly on a
-  Dask Series (Dask `.str` accessor is unreliable after repartition/astype).
-- The final sequence before writing Parquet must be:
-  1. `set_index("well_id")` — triggers distributed shuffle; call exactly once.
-  2. `repartition(npartitions=max(10, min(ddf.npartitions, 50)))`.
-  3. Sort within each partition by `production_date` using `map_partitions`.
-- `meta=` for every `map_partitions` call must be derived by calling the target function
-  on `ddf._meta.copy()` (an empty DataFrame with the correct schema). Never manually
-  construct the meta column list — it will drift when the function changes.
-- Row count after deduplication must be ≤ raw row count (TR-15).
-- Zeros in production volumes (`OilProduced`, `GasProduced`, `WaterProduced`) must be
-  preserved as `0.0`, not converted to null (TR-05).
-- The stage uses the Dask distributed scheduler. Check for an existing Client via
-  `distributed.get_client()`; catch `ValueError` to detect no running client and create
-  a `LocalCluster` + `Client` from `config["dask"]`.
-
----
-
-## Task 01: Implement TransformError and well_id builder
+## Task TRN-01: Derive entity key and production date
 
 **Module:** `cogcc_pipeline/transform.py`
-**Classes/Functions:**
-- `class TransformError(RuntimeError)` — raised on unrecoverable transform failures
-- `_build_well_id(df: pd.DataFrame) -> pd.Series`
+**Function:** `_add_derived_columns(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-`TransformError` is a thin subclass of `RuntimeError`.
+Partition-level function (called via `map_partitions`) that adds two derived columns
+to the input DataFrame. Must be pure and stateless.
 
-`_build_well_id` takes a pandas DataFrame (one partition) and returns a `pd.Series` of
-dtype `pd.StringDtype()` containing the composite well identifier. Construction rule:
-- `"05-" + ApiCountyCode + "-" + ApiSequenceNumber + "-" + ApiSidetrack.fillna("00")`
-- Pad `ApiSidetrack` to exactly 2 digits using `.str.zfill(2)` before substituting `"00"`
-  for nulls.
-- Use vectorised string concatenation only — no apply, no loop.
+### Derived columns:
 
-**Test cases:**
+**`well_id`** — The canonical well entity key used for indexing, grouping, and joining
+throughout the remainder of the pipeline. Derived by zero-padding and concatenating
+the three API number components:
+- `ApiCountyCode`: zero-padded to 2 characters
+- `ApiSequenceNumber`: zero-padded to 5 characters
+- `ApiSidetrack`: zero-padded to 2 characters (use `"00"` when `ApiSidetrack` is NA)
+- Concatenated as: `f"{county:>02}{seq:>05}{sidetrack:>02}"`
+- The result is a 9-character string (e.g., `"010123400"` for county `01`, sequence
+  `01234`, sidetrack `00`).
+- All three component columns are `string` dtype — use pandas string operations,
+  not Python string formatting in a row-wise apply.
 
-- `@pytest.mark.unit` — Given a DataFrame row with `ApiCountyCode="01"`,
-  `ApiSequenceNumber="12345"`, `ApiSidetrack="00"`, assert `well_id == "05-01-12345-00"`.
-- `@pytest.mark.unit` — Given a row with null `ApiSidetrack`, assert `well_id` uses
-  `"00"` as the sidetrack component.
-- `@pytest.mark.unit` — Given a DataFrame with 100 rows, assert no Python `for` loop is
-  used (check that result matches vectorised computation).
-- `@pytest.mark.unit` — Assert return dtype is `pd.StringDtype()`.
-
-**Definition of done:** `TransformError` and `_build_well_id` implemented, all test
-cases pass, ruff and mypy report no errors, `requirements.txt` updated with all
-third-party packages imported in this task.
-
----
-
-## Task 02: Implement production_date column builder
-
-**Module:** `cogcc_pipeline/transform.py`
-**Function:** `_build_production_date(df: pd.DataFrame) -> pd.Series`
-
-**Description:**
-Takes a pandas DataFrame partition and returns a `pd.Series` of `datetime64[ns]`
-representing the first day of the production month. Uses:
+**`production_date`** — A `datetime64[ns]` column representing the first day of the
+production reporting period. Derived as:
 `pd.to_datetime({"year": df["ReportYear"], "month": df["ReportMonth"], "day": 1})`
 
-Returns the resulting Series. If any row has an invalid year/month combination, those
-rows produce `NaT`.
+### Implementation constraint:
+Both derivations must be fully vectorized using pandas string and datetime
+constructors — no `apply`, no `iterrows`, no per-row lambda.
+
+**Meta derivation:**
+When calling `ddf.map_partitions(_add_derived_columns, meta=meta)`, derive `meta` by
+calling `_add_derived_columns(ddf._meta.copy())`. Never construct meta manually
+(ADR-003, TR-23).
+
+**Dependencies:** `pandas`
 
 **Test cases:**
+- Given a DataFrame with `ApiCountyCode="01"`, `ApiSequenceNumber="00123"`,
+  `ApiSidetrack="00"`, assert `well_id == "010012300"`.
+- Given a DataFrame with `ApiCountyCode="5"` (not zero-padded in source),
+  `ApiSequenceNumber="456"`, `ApiSidetrack=pd.NA`, assert `well_id == "050045600"`.
+- Given `ReportYear=2021`, `ReportMonth=6`, assert `production_date == pd.Timestamp("2021-06-01")`.
+- Assert `production_date` dtype is `datetime64[ns]`.
+- Assert `well_id` dtype is `string` or `object` (str).
+- TR-23: Call `_add_derived_columns` on an empty DataFrame with the input schema and
+  assert the output column list and dtypes match what would be passed as `meta` in
+  `map_partitions`.
 
-- `@pytest.mark.unit` — Given `ReportYear=2021`, `ReportMonth=6`, assert result is
-  `Timestamp("2021-06-01")`.
-- `@pytest.mark.unit` — Given `ReportYear=2020`, `ReportMonth=12`, assert result is
-  `Timestamp("2020-12-01")`.
-- `@pytest.mark.unit` — Given an invalid month (e.g. `ReportMonth=13`), assert the
-  result is `NaT` (not an exception).
-- `@pytest.mark.unit` — Assert return dtype is `datetime64[ns]`.
-
-**Definition of done:** `_build_production_date` implemented, all test cases pass, ruff
-and mypy report no errors, `requirements.txt` updated with all third-party packages
-imported in this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 03: Implement deduplication
-
-**Module:** `cogcc_pipeline/transform.py`
-**Function:** `_deduplicate(df: pd.DataFrame) -> pd.DataFrame`
-
-**Description:**
-Removes duplicate rows from a partition. Deduplication key: `["ApiCountyCode",
-"ApiSequenceNumber", "ReportYear", "ReportMonth"]`. When duplicates are found, keep the
-row with the most recent `AcceptedDate` (sort descending by `AcceptedDate`, then keep
-first). If `AcceptedDate` is null for all duplicates, keep the first occurrence. Uses
-vectorised sort + `drop_duplicates` — no apply, no loop.
-
-Idempotency requirement: calling `_deduplicate` twice on the same DataFrame must produce
-the same result as calling it once (TR-15).
-
-**Test cases:**
-
-- `@pytest.mark.unit` — Given a DataFrame with two rows sharing the same
-  `ApiCountyCode`, `ApiSequenceNumber`, `ReportYear`, `ReportMonth` but different
-  `AcceptedDate`, assert only the row with the later `AcceptedDate` is retained.
-- `@pytest.mark.unit` — Given a DataFrame with no duplicates, assert row count is
-  unchanged.
-- `@pytest.mark.unit` — Given a DataFrame with all-null `AcceptedDate` for duplicates,
-  assert only one row per key is retained.
-- `@pytest.mark.unit` — Assert idempotency: apply `_deduplicate` twice and assert the
-  result equals applying it once (TR-15).
-- `@pytest.mark.unit` — Assert row count after deduplication ≤ row count before (TR-15).
-
-**Definition of done:** `_deduplicate` implemented, all test cases pass, ruff and mypy
-report no errors, `requirements.txt` updated with all third-party packages imported in
-this task.
-
----
-
-## Task 04: Implement production volume cleaner
+## Task TRN-02: Production volume validation and cleaning
 
 **Module:** `cogcc_pipeline/transform.py`
 **Function:** `_clean_production_volumes(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-Cleans the three primary production volume columns: `OilProduced`, `GasProduced`,
-`WaterProduced`. Rules applied using vectorised `numpy`/`pandas` operations only:
+Partition-level cleaning function (called via `map_partitions`) that enforces physical
+and domain validity rules on production volume columns. Must be pure and stateless.
 
-1. **Negative values** — Replace any negative value with `pd.NA`. Physical production
-   volumes cannot be negative (TR-01). Use `numpy.where` or boolean masking.
-2. **Zero preservation** — A value of exactly `0.0` is a valid measurement (TR-05). Do
-   NOT replace zeros with null.
-3. **Oil unit outlier check (TR-02)** — Single-well monthly `OilProduced` values above
-   50,000 BBL are almost certainly a unit error. Replace with `pd.NA` and log a
-   `WARNING` with the `well_id` and the erroneous value.
-4. **Days consistency** — If `DaysProduced` is 0 and any of the three volumes are
-   non-zero, log a `WARNING` (do not null the production — this is a data quality flag
-   only).
-5. **Return** the cleaned DataFrame.
+### Columns subject to cleaning:
+`OilProduced`, `OilSales`, `GasProduced`, `GasSales`, `GasUsedOnLease`,
+`FlaredVented`, `WaterProduced`
 
-**Test cases:**
+### Cleaning rules (applied in order):
 
-- `@pytest.mark.unit` — Given a row with `OilProduced=-100.0`, assert it becomes
-  `pd.NA` (TR-01).
-- `@pytest.mark.unit` — Given a row with `OilProduced=0.0`, assert it remains `0.0`
-  (not null) (TR-05).
-- `@pytest.mark.unit` — Given a row with `OilProduced=75000.0`, assert it becomes
-  `pd.NA` and a `WARNING` is logged (TR-02).
-- `@pytest.mark.unit` — Given a row with `GasProduced=-1.0`, assert it becomes `pd.NA`.
-- `@pytest.mark.unit` — Given a row with `WaterProduced=0.0` and `DaysProduced=0`,
-  assert no exception and both values are preserved as-is (zero is valid).
-- `@pytest.mark.unit` — Given a row with `DaysProduced=0` and `OilProduced=100.0`,
-  assert a `WARNING` is logged and `OilProduced` remains `100.0`.
+1. **Negative value replacement (TR-01 physical bound):**
+   For each of the listed columns, replace any negative value with `pd.NA`.
+   A negative production volume is physically impossible — it is a data entry error
+   or a unit conversion mistake, not a valid measurement.
+   Zero values must NOT be replaced — zero is a valid measurement (TR-05).
 
-**Definition of done:** `_clean_production_volumes` implemented, all test cases pass,
-ruff and mypy report no errors, `requirements.txt` updated with all third-party packages
-imported in this task.
+2. **Unit range outlier flagging (TR-02 unit consistency):**
+   For `OilProduced` only: if a value exceeds 50,000 BBL/month for a single well,
+   flag the row by setting a new boolean column `oil_unit_flag = True` for that row.
+   For all other rows set `oil_unit_flag = False`. Do not null out the value — only flag.
+   The column `oil_unit_flag` must be added to the DataFrame by this function.
 
----
+3. **Pressure column negative replacement (TR-01):**
+   Replace negative values in `GasPressureTubing`, `GasPressureCasing`,
+   `WaterPressureTubing`, `WaterPressureCasing` with `pd.NA`.
 
-## Task 05: Implement WellStatus categorical caster
+4. **DaysProduced range validation:**
+   `DaysProduced` must be between 0 and 31 inclusive. Values outside this range
+   → replace with `pd.NA`.
 
-**Module:** `cogcc_pipeline/transform.py`
-**Function:** `_cast_well_status(df: pd.DataFrame) -> pd.DataFrame`
+### Zero vs null preservation (TR-05):
+Zeros in the input must remain as zeros (not converted to null). Only negative values
+are replaced with `pd.NA`.
 
-**Description:**
-Casts the `WellStatus` column from `pd.StringDtype()` to
-`pd.CategoricalDtype(categories=["AB","AC","DG","PA","PR","SI","SO","TA","WO"], ordered=False)`.
-Before casting:
-1. Replace any value not in the allowed category list with `pd.NA` using `numpy.where`
-   or `isin` + boolean mask — no loop.
-2. Then cast the column.
+**Meta derivation:**
+Derive `meta` by calling `_clean_production_volumes(ddf._meta.copy())` before the
+`map_partitions` call (ADR-003, TR-23).
 
-**Test cases:**
+**Dependencies:** `pandas`
 
-- `@pytest.mark.unit` — Given a DataFrame with `WellStatus` values `["AC", "SI", "PA"]`,
-  assert the cast column dtype is `CategoricalDtype` with the declared categories.
-- `@pytest.mark.unit` — Given a value `"XX"` (not in the allowed list), assert it
-  becomes `pd.NA` after casting.
-- `@pytest.mark.unit` — Given a null `WellStatus`, assert it remains null (not
-  erroneously assigned a category).
-- `@pytest.mark.unit` — Assert that unknown category values do not propagate silently —
-  the number of non-null values in the output must equal the number of rows with a
-  recognised status code in the input.
+**Test cases (TR-01, TR-02, TR-05):**
+- Given a row with `OilProduced=-100.0`, assert the cleaned value is `pd.NA`.
+- Given a row with `OilProduced=0.0`, assert the cleaned value remains `0.0` (not NA).
+- Given a row with `OilProduced=51000.0`, assert `oil_unit_flag=True` and value is
+  unchanged (not nulled).
+- Given a row with `OilProduced=100.0`, assert `oil_unit_flag=False`.
+- Given a row with `GasProduced=-5.0`, assert the cleaned value is `pd.NA`.
+- Given a row with `WaterProduced=0.0`, assert the cleaned value remains `0.0`.
+- Given a row with `GasPressureTubing=-10.0`, assert the cleaned value is `pd.NA`.
+- Given a row with `DaysProduced=35`, assert the cleaned value is `pd.NA`.
+- Given a row with `DaysProduced=0`, assert the cleaned value remains `0`.
+- TR-23: Call on an empty DataFrame and assert output schema matches `meta`.
 
-**Definition of done:** `_cast_well_status` implemented, all test cases pass, ruff and
-mypy report no errors, `requirements.txt` updated with all third-party packages imported
-in this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 06: Implement partition-level transform orchestrator (map_partitions callback)
+## Task TRN-03: Operator name normalization
 
 **Module:** `cogcc_pipeline/transform.py`
-**Function:** `_transform_partition(df: pd.DataFrame) -> pd.DataFrame`
+**Function:** `_normalize_operator_names(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-Applied via `map_partitions` to each Dask partition. Executes the full per-partition
-transformation chain in order:
-1. `df = _deduplicate(df)`
-2. `df = _clean_production_volumes(df)`
-3. `df["well_id"] = _build_well_id(df)` — insert as first column
-4. `df["production_date"] = _build_production_date(df)` — insert after `well_id`
-5. `df = _cast_well_status(df)`
-6. Drop `ReportYear` and `ReportMonth` from the output (superseded by `production_date`).
-7. Return the transformed DataFrame.
+Partition-level function (called via `map_partitions`) that standardizes `OpName`
+values to improve grouping consistency. Must be pure and stateless.
 
-**Meta construction:** The `meta=` argument for `ddf.map_partitions(_transform_partition, meta=meta)`
-must be derived by calling `_transform_partition(ddf._meta.copy())`. Do not manually
-specify column names or dtypes for meta.
+### Normalization rules (applied in order to `OpName`):
+1. Strip leading and trailing whitespace.
+2. Collapse internal multiple spaces to a single space.
+3. Convert to uppercase.
+4. Remove common legal-form suffixes to normalize variants:
+   Remove (case-insensitively, then re-upper) the following trailing tokens if present:
+   `, LLC`, `, INC`, `, INC.`, `, LP`, `, LTD`, `, CORP`, `, CO.`, `, CO`
+   after stripping they must also be stripped of any remaining trailing commas/spaces.
+5. If `OpName` is `pd.NA` or empty after normalization → leave as `pd.NA`.
+
+The result column replaces `OpName` in place (same column name, modified values).
+
+### Implementation constraint:
+Use pandas string accessor operations (`.str.strip()`, `.str.upper()`, `.str.replace()`,
+`.str.contains()`, `.str.extract()`) — no per-row apply or lambda.
+
+**Dependencies:** `pandas`
 
 **Test cases:**
+- Assert `"  Devon Energy Corp , LLC  "` normalizes to `"DEVON ENERGY CORP"`.
+- Assert `"Continental Resources, Inc."` normalizes to `"CONTINENTAL RESOURCES"`.
+- Assert `"ENERPLUS RESOURCES"` normalizes to `"ENERPLUS RESOURCES"` (no change).
+- Assert `pd.NA` remains `pd.NA` after normalization.
+- Assert `""` (empty string) becomes `pd.NA`.
+- Assert `"PDC  Energy,  LP"` (double space) normalizes to `"PDC ENERGY"`.
+- TR-23: Call on an empty DataFrame and assert output schema matches `meta`.
 
-- `@pytest.mark.unit` — Given a minimal synthetic partition DataFrame with all required
-  columns, assert the output contains `well_id` and `production_date` columns.
-- `@pytest.mark.unit` — Assert the output does NOT contain `ReportYear` or `ReportMonth`.
-- `@pytest.mark.unit` — Assert `well_id` dtype is `pd.StringDtype()`.
-- `@pytest.mark.unit` — Assert `production_date` dtype is `datetime64[ns]`.
-- `@pytest.mark.unit` — Assert `WellStatus` dtype is `CategoricalDtype`.
-- `@pytest.mark.unit` — Meta consistency (TR-23): call `_transform_partition` on
-  `ddf._meta.copy()` and assert column names, column order, and dtypes match the `meta=`
-  argument passed to `map_partitions`.
-
-**Definition of done:** `_transform_partition` implemented, all test cases pass, ruff and
-mypy report no errors, `requirements.txt` updated with all third-party packages imported
-in this task.
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 07: Implement well completeness checker
+## Task TRN-04: Deduplication
 
 **Module:** `cogcc_pipeline/transform.py`
-**Function:** `check_well_completeness(ddf: dask.dataframe.DataFrame) -> pd.DataFrame`
+**Function:** `_deduplicate(df: pd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-Checks for unexpected gaps in each well's monthly production record (TR-04). Computes
-for each well:
-- `first_date`: minimum `production_date`
-- `last_date`: maximum `production_date`
-- `expected_months`: months between first and last date (inclusive)
-- `actual_months`: count of distinct `production_date` values
-- `gap_count`: `expected_months - actual_months`
+Partition-level deduplication function (called via `map_partitions`). Removes exact
+duplicate rows and handles the COGCC revision pattern where a later record supersedes
+an earlier one for the same well-month combination.
 
-Uses `ddf.groupby("well_id")["production_date"].agg(["min", "max", "count"])` followed
-by `.compute()` to get a summary pandas DataFrame. Returns this summary. Logs a
-`WARNING` for each well with `gap_count > 0`.
+### Deduplication rules (applied in order):
 
-Note: this is a diagnostic/audit function — it does not modify the data. It calls
-`.compute()` once on the aggregated summary (small result), not on the full dataset.
+1. **Exact duplicate removal:** Drop rows where all column values are identical.
+   Use `df.drop_duplicates()`.
 
-**Dependencies:** `dask.dataframe`, `pandas`, `logging`
+2. **Well-month revision deduplication:** For the same `(well_id, ReportYear, ReportMonth)`
+   combination where multiple rows exist and the `Revised` column is `True` on some:
+   - Keep only the row with `Revised=True` if present (supersedes the original).
+   - If multiple revised rows exist for the same key, keep the one with the latest
+     `AcceptedDate`. If `AcceptedDate` is NA, keep the last row in sort order.
+   - Use `sort_values` + `drop_duplicates(keep="last")` — do not iterate over groups.
 
-**Test cases:**
+### Row count constraint (TR-15):
+After deduplication, `len(output_df) <= len(input_df)` must hold. The function must
+never increase the row count.
 
-- `@pytest.mark.unit` — Given a synthetic well with 12 consecutive monthly records (Jan
-  2021 – Dec 2021), assert `gap_count == 0` (TR-04).
-- `@pytest.mark.unit` — Given a well missing the March 2021 record (11 out of 12
-  months), assert `gap_count == 1` and a `WARNING` is logged (TR-04).
-- `@pytest.mark.unit` — Given two wells, assert the summary DataFrame has two rows.
+**Meta derivation:**
+Derive `meta` by calling `_deduplicate(ddf._meta.copy())` before `map_partitions`
+(TR-23).
 
-**Definition of done:** `check_well_completeness` implemented, all test cases pass, ruff
-and mypy report no errors, `requirements.txt` updated with all third-party packages
-imported in this task.
+**Dependencies:** `pandas`
+
+**Test cases (TR-15):**
+- Given a DataFrame with 5 identical rows, assert deduplication returns 1 row.
+- Given a DataFrame with 2 rows for the same `(well_id, ReportYear, ReportMonth)`,
+  one with `Revised=False` and one with `Revised=True`, assert only the `Revised=True`
+  row is kept.
+- Given a DataFrame with 2 revised rows for the same key and different `AcceptedDate`,
+  assert the row with the later `AcceptedDate` is kept.
+- Assert output row count is always <= input row count (test with 100 random rows
+  where 30% are duplicates).
+- TR-15 idempotency: Apply `_deduplicate` twice on the same input and assert the
+  output after the second run is identical to the output after the first.
+- TR-23: Call on an empty DataFrame and assert output schema matches `meta`.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 08: Implement data integrity spot-checker
+## Task TRN-05: Well completeness gap detection
 
 **Module:** `cogcc_pipeline/transform.py`
-**Function:** `check_data_integrity(interim_ddf: dask.dataframe.DataFrame, processed_ddf: dask.dataframe.DataFrame, sample_n: int = 20) -> None`
+**Function:** `check_well_completeness(ddf: dd.DataFrame) -> pd.DataFrame`
 
 **Description:**
-Spot-checks production volumes from interim to processed data for a random sample of
-wells (TR-11). Steps:
-1. Get a list of distinct `well_id` values from `processed_ddf` by computing
-   `processed_ddf["well_id"].unique().compute()`.
-2. Draw a random sample of `min(sample_n, len(well_ids))` well IDs.
-3. For each sampled well, compare `OilProduced` sum from interim vs processed using
-   `dask.compute()` (batch both at once — not two sequential `.compute()` calls).
-4. Assert the difference is within a tolerance of 1e-3 BBL (floating-point rounding only).
-5. Log a `WARNING` for any well with a discrepancy beyond tolerance.
-6. Log `INFO` with the number of wells checked and the number with discrepancies.
+Compute a summary DataFrame reporting wells with unexpected gaps in their monthly
+production record. This is a diagnostic/QC function — it does NOT filter or modify
+the production data. It returns a pandas DataFrame (i.e., it calls `.compute()` once
+on a grouped aggregation) suitable for logging or writing to a QC report file.
 
-**Non-negotiable:** Batch both interim and processed compute calls using `dask.compute()`,
-never call `.compute()` sequentially (see non-negotiable compute constraint).
+### Logic:
+For each unique `well_id`:
+1. Find the minimum and maximum `production_date`.
+2. Compute the expected number of months: `(max_year * 12 + max_month) - (min_year * 12 + min_month) + 1`.
+3. Compute the actual number of records for that well.
+4. If `actual_count < expected_count`, the well has gaps — include it in the output.
 
-**Test cases:**
+### Output schema (pandas DataFrame):
+Columns: `well_id`, `min_date`, `max_date`, `expected_months`, `actual_months`,
+`gap_count` (= `expected_months - actual_months`).
+Return only wells where `gap_count > 0`, sorted descending by `gap_count`.
 
-- `@pytest.mark.unit` — Given matching synthetic interim and processed Dask DataFrames,
-  assert no warnings are logged (TR-11).
-- `@pytest.mark.unit` — Given a processed DataFrame where one well's `OilProduced` sum
-  differs from interim by more than 1e-3, assert a `WARNING` is logged.
+### Implementation constraint:
+Use a Dask groupby aggregation — do not compute the full dataset to pandas before
+aggregating. Call `.compute()` only on the final aggregated result.
 
-**Definition of done:** `check_data_integrity` implemented, all test cases pass, ruff
-and mypy report no errors, `requirements.txt` updated with all third-party packages
-imported in this task.
+**Dependencies:** `dask.dataframe`, `pandas`
+
+**Test cases (TR-04):**
+- Given a synthetic Dask DataFrame for one well with records for Jan–Dec 2021 (12 rows),
+  assert `check_well_completeness` returns an empty DataFrame (no gaps).
+- Given a well with records for Jan, Feb, Apr 2021 (3 rows — March missing), assert
+  the well appears in the output with `expected_months=4`, `actual_months=3`,
+  `gap_count=1`.
+- Given two wells — one with no gaps and one with 2 gaps — assert only the gapped
+  well appears in the output.
+- Assert the output is a pandas DataFrame (not Dask).
+- Assert the output columns are exactly: `well_id`, `min_date`, `max_date`,
+  `expected_months`, `actual_months`, `gap_count`.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
 ---
 
-## Task 09: Implement transform stage orchestrator
+## Task TRN-06: Transform pipeline assembler
 
 **Module:** `cogcc_pipeline/transform.py`
-**Function:** `run_transform(config: dict) -> dask.dataframe.DataFrame`
+**Function:** `run_transform(config_path: str = "config/config.yaml") -> None`
 
 **Description:**
-Orchestrates the full transform stage:
-1. Detect or initialise Dask distributed Client (same pattern as ingest: try
-   `distributed.get_client()`, catch `ValueError`, create `LocalCluster` + `Client`).
-2. Read interim Parquet: `ddf = dd.read_parquet(config["transform"]["interim_dir"] + "/production.parquet", engine="pyarrow")`.
-3. Apply per-partition transform: `ddf = ddf.map_partitions(_transform_partition, meta=meta)`
-   where `meta = _transform_partition(ddf._meta.copy())`.
-4. Filter using `map_partitions` (not `.str` accessor directly): remove rows where
-   `well_id` is null or empty.
-5. Call `check_well_completeness(ddf)` (diagnostic only — does not block pipeline).
-6. **Final sequence (non-negotiable order):**
-   a. `ddf = ddf.set_index("well_id")` — distributed shuffle; exactly once.
-   b. `ddf = ddf.repartition(npartitions=max(10, min(ddf.npartitions, 50)))`.
-   c. Sort within each partition by `production_date` using `map_partitions` with a
-      lambda that calls `df.sort_values("production_date")`.
-7. Write processed Parquet: `ddf.to_parquet(config["transform"]["processed_dir"] + "/production.parquet", engine="pyarrow", write_index=True, overwrite=True)`.
-8. Call `check_data_integrity` (audit step).
-9. Return the Dask DataFrame (do NOT call `.compute()` on the full dataset).
+Top-level entry point for the transform stage. Orchestrates all cleaning, validation,
+sorting, and partitioning steps and writes the final Parquet output.
 
-**Non-negotiable:** `set_index` is called exactly once, at step 6a. Never call it before
-cleaning or in the middle of the transform chain. The `meta=` for map_partitions must be
-derived from calling the function on `ddf._meta.copy()`.
+### Processing steps (in order):
+
+1. `load_config(config_path)` from `cogcc_pipeline.utils`.
+2. Read `data/interim/` with `dd.read_parquet(interim_dir)` — no re-casting needed
+   (the boundary contract guarantees canonical dtypes from ingest).
+3. Apply `_add_derived_columns` via `map_partitions` (adds `well_id`,
+   `production_date`).
+4. Apply `_clean_production_volumes` via `map_partitions`.
+5. Apply `_normalize_operator_names` via `map_partitions`.
+6. Apply `_deduplicate` via `map_partitions`.
+7. **Set index on `well_id`:** `ddf = ddf.set_index("well_id", sorted=False, drop=True)`.
+   This triggers a distributed shuffle — it is intentional and expected per the
+   boundary contract.
+8. **Sort by `production_date` within partitions:**
+   After `set_index`, apply a `map_partitions` call that sorts each partition's
+   DataFrame by `production_date` ascending using `df.sort_values("production_date")`.
+   This satisfies the sort guarantee required by the features stage (H1, transform manifest).
+9. **Repartition:** `ddf.repartition(npartitions=get_partition_count(n))` where
+   `n` is derived from the number of interim Parquet files (use `len(list(Path(interim_dir).glob("*.parquet")))`).
+   Repartition must be the last operation before writing (ADR-004).
+10. **Write Parquet:** `ddf.to_parquet(processed_dir, write_index=True, overwrite=True)`.
+11. **Log well completeness:** Call `check_well_completeness(ddf_before_repartition)`
+    on the sorted but not-yet-repartitioned Dask DataFrame; log the result as INFO if
+    no gaps are found, or WARNING listing the top 10 gapped wells if gaps are present.
+    This is a diagnostic step — it must not block or fail the pipeline.
+12. Log total rows in output (from partition metadata).
+
+### Scheduler:
+Reuse an existing Dask `Client` — do not initialize a new cluster inside this function.
+
+**Error handling:**
+- If `interim_dir` has no Parquet files → log WARNING and return.
+- Any exception in `_add_derived_columns` or `_clean_production_volumes` →
+  propagate; log ERROR with the stage name.
+
+**Dependencies:** `dask.dataframe`, `pathlib`, `logging`, `cogcc_pipeline.utils`
 
 **Test cases:**
+- Given synthetic interim Parquet in a temp dir (2 wells × 6 months each), assert
+  `run_transform` writes Parquet to `processed_dir` without error.
+- Assert the Parquet output is readable by `dd.read_parquet` (TR-18).
+- Assert the output contains columns: `production_date`, `well_id`, `OilProduced`,
+  `GasProduced`, `WaterProduced`, `oil_unit_flag`.
+- Assert the output is sorted by `production_date` ascending within each partition
+  (read each partition with `pd.read_parquet`, assert `df["production_date"].is_monotonic_increasing`).
+- TR-16 sort stability: If a well spans multiple partitions, assert the last
+  `production_date` in partition N is strictly less than the first in partition N+1
+  for the same well.
+- TR-17: Assert `run_transform` does not call `.compute()` before the final write.
+- Given an empty `interim_dir`, assert `run_transform` returns without raising.
 
-- `@pytest.mark.unit` — Mock all sub-functions; assert `run_transform` returns a
-  `dask.dataframe.DataFrame` (TR-17).
-- `@pytest.mark.unit` — Assert `.compute()` is never called on the full dataset inside
-  `run_transform` (TR-17).
-- `@pytest.mark.integration` — Run `run_transform(config)` against `data/interim/`; assert
-  `data/processed/production.parquet/` is created and readable (TR-18).
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report
+no errors, requirements.txt updated with all third-party packages imported in this task.
 
-**Data cleaning validation (TR-12):**
+---
 
-- `@pytest.mark.integration` — After `run_transform`, read a sample partition from
-  `data/processed/production.parquet/`. Assert: no column uses `object` dtype (use
-  `pd.StringDtype()` or `CategoricalDtype`); `production_date` is `datetime64[ns]`;
-  `OilProduced` is `Float64`; `WellStatus` is `CategoricalDtype`.
+## Task TRN-07: Transform stage integration tests
 
-**Row count reconciliation (TR-15):**
+**Module:** `tests/test_transform.py`
+**Scope:** TR-01, TR-02, TR-04, TR-05, TR-11, TR-12, TR-13, TR-14, TR-15, TR-16, TR-17, TR-23
 
-- `@pytest.mark.integration` — Assert processed row count ≤ interim row count. Run
-  `run_transform` twice and assert the processed row count is identical both times
-  (idempotency).
+**Description:**
+Write integration-level tests for the complete transform output contract using
+synthetic interim Parquet data.
 
-**Sort stability (TR-16):**
+### TR-11 — Data integrity spot-check
+- Create synthetic interim Parquet with 50 rows across 5 wells.
+- Run `run_transform`.
+- For 10 randomly selected `(well_id, production_date)` pairs, assert that the
+  `OilProduced` value in the processed output matches the corresponding cleaned
+  expected value (i.e., positive values are preserved, negatives are NA).
 
-- `@pytest.mark.unit` — Given a synthetic Dask DataFrame with two partitions for the
-  same well, after the sort step assert the last `production_date` in partition 0 is
-  earlier than the first `production_date` in partition 1.
+### TR-12 — Data cleaning validation
+- Create input with: 2 null `OilProduced` rows, 3 negative `GasProduced` rows,
+  1 duplicate row.
+- Run `run_transform`.
+- Assert null `OilProduced` remains null (not filled).
+- Assert negative `GasProduced` rows become NA.
+- Assert duplicate row is removed (row count decreases by 1).
+- Assert `production_date` dtype is `datetime64[ns]`.
+- Assert `OilProduced` dtype is `float64`.
 
-**Zero preservation (TR-05):**
+### TR-13 — Partition correctness
+- After `run_transform` with 3 known wells, read each Parquet partition file.
+- For each partition file, assert all rows have the same `well_id` value in the
+  index — no partition should contain rows from multiple wells.
 
-- `@pytest.mark.unit` — Given a partition with `OilProduced=0.0`, assert `0.0` appears
-  in the processed output (not `pd.NA`).
+### TR-14 — Schema stability across wells
+- Read 2 different partition files after `run_transform`.
+- Assert that the column names list of partition 1 equals the column names list
+  of partition 2 (identical names and identical order).
+- Assert that the dtypes dict of partition 1 equals the dtypes dict of partition 2.
 
-**Schema stability (TR-14):**
+### TR-15 — Row count reconciliation
+- Count rows in interim Parquet input (before transform).
+- Count rows in processed Parquet output (after transform).
+- Assert output row count <= input row count.
+- Run `run_transform` a second time on the same input (idempotency check).
+- Assert output row count is identical to the first run.
 
-- `@pytest.mark.integration` — Read two different partition files from
-  `data/processed/production.parquet/`; assert their column names and dtypes are
-  identical.
+### TR-16 — Sort stability
+- Use a synthetic well with 12 months of production data that would span at least 2
+  partitions after repartition.
+- Assert that for all consecutive partition pairs containing rows for this well, the
+  max `production_date` in partition N < min `production_date` in partition N+1.
 
-**Partition correctness (TR-13):**
+### TR-23 — map_partitions meta consistency
+- For `_add_derived_columns`, `_clean_production_volumes`, `_normalize_operator_names`,
+  `_deduplicate`: call each function on an empty DataFrame matching the expected input
+  schema. Assert the output column list and dtypes match what would be passed as `meta`
+  to `map_partitions`.
 
-- `@pytest.mark.integration` — After `run_transform`, read each Parquet partition file
-  individually and assert the index (well_id) within each partition contains only one
-  unique value (since `set_index("well_id")` was used — rows for a given well are
-  co-located after the shuffle).
-
-**Definition of done:** `run_transform` implemented, all test cases pass (including TR-05,
-TR-11, TR-12, TR-13, TR-14, TR-15, TR-16, TR-17, TR-18, TR-23), ruff and mypy report no
-errors, `requirements.txt` updated with all third-party packages imported in this task.
+**Definition of done:** All TR-01, TR-02, TR-04, TR-05, TR-11, TR-12, TR-13, TR-14,
+TR-15, TR-16, TR-17, TR-23 test cases pass, ruff and mypy report no errors,
+requirements.txt updated with all third-party packages imported in this task.
