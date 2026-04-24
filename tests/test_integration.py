@@ -167,10 +167,22 @@ def test_ingest_integration(tmp_path: Path):
 
     # (d) All schema-required columns present (TR-22)
     for col in [
-        "ApiCountyCode", "ApiSequenceNumber", "ReportYear", "ReportMonth",
-        "OilProduced", "OilSales", "GasProduced", "GasSales",
-        "FlaredVented", "GasUsedOnLease", "WaterProduced",
-        "DaysProduced", "Well", "OpName", "DocNum", "OpNumber",
+        "ApiCountyCode",
+        "ApiSequenceNumber",
+        "ReportYear",
+        "ReportMonth",
+        "OilProduced",
+        "OilSales",
+        "GasProduced",
+        "GasSales",
+        "FlaredVented",
+        "GasUsedOnLease",
+        "WaterProduced",
+        "DaysProduced",
+        "Well",
+        "OpName",
+        "DocNum",
+        "OpNumber",
     ]:
         assert col in df.columns, f"TR-22 column missing: {col}"
 
@@ -193,21 +205,25 @@ def test_transform_integration(tmp_path: Path):
     _make_synthetic_csv(raw_dir / "file1.csv", year=2022, n_rows=20)
     _make_synthetic_csv(raw_dir / "file2.csv", year=2023, n_rows=15)
 
-    ingest({
-        "ingest": {
-            **INGEST_CFG_TEMPLATE,
-            "raw_dir": str(raw_dir),
-            "interim_dir": str(interim_dir),
+    ingest(
+        {
+            "ingest": {
+                **INGEST_CFG_TEMPLATE,
+                "raw_dir": str(raw_dir),
+                "interim_dir": str(interim_dir),
+            }
         }
-    })
+    )
 
-    transform({
-        "transform": {
-            **TRANSFORM_CFG_TEMPLATE,
-            "interim_dir": str(interim_dir),
-            "processed_dir": str(processed_dir),
+    transform(
+        {
+            "transform": {
+                **TRANSFORM_CFG_TEMPLATE,
+                "interim_dir": str(interim_dir),
+                "processed_dir": str(processed_dir),
+            }
         }
-    })
+    )
 
     # (a) Processed Parquet is readable
     ddf = dd.read_parquet(str(processed_dir), engine="pyarrow")
@@ -251,29 +267,35 @@ def test_features_integration(tmp_path: Path):
     _make_synthetic_csv(raw_dir / "file1.csv", year=2022, n_rows=20)
     _make_synthetic_csv(raw_dir / "file2.csv", year=2023, n_rows=15)
 
-    ingest({
-        "ingest": {
-            **INGEST_CFG_TEMPLATE,
-            "raw_dir": str(raw_dir),
-            "interim_dir": str(interim_dir),
+    ingest(
+        {
+            "ingest": {
+                **INGEST_CFG_TEMPLATE,
+                "raw_dir": str(raw_dir),
+                "interim_dir": str(interim_dir),
+            }
         }
-    })
+    )
 
-    transform({
-        "transform": {
-            **TRANSFORM_CFG_TEMPLATE,
-            "interim_dir": str(interim_dir),
-            "processed_dir": str(processed_dir),
+    transform(
+        {
+            "transform": {
+                **TRANSFORM_CFG_TEMPLATE,
+                "interim_dir": str(interim_dir),
+                "processed_dir": str(processed_dir),
+            }
         }
-    })
+    )
 
-    features({
-        "features": {
-            **FEATURES_CFG_TEMPLATE,
-            "processed_dir": str(processed_dir),
-            "features_dir": str(features_dir),
+    features(
+        {
+            "features": {
+                **FEATURES_CFG_TEMPLATE,
+                "processed_dir": str(processed_dir),
+                "features_dir": str(features_dir),
+            }
         }
-    })
+    )
 
     # (a) Features Parquet is readable
     ddf = dd.read_parquet(str(features_dir), engine="pyarrow")
@@ -282,8 +304,11 @@ def test_features_integration(tmp_path: Path):
 
     # (b) All derived feature columns are present
     required = [
-        "cum_oil", "cum_gas", "cum_water",
-        "gor", "water_cut",
+        "cum_oil",
+        "cum_gas",
+        "cum_water",
+        "gor",
+        "water_cut",
         "decline_rate",
         "OilProduced_rolling_3m",
         "OilProduced_lag_1",
@@ -323,13 +348,15 @@ def test_end_to_end_pipeline(tmp_path: Path):
     _make_synthetic_csv(raw_dir / "file3.csv", year=2021, n_rows=25)
 
     # --- ingest ---
-    ingest({
-        "ingest": {
-            **INGEST_CFG_TEMPLATE,
-            "raw_dir": str(raw_dir),
-            "interim_dir": str(interim_dir),
+    ingest(
+        {
+            "ingest": {
+                **INGEST_CFG_TEMPLATE,
+                "raw_dir": str(raw_dir),
+                "interim_dir": str(interim_dir),
+            }
         }
-    })
+    )
 
     # (a) boundary-ingest-transform
     ddf_ingest = dd.read_parquet(str(interim_dir), engine="pyarrow")
@@ -340,13 +367,15 @@ def test_end_to_end_pipeline(tmp_path: Path):
         assert col in df_ingest.columns
 
     # --- transform ---
-    transform({
-        "transform": {
-            **TRANSFORM_CFG_TEMPLATE,
-            "interim_dir": str(interim_dir),
-            "processed_dir": str(processed_dir),
+    transform(
+        {
+            "transform": {
+                **TRANSFORM_CFG_TEMPLATE,
+                "interim_dir": str(interim_dir),
+                "processed_dir": str(processed_dir),
+            }
         }
-    })
+    )
 
     # (b) boundary-transform-features
     ddf_transform = dd.read_parquet(str(processed_dir), engine="pyarrow")
@@ -356,13 +385,15 @@ def test_end_to_end_pipeline(tmp_path: Path):
     assert 10 <= ddf_transform.npartitions <= 50
 
     # --- features ---
-    features({
-        "features": {
-            **FEATURES_CFG_TEMPLATE,
-            "processed_dir": str(processed_dir),
-            "features_dir": str(features_dir),
+    features(
+        {
+            "features": {
+                **FEATURES_CFG_TEMPLATE,
+                "processed_dir": str(processed_dir),
+                "features_dir": str(features_dir),
+            }
         }
-    })
+    )
 
     # (c) TR-26 features guarantees
     ddf_features = dd.read_parquet(str(features_dir), engine="pyarrow")

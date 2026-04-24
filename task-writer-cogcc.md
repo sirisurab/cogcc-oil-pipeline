@@ -42,10 +42,9 @@
 
 <data-dictionaries>
   <file>references/production-data-dictionary.csv</file>
-  <description>Has columns: column, description, dtype, nullable.
-  This is the authoritative dtype source for all ingest, transform, and features
-  task specs. dtype and nullable values must be mapped to pandas types per the
-  rules in task-writer.md &lt;dtypes&gt; section.
+  <description>Use production-data-dictionary.csv as the authoritative data-type source for all
+  ingest, transform, and features task specs; data-type and nullable values must be
+  mapped to pandas types per the Data dictionary ADR in ADRs.md
   </description>
 </data-dictionaries>
 

@@ -73,10 +73,10 @@ _CANONICAL_COL_DTYPES: dict[str, str] = {
     "Well": "string",
     "DaysProduced": "float64",
     "DocNum": "float64",
-    "OpNumber": "string",
-    "FacilityId": "string",
+    "OpNumber": "float64",
+    "FacilityId": "float64",
     "AcceptedDate": "datetime64[us]",
-    "Revised": "string",
+    "Revised": "bool",
     "OilAdjustment": "float64",
     "OilGravity": "float64",
     "GasBtuSales": "float64",
@@ -235,6 +235,8 @@ def clean_partition(pdf: pd.DataFrame, config: dict) -> pd.DataFrame:
                 na_val = float("nan")
             elif target_dtype.startswith("datetime"):
                 na_val = pd.NaT
+            elif target_dtype == "bool":
+                na_val = False
             else:
                 na_val = pd.NA
             df[col] = pd.Series([na_val] * len(df), dtype=target_dtype)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 from pathlib import Path
 
 import dask.dataframe as dd
@@ -11,7 +10,6 @@ import pytest
 
 from cogcc_pipeline.ingest import (
     SchemaError,
-    _empty_frame,
     _partition_count,
     ingest,
     load_canonical_schema,
@@ -100,8 +98,17 @@ def _write_csv(tmp_path: Path, rows: list[dict], filename: str = "test.csv") -> 
 def test_schema_loads_all_columns():
     """Every column in TR-22 is present in the schema."""
     schema = load_canonical_schema(DICT_PATH)
-    for col in ["ApiCountyCode", "ApiSequenceNumber", "ReportYear", "ReportMonth",
-                "OilProduced", "WaterProduced", "DocNum", "OpNumber", "Well"]:
+    for col in [
+        "ApiCountyCode",
+        "ApiSequenceNumber",
+        "ReportYear",
+        "ReportMonth",
+        "OilProduced",
+        "WaterProduced",
+        "DocNum",
+        "OpNumber",
+        "Well",
+    ]:
         assert col in schema, f"Column {col} missing from schema"
 
 

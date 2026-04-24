@@ -173,9 +173,7 @@ def read_raw_file_to_frame(raw_path: str, schema: dict) -> pd.DataFrame:
                         range(len(raw_df))
                     )  # type: ignore[assignment]
                 else:
-                    result_cols[col_name] = pd.Series([], dtype=dtype).reindex(
-                        range(len(raw_df))
-                    )  # type: ignore[assignment]
+                    result_cols[col_name] = pd.Series([], dtype=dtype).reindex(range(len(raw_df)))  # type: ignore[assignment]
             # non-nullable absent is already caught above
         else:
             raw_series = raw_df[col_name].replace("", pd.NA)
@@ -222,11 +220,11 @@ def read_raw_file_to_frame(raw_path: str, schema: dict) -> pd.DataFrame:
 
 def _make_cat_dtype(schema: dict, col_name: str) -> pd.CategoricalDtype:
     """Return a CategoricalDtype for a column, extracting categories from schema.
-    
+
     Args:
         schema: The canonical schema dict.
         col_name: The column name to get categories for.
-    
+
     Returns:
         A pd.CategoricalDtype with the exact categories from the schema.
     """

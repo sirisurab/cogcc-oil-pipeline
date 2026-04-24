@@ -48,15 +48,11 @@ def build_download_targets(config: dict, current_year: int | None = None) -> lis
     if start_year is None:
         raise AcquireConfigError("acquire.start_year is not configured")
     if start_year > current_year:
-        raise AcquireConfigError(
-            f"start_year {start_year} is after current_year {current_year}"
-        )
+        raise AcquireConfigError(f"start_year {start_year} is after current_year {current_year}")
 
     base_url: str = config.get("base_url", "")
     raw_dir: str = config.get("raw_dir", "data/raw")
-    zip_url_tpl: str = config.get(
-        "zip_url_template", "{base_url}/{year}_prod_reports.zip"
-    )
+    zip_url_tpl: str = config.get("zip_url_template", "{base_url}/{year}_prod_reports.zip")
     monthly_url: str = config.get("monthly_url", "{base_url}/monthly_prod.csv")
 
     # Resolve template placeholders
@@ -248,8 +244,7 @@ def acquire(config: dict) -> list[dict]:
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {
-            executor.submit(download_target, t, config): i
-            for i, t in enumerate(targets)
+            executor.submit(download_target, t, config): i for i, t in enumerate(targets)
         }
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]

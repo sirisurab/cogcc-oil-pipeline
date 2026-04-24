@@ -283,7 +283,7 @@ def test_decline_rate_above_upper_bound_clipped():
     # Use prev=0.001, curr large... we need (prev-curr)/prev > 10
     # prev=1, curr=1000 → (1-1000)/1 = -999 → below lower. Try prev=100, curr=-1→NA
     # Actually: decline = (prev-curr)/prev. For above 10: prev=0.1, curr=-1→neg
-    # Use: prev=100, curr=100-(100*11)= -1000 which is negative. 
+    # Use: prev=100, curr=100-(100*11)= -1000 which is negative.
     # Better: small prev, big curr reduction ratio: prev=1, curr = 1-11*1 = -10 → negative
     # Let's directly test that a known sequence with >10 result is clipped:
     # prev=10, curr=10 - 10*11 = -100 → negative → replaced by null in physical bounds, but
@@ -342,8 +342,7 @@ def test_feature_column_presence(tmp_path: Path):
     processed_dir.mkdir()
     features_dir = tmp_path / "features"
 
-    production = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0,
-                  110.0, 120.0, 130.0]
+    production = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0]
     n = len(production)
     dates = pd.date_range(start="2022-01-01", periods=n, freq="MS")
     df = pd.DataFrame(
@@ -368,10 +367,14 @@ def test_feature_column_presence(tmp_path: Path):
 
     out = dd.read_parquet(str(features_dir), engine="pyarrow").compute()
     required_cols = [
-        "cum_oil", "cum_gas", "cum_water",
-        "gor", "water_cut",
+        "cum_oil",
+        "cum_gas",
+        "cum_water",
+        "gor",
+        "water_cut",
         "decline_rate",
-        "OilProduced_rolling_3m", "OilProduced_rolling_6m",
+        "OilProduced_rolling_3m",
+        "OilProduced_rolling_6m",
         "OilProduced_lag_1",
         "is_peak_oil_month",
     ]
@@ -382,7 +385,6 @@ def test_feature_column_presence(tmp_path: Path):
 @pytest.mark.unit
 def test_features_schema_stable_across_partitions(tmp_path: Path):
     """Schema sampled from two partitions is identical (TR-14)."""
-    import dask.dataframe as dd
 
     processed_dir = tmp_path / "processed"
     processed_dir.mkdir()
