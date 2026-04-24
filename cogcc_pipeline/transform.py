@@ -1,306 +1,418 @@
-"""Transform stage: clean, validate, derive columns, and write processed Parquet."""
+"""Transform stage — clean, sort, index, and write processed Parquet."""
+
+from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import dask.dataframe as dd
+import numpy as np
 import pandas as pd
-
-from cogcc_pipeline.utils import get_partition_count, load_config
+from distributed import Client
 
 logger = logging.getLogger(__name__)
 
-_VOLUME_COLS = [
+_WELL_STATUS_CATEGORIES = ["AB", "AC", "DG", "PA", "PR", "SI", "SO", "TA", "WO"]
+
+# Canonical column order for output (TR-14, TR-23: stable schema across partitions)
+_CANONICAL_COL_ORDER = [
+    "ApiCountyCode",
+    "ApiSequenceNumber",
+    "ApiSidetrack",
+    "ReportYear",
+    "ReportMonth",
     "OilProduced",
-    "OilSales",
     "GasProduced",
-    "GasSales",
-    "GasUsedOnLease",
-    "FlaredVented",
     "WaterProduced",
-]
-_PRESSURE_COLS = [
-    "GasPressureTubing",
-    "GasPressureCasing",
+    "OilSales",
+    "GasSales",
     "WaterPressureTubing",
     "WaterPressureCasing",
+    "GasPressureTubing",
+    "GasPressureCasing",
+    "WellStatus",
+    "OpName",
+    "Well",
+    "DaysProduced",
+    "DocNum",
+    "OpNumber",
+    "FacilityId",
+    "AcceptedDate",
+    "Revised",
+    "OilAdjustment",
+    "OilGravity",
+    "GasBtuSales",
+    "GasUsedOnLease",
+    "GasShrinkage",
+    "FlaredVented",
+    "BomInvent",
+    "EomInvent",
+    "FormationCode",
 ]
-_LEGAL_SUFFIXES = [", LLC", ", INC.", ", INC", ", LP", ", LTD", ", CORP", ", CO.", ", CO"]
+
+# Output dtypes for canonical columns added when missing (TR-14, TR-23)
+_CANONICAL_COL_DTYPES: dict[str, str] = {
+    "ApiCountyCode": "string",
+    "ApiSequenceNumber": "string",
+    "ApiSidetrack": "string",
+    "ReportYear": "float64",
+    "ReportMonth": "float64",
+    "OilProduced": "float64",
+    "GasProduced": "float64",
+    "WaterProduced": "float64",
+    "OilSales": "float64",
+    "GasSales": "float64",
+    "WaterPressureTubing": "float64",
+    "WaterPressureCasing": "float64",
+    "GasPressureTubing": "float64",
+    "GasPressureCasing": "float64",
+    "WellStatus": "string",
+    "OpName": "string",
+    "Well": "string",
+    "DaysProduced": "float64",
+    "DocNum": "float64",
+    "OpNumber": "string",
+    "FacilityId": "string",
+    "AcceptedDate": "datetime64[us]",
+    "Revised": "string",
+    "OilAdjustment": "float64",
+    "OilGravity": "float64",
+    "GasBtuSales": "float64",
+    "GasUsedOnLease": "float64",
+    "GasShrinkage": "float64",
+    "FlaredVented": "float64",
+    "BomInvent": "float64",
+    "EomInvent": "float64",
+    "FormationCode": "string",
+    "well_id": "string",
+    "production_date": "datetime64[us]",
+}
 
 
 # ---------------------------------------------------------------------------
-# TRN-01: Derive entity key and production date
+# Task T1 — Partition-level cleaning
 # ---------------------------------------------------------------------------
 
 
-def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Add well_id (canonical entity key) and production_date columns.
+def clean_partition(pdf: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Apply all partition-level cleaning rules.
 
-    Pure and stateless — called via map_partitions.
+    Input carries canonical schema and data-dictionary dtypes
+    (boundary-ingest-transform downstream reliance). This function does not
+    re-establish those.
+
+    Returns a DataFrame that satisfies the boundary-transform-features contract:
+    entity_col present, production_date present, categoricals clean.
+
+    Args:
+        pdf: Single partition from interim Parquet.
+        config: The ``transform`` section of config.yaml.
+
+    Returns:
+        Cleaned partition.
     """
-    county = df["ApiCountyCode"].fillna("").str.zfill(2)
-    seq = df["ApiSequenceNumber"].fillna("").str.zfill(5)
-    sidetrack = df["ApiSidetrack"].fillna("00").str.zfill(2)
+    if pdf.empty:
+        return _empty_clean_partition(pdf, config)
 
-    df = df.copy()
-    df["well_id"] = county + seq + sidetrack
-    df["production_date"] = pd.to_datetime(
-        {"year": df["ReportYear"], "month": df["ReportMonth"], "day": 1}
-    )
-    return df
+    entity_col: str = config.get("entity_col", "well_id")
+    date_col: str = config.get("date_col", "production_date")
+    api_county: str = config.get("api_county_col", "ApiCountyCode")
+    api_seq: str = config.get("api_sequence_col", "ApiSequenceNumber")
+    api_sidetrack: str = config.get("api_sidetrack_col", "ApiSidetrack")
+    min_year: int = int(config.get("min_report_year", 2020))
+    current_year: int = datetime.now().year
 
+    df = pdf.copy()
 
-# ---------------------------------------------------------------------------
-# TRN-02: Production volume validation and cleaning
-# ---------------------------------------------------------------------------
-
-
-def _clean_production_volumes(df: pd.DataFrame) -> pd.DataFrame:
-    """Enforce physical and domain validity rules on production volume columns.
-
-    Pure and stateless — called via map_partitions.
-    """
-    df = df.copy()
-
-    # Rule 1: Replace negative values with NA (TR-01, TR-05)
-    for col in _VOLUME_COLS:
+    # --- Build entity column (well identifier) from API components ---
+    def _str_col(col: str) -> pd.Series:
         if col in df.columns:
-            df[col] = df[col].where(df[col].isna() | (df[col] >= 0), other=pd.NA)  # type: ignore[call-overload]
+            return df[col].astype(str).str.strip().replace("nan", pd.NA).replace("<NA>", pd.NA)
+        return pd.Series([""] * len(df), dtype="string")
 
-    # Rule 2: Oil unit flag (TR-02)
+    county = _str_col(api_county)
+    seq = _str_col(api_seq)
+    sidetrack = _str_col(api_sidetrack)
+
+    entity_valid = county.notna() & seq.notna() & sidetrack.notna()
+    df[entity_col] = (county + "-" + seq + "-" + sidetrack).where(entity_valid, other=None)  # type: ignore[call-overload]
+
+    # --- Build production_date from ReportYear + ReportMonth ---
+    if "ReportYear" in df.columns and "ReportMonth" in df.columns:
+        year_s = pd.to_numeric(df["ReportYear"], errors="coerce")
+        month_s = pd.to_numeric(df["ReportMonth"], errors="coerce")
+        valid_date = year_s.notna() & month_s.notna()
+        df[date_col] = pd.NaT
+        if valid_date.any():
+            df.loc[valid_date, date_col] = pd.to_datetime(
+                year_s[valid_date].astype(int).astype(str)
+                + "-"
+                + month_s[valid_date].astype(int).astype(str).str.zfill(2)
+                + "-01",
+                format="%Y-%m-%d",
+                errors="coerce",
+            )
+    else:
+        df[date_col] = pd.NaT
+
+    # --- Drop rows missing entity or production_date ---
+    before_null_drop = len(df)
+    df = df[df[entity_col].notna() & df[date_col].notna()]
+    logger.debug("Dropped %d rows with null entity or date", before_null_drop - len(df))
+
+    if df.empty:
+        return _empty_clean_partition(pdf, config)
+
+    # --- Re-assert year filter (cheap, idempotent) ---
+    if "ReportYear" in df.columns:
+        year_s = pd.to_numeric(df["ReportYear"], errors="coerce")
+        df = df[year_s.between(min_year, current_year, inclusive="both")]
+
+    if df.empty:
+        return _empty_clean_partition(pdf, config)
+
+    # --- Deduplicate on (entity, production_date) — keep first (TR-15) ---
+    before_dedup = len(df)
+    df = df.drop_duplicates(subset=[entity_col, date_col], keep="first")
+    logger.debug("Dropped %d duplicate rows", before_dedup - len(df))
+
+    # --- Physical bound enforcement (TR-01, TR-05) ---
+    # Clip negative volumes to null sentinel (sensor error).
+    # Zeros are preserved (TR-05) — only strictly negative values are replaced.
+    physical_bounds: dict = config.get("physical_bounds", {})
+    volume_cols = [
+        "OilProduced",
+        "GasProduced",
+        "WaterProduced",
+        "OilSales",
+        "GasSales",
+        "WaterPressureTubing",
+        "WaterPressureCasing",
+        "GasPressureTubing",
+        "GasPressureCasing",
+    ]
+    for col in volume_cols:
+        if col in df.columns:
+            bounds = physical_bounds.get(col, {"min": 0.0, "max": None})
+            col_min = bounds.get("min")
+            if col_min is not None:
+                # Replace strictly-below-min with NA (preserves zeros when min=0)
+                numeric_col = pd.to_numeric(df[col], errors="coerce")
+                below_bound = numeric_col < col_min
+                df[col] = numeric_col.where(~below_bound, other=None)  # type: ignore[call-overload]
+
+    # --- Unit-consistency outlier detection (TR-02) ---
+    unit_cfg: dict = config.get("unit_consistency", {})
+    oil_max: float = float(unit_cfg.get("OilProduced_max_bbl_month", 50000.0))
     if "OilProduced" in df.columns:
-        df["oil_unit_flag"] = df["OilProduced"].fillna(0) > 50_000
+        oil_series = pd.to_numeric(df["OilProduced"], errors="coerce")
+        df["OilProduced"] = oil_series.where(oil_series <= oil_max, other=None)  # type: ignore[call-overload]
 
-    # Rule 3: Pressure column negative replacement (TR-01)
-    for col in _PRESSURE_COLS:
-        if col in df.columns:
-            df[col] = df[col].where(df[col].isna() | (df[col] >= 0), other=pd.NA)  # type: ignore[call-overload]
-
-    # Rule 4: DaysProduced range validation
-    if "DaysProduced" in df.columns:
-        dp = df["DaysProduced"]
-        df["DaysProduced"] = dp.where(dp.isna() | ((dp >= 0) & (dp <= 31)), other=pd.NA)  # type: ignore[call-overload]
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# TRN-03: Operator name normalization
-# ---------------------------------------------------------------------------
-
-
-def _normalize_operator_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize OpName values for grouping consistency.
-
-    Pure and stateless — called via map_partitions.
-    """
-    df = df.copy()
-
-    if "OpName" not in df.columns:
-        return df
-
-    s = df["OpName"]
-
-    # Step 1: Strip leading/trailing whitespace
-    s = s.str.strip()
-    # Step 2: Collapse internal multiple spaces
-    s = s.str.replace(r"\s+", " ", regex=True)
-    # Step 3: Uppercase
-    s = s.str.upper()
-    # Step 4: Remove legal suffixes (order matters — longer first to avoid partial matches)
-    for suffix in _LEGAL_SUFFIXES:
-        s = s.str.replace(suffix.upper() + "$", "", regex=True)
-        # Strip trailing comma/space that may remain after suffix removal
-        s = s.str.replace(r"[, ]+$", "", regex=True)
-
-    # Step 5: Empty or NA → NA
-    s = s.str.strip()
-    s = s.where(s.notna() & (s != ""), other=pd.NA)  # type: ignore[call-overload]
-
-    df["OpName"] = s
-    return df
-
-
-# ---------------------------------------------------------------------------
-# TRN-04: Deduplication
-# ---------------------------------------------------------------------------
-
-
-def _deduplicate(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove exact duplicates and apply well-month revision deduplication.
-
-    Pure and stateless — called via map_partitions.
-    Output row count is always <= input row count (TR-15).
-    """
-    df = df.copy()
-
-    # Rule 1: Exact duplicate removal
-    df = df.drop_duplicates()
-
-    # Rule 2: Well-month revision deduplication
-    key_cols = ["well_id", "ReportYear", "ReportMonth"]
-    # Only apply if all key columns are present
-    if all(c in df.columns for c in key_cols):
-        # Sort: Revised=True rows last, then by AcceptedDate ascending (NA last)
-        has_revised = "Revised" in df.columns
-        has_accepted = "AcceptedDate" in df.columns
-
-        sort_cols: list[str] = []
-        ascending: list[bool] = []
-
-        if has_revised:
-            # Convert Revised to bool-like for sorting (False < True → True rows are kept)
-            df["_revised_sort"] = df["Revised"].fillna(False).astype(bool)
-            sort_cols.append("_revised_sort")
-            ascending.append(True)  # True values come last → kept by drop_duplicates keep="last"
-
-        if has_accepted:
-            sort_cols.append("AcceptedDate")
-            ascending.append(True)
-
-        if sort_cols:
-            df = df.sort_values(sort_cols, ascending=ascending, na_position="first")
-
-        df = df.drop_duplicates(subset=key_cols, keep="last")
-
-        if "_revised_sort" in df.columns:
-            df = df.drop(columns=["_revised_sort"])
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# TRN-05: Well completeness gap detection
-# ---------------------------------------------------------------------------
-
-
-def check_well_completeness(ddf: dd.DataFrame) -> pd.DataFrame:
-    """Compute a summary of wells with unexpected gaps in monthly production records.
-
-    Returns a pandas DataFrame — calls .compute() once on aggregated result.
-    """
-
-    def _compute_gaps(df: pd.DataFrame) -> pd.DataFrame:
-        """Group-level gap computation applied after groupby."""
-        result_rows = []
-        for well_id, group in df.groupby("well_id"):
-            min_date = group["production_date"].min()
-            max_date = group["production_date"].max()
-            min_yr, min_mo = min_date.year, min_date.month
-            max_yr, max_mo = max_date.year, max_date.month
-            expected = (max_yr * 12 + max_mo) - (min_yr * 12 + min_mo) + 1
-            actual = len(group)
-            if actual < expected:
-                result_rows.append(
-                    {
-                        "well_id": well_id,
-                        "min_date": min_date,
-                        "max_date": max_date,
-                        "expected_months": expected,
-                        "actual_months": actual,
-                        "gap_count": expected - actual,
-                    }
-                )
-        return pd.DataFrame(result_rows)
-
-    # Reset index so well_id is a column
-    ddf_reset = ddf.reset_index()
-
-    # Compute the aggregation by partition, then combine
-    # Use a simple approach: aggregate min/max/count per well via Dask groupby
-    agg = (
-        ddf_reset.groupby("well_id")["production_date"]
-        .agg(["min", "max", "count"])
-        .compute()
-        .reset_index()
-    )
-    agg.columns = ["well_id", "min_date", "max_date", "actual_months"]
-
-    def _expected(row: pd.Series) -> int:
-        return (
-            (row["max_date"].year * 12 + row["max_date"].month)
-            - (row["min_date"].year * 12 + row["min_date"].month)
-            + 1
+    # --- Normalize OpName (non-null → stripped uppercase) ---
+    if "OpName" in df.columns:
+        mask_notnull = df["OpName"].notna()
+        df.loc[mask_notnull, "OpName"] = (
+            df.loc[mask_notnull, "OpName"].astype(str).str.strip().str.upper()
         )
 
-    agg["expected_months"] = agg.apply(_expected, axis=1)
-    agg["gap_count"] = agg["expected_months"] - agg["actual_months"]
+    # --- Cast WellStatus categorical (H2 — only declared values) ---
+    if "WellStatus" in df.columns:
+        mask_invalid = ~df["WellStatus"].isin(_WELL_STATUS_CATEGORIES) & df["WellStatus"].notna()
+        df.loc[mask_invalid, "WellStatus"] = pd.NA
+        df["WellStatus"] = df["WellStatus"].astype(
+            pd.CategoricalDtype(categories=_WELL_STATUS_CATEGORIES, ordered=False)
+        )
 
-    gaps = agg[agg["gap_count"] > 0].sort_values("gap_count", ascending=False)
-    return gaps[
-        ["well_id", "min_date", "max_date", "expected_months", "actual_months", "gap_count"]
-    ]
-
-
-# ---------------------------------------------------------------------------
-# TRN-06: Transform pipeline assembler
-# ---------------------------------------------------------------------------
-
-
-def run_transform(config_path: str = "config/config.yaml") -> None:
-    """Top-level entry point for the transform stage.
-
-    Reads interim Parquet, applies all cleaning/validation/derivation steps,
-    and writes processed Parquet to data/processed/.
-    """
-    config = load_config(config_path)
-    trn_cfg = config["transform"]
-
-    interim_dir = Path(trn_cfg["interim_dir"])
-    processed_dir = Path(trn_cfg["processed_dir"])
-
-    parquet_files = list(interim_dir.glob("*.parquet"))
-    if not parquet_files:
-        logger.warning("No Parquet files found in %s — transform skipped", interim_dir)
-        return
-
-    n = len(parquet_files)
-
-    try:
-        ddf = dd.read_parquet(str(interim_dir))
-
-        # Step 3: Add derived columns
-        meta_derived = _add_derived_columns(ddf._meta.copy())
-        ddf = ddf.map_partitions(_add_derived_columns, meta=meta_derived)
-
-        # Step 4: Clean production volumes
-        meta_cleaned = _clean_production_volumes(ddf._meta.copy())
-        ddf = ddf.map_partitions(_clean_production_volumes, meta=meta_cleaned)
-
-        # Step 5: Normalize operator names
-        meta_normalized = _normalize_operator_names(ddf._meta.copy())
-        ddf = ddf.map_partitions(_normalize_operator_names, meta=meta_normalized)
-
-        # Step 6: Deduplicate
-        meta_deduped = _deduplicate(ddf._meta.copy())
-        ddf = ddf.map_partitions(_deduplicate, meta=meta_deduped)
-
-        # Step 7: Set index on well_id
-        ddf = ddf.set_index("well_id", sorted=False, drop=True)
-
-        # Step 8: Sort by production_date within partitions
-        ddf = ddf.map_partitions(lambda df: df.sort_values("production_date"))
-
-        # Step 11: Well completeness diagnostic (before repartition)
-        try:
-            gaps_df = check_well_completeness(ddf)
-            if gaps_df.empty:
-                logger.info("Well completeness check: no gaps found")
+    # Ensure consistent column order across all partitions (TR-14, TR-23)
+    # Add all canonical columns to dataframe, filling missing with NA
+    for col in _CANONICAL_COL_ORDER:
+        if col not in df.columns:
+            target_dtype = _CANONICAL_COL_DTYPES.get(col, "object")
+            na_val: Any
+            if target_dtype.startswith("float"):
+                na_val = float("nan")
+            elif target_dtype.startswith("datetime"):
+                na_val = pd.NaT
             else:
-                top10 = gaps_df.head(10)
-                logger.warning("Well completeness gaps found:\n%s", top10.to_string())
-        except Exception as exc:
-            logger.warning("Well completeness check failed (non-blocking): %s", exc)
+                na_val = pd.NA
+            df[col] = pd.Series([na_val] * len(df), dtype=target_dtype)
+    # Use canonical order, then append any generated or extra columns
+    final_cols = list(_CANONICAL_COL_ORDER)
+    final_cols += [entity_col]
+    final_cols += [date_col]
+    # Remove duplicates while preserving order
+    final_cols = list(dict.fromkeys(final_cols))
+    result = df[final_cols].reset_index(drop=True)
 
-        # Step 9: Repartition
-        ddf = ddf.repartition(npartitions=get_partition_count(n))
+    # Guarantee WellStatus categorical dtype on all return paths (TR-14, TR-23)
+    if "WellStatus" in result.columns:
+        result["WellStatus"] = result["WellStatus"].astype(
+            pd.CategoricalDtype(categories=_WELL_STATUS_CATEGORIES, ordered=False)
+        )
 
-        # Step 10: Write Parquet
-        processed_dir.mkdir(parents=True, exist_ok=True)
-        ddf.to_parquet(str(processed_dir), write_index=True, overwrite=True)
+    # Normalize string dtypes to pd.StringDtype() for consistent meta (TR-23)
+    for col in result.columns:
+        if pd.api.types.is_string_dtype(result[col]) and result[col].dtype != pd.StringDtype():
+            try:
+                result[col] = result[col].astype(pd.StringDtype())
+            except Exception:
+                pass
 
-        logger.info("Transform complete: %d input partitions → %s", n, processed_dir)
+    # Normalize nullable dtypes to numpy equivalents for consistent meta (TR-23)
+    for col in result.columns:
+        if hasattr(result[col].dtype, "numpy_dtype"):
+            numpy_target = result[col].dtype.numpy_dtype  # type: ignore[union-attr]
+            # Normalize integers to float64 to allow NaN representation
+            if np.issubdtype(numpy_target, np.integer):
+                numpy_target = np.dtype("float64")
+            try:
+                result[col] = result[col].astype(numpy_target)
+            except Exception:
+                pass
 
-    except Exception as exc:
-        logger.error("Transform stage failed: %s", exc)
-        raise
+    return result
+
+
+def _empty_clean_partition(pdf: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Return a zero-row output frame with the correct output schema."""
+    entity_col: str = config.get("entity_col", "well_id")
+    date_col: str = config.get("date_col", "production_date")
+
+    df = pdf.iloc[:0].copy()
+    if entity_col not in df.columns:
+        df[entity_col] = pd.Series([], dtype="string")
+    else:
+        df[entity_col] = pd.Series([], dtype="string")
+    if date_col not in df.columns:
+        df[date_col] = pd.Series([], dtype="datetime64[ns]")
+    else:
+        df[date_col] = pd.Series([], dtype="datetime64[ns]")
+    if "WellStatus" in df.columns:
+        df["WellStatus"] = pd.Series(
+            [], dtype=pd.CategoricalDtype(categories=_WELL_STATUS_CATEGORIES, ordered=False)
+        )
+    # Convert any remaining object dtype columns to string to avoid pyarrow serialization issues
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].astype("string")
+    # Ensure consistent column order across all partitions (TR-14, TR-23)
+    # Add all canonical columns to dataframe, filling missing with NA
+    for col in _CANONICAL_COL_ORDER:
+        if col not in df.columns:
+            target_dtype = _CANONICAL_COL_DTYPES.get(col, "object")
+            df[col] = pd.Series([], dtype=target_dtype)
+    # Use canonical order, then append any generated or extra columns
+    final_cols = list(_CANONICAL_COL_ORDER)
+    final_cols += [entity_col]
+    final_cols += [date_col]
+    # Remove duplicates while preserving order
+    final_cols = list(dict.fromkeys(final_cols))
+    result = df[final_cols].reset_index(drop=True)
+
+    # Normalize string dtypes to pd.StringDtype() for consistent meta (TR-23)
+    for col in result.columns:
+        if pd.api.types.is_string_dtype(result[col]) and result[col].dtype != pd.StringDtype():
+            try:
+                result[col] = result[col].astype(pd.StringDtype())
+            except Exception:
+                pass
+
+    # Normalize nullable dtypes to numpy equivalents for consistent meta (TR-23)
+    for col in result.columns:
+        if hasattr(result[col].dtype, "numpy_dtype"):
+            numpy_target = result[col].dtype.numpy_dtype  # type: ignore[union-attr]
+            # Normalize integers to float64 to allow NaN representation
+            if np.issubdtype(numpy_target, np.integer):
+                numpy_target = np.dtype("float64")
+            try:
+                result[col] = result[col].astype(numpy_target)
+            except Exception:
+                pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Task T2 — Stage orchestration: clean, sort, index, partition, write
+# ---------------------------------------------------------------------------
+
+
+def _partition_count(n: int, cfg_min: int = 10, cfg_max: int = 50) -> int:
+    return max(cfg_min, min(n, cfg_max))
+
+
+def transform(config: dict) -> None:
+    """Stage entry point. Read interim Parquet, clean, sort, index, write.
+
+    Sort by production_date is applied per-partition AFTER set_index since
+    set_index's shuffle destroys prior ordering (H1). set_index is the last
+    structural operation before repartition and write (H4).
+
+    Meta derivation: call clean_partition on zero-row real input (ADR-003).
+
+    Args:
+        config: Full pipeline config dict (uses ``transform`` sub-section).
+    """
+    transform_cfg: dict = config.get("transform", config)
+    interim_dir = Path(transform_cfg.get("interim_dir", "data/interim"))
+    processed_dir = Path(transform_cfg.get("processed_dir", "data/processed"))
+    entity_col: str = transform_cfg.get("entity_col", "well_id")
+    date_col: str = transform_cfg.get("date_col", "production_date")
+    p_min: int = int(transform_cfg.get("partition_min", 10))
+    p_max: int = int(transform_cfg.get("partition_max", 50))
+
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    # Reuse existing distributed client (build-env-manifest)
+    try:
+        Client.current()
+    except ValueError:
+        pass  # no client; Dask uses default scheduler
+
+    ddf = dd.read_parquet(str(interim_dir), engine="pyarrow")
+    logger.info("Loaded interim Parquet: %d partitions", ddf.npartitions)
+
+    # Meta derivation per ADR-003: call actual function on zero-row real input
+    meta_sample = ddf._meta.copy()
+    meta_df = clean_partition(meta_sample, transform_cfg)
+
+    ddf_clean = ddf.map_partitions(clean_partition, transform_cfg, meta=meta_df)
+
+    # Resolve H1 + H4:
+    # - set_index on entity_col triggers distributed shuffle (destroys sort)
+    # - After set_index, map_partitions to sort within each partition by date
+    # - repartition is last op before write (ADR-004 H3)
+    #
+    # To satisfy boundary-transform-features (sorted by production_date within
+    # each partition at stage exit), we sort AFTER set_index via map_partitions.
+
+    # set_index on entity_col — last structural operation (H4)
+    ddf_indexed = ddf_clean.set_index(entity_col, drop=True, sorted=False)
+
+    # Sort within each partition by date AFTER set_index (resolves H1)
+    def _sort_partition(part: pd.DataFrame) -> pd.DataFrame:
+        if date_col in part.columns and not part.empty:
+            return part.sort_values(date_col, kind="stable")
+        return part
+
+    sort_meta = ddf_indexed._meta.copy()
+    ddf_sorted = ddf_indexed.map_partitions(_sort_partition, meta=sort_meta)
+
+    n_parts = _partition_count(ddf_sorted.npartitions, p_min, p_max)
+    ddf_out = ddf_sorted.repartition(npartitions=n_parts)
+
+    # Convert WellStatus from categorical to string to ensure consistent dtypes across partitions (TR-14, TR-23)
+    if "WellStatus" in ddf_out.columns:
+        ddf_out = ddf_out.assign(WellStatus=ddf_out["WellStatus"].astype("string"))
+
+    logger.info("Writing processed Parquet to %s (%d partitions)", processed_dir, n_parts)
+    # Single compute at write (ADR-005)
+    ddf_out.to_parquet(
+        str(processed_dir),
+        engine="pyarrow",
+        write_index=True,
+        overwrite=True,
+    )
+    logger.info("Transform complete — processed Parquet written")

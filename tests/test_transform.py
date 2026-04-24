@@ -1,672 +1,462 @@
-"""Tests for the transform stage (TRN-01 through TRN-07, TR-01 through TR-23)."""
+"""Unit tests for cogcc_pipeline.transform."""
 
-import random
+from __future__ import annotations
+
 from pathlib import Path
 
 import dask.dataframe as dd
-import numpy as np
 import pandas as pd
 import pytest
 
-from cogcc_pipeline.transform import (
-    _add_derived_columns,
-    _clean_production_volumes,
-    _deduplicate,
-    _normalize_operator_names,
-    check_well_completeness,
-    run_transform,
-)
+from cogcc_pipeline.transform import _partition_count, clean_partition, transform
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+DICT_PATH = "references/production-data-dictionary.csv"
 
-_WELL_STATUS_CATS = ["AB", "AC", "DG", "PA", "PR", "SI", "SO", "TA", "WO"]
-
-
-def _make_interim_df(
-    n_wells: int = 2,
-    months_per_well: int = 6,
-    start_year: int = 2021,
-    include_negatives: bool = False,
-) -> pd.DataFrame:
-    """Create a synthetic interim-stage DataFrame."""
-    rows = []
-    for w in range(n_wells):
-        api_county = f"{w + 1:02d}"
-        api_seq = f"{w + 1:05d}"
-        api_side = "00"
-        for m in range(months_per_well):
-            month = (m % 12) + 1
-            year = start_year + m // 12
-            oil = -100.0 if include_negatives and m == 0 else float(100 + m * 10)
-            rows.append(
-                {
-                    "DocNum": 1000 + w * 100 + m,
-                    "ReportMonth": month,
-                    "ReportYear": year,
-                    "DaysProduced": 28,
-                    "AcceptedDate": pd.Timestamp(f"{year}-{month:02d}-15"),
-                    "Revised": False,
-                    "OpName": f"Operator {w + 1}, LLC",
-                    "OpNumber": 100 + w,
-                    "FacilityId": 200 + w,
-                    "ApiCountyCode": api_county,
-                    "ApiSequenceNumber": api_seq,
-                    "ApiSidetrack": api_side,
-                    "Well": f"WELL-{w + 1}",
-                    "WellStatus": pd.Categorical(["AC"], categories=_WELL_STATUS_CATS)[0],
-                    "FormationCode": "WATTE",
-                    "OilProduced": oil,
-                    "OilSales": oil * 0.95,
-                    "OilAdjustment": 0.0,
-                    "OilGravity": 38.5,
-                    "GasProduced": 500.0 + m * 5,
-                    "GasSales": 480.0,
-                    "GasBtuSales": 1000.0,
-                    "GasUsedOnLease": 10.0,
-                    "GasShrinkage": 5.0,
-                    "GasPressureTubing": 200.0,
-                    "GasPressureCasing": 210.0,
-                    "WaterProduced": 50.0,
-                    "WaterPressureTubing": 100.0,
-                    "WaterPressureCasing": 105.0,
-                    "FlaredVented": 2.0,
-                    "BomInvent": 0.0,
-                    "EomInvent": 0.0,
-                }
-            )
-    df = pd.DataFrame(rows)
-    df["WellStatus"] = pd.Categorical(df["WellStatus"], categories=_WELL_STATUS_CATS)
-    df["DaysProduced"] = df["DaysProduced"].astype("Int64")
-    df["DocNum"] = df["DocNum"].astype("Int64")
-    df["ReportYear"] = df["ReportYear"].astype("int64")
-    df["ReportMonth"] = df["ReportMonth"].astype("int64")
-    return df
+TRANSFORM_CFG = {
+    "interim_dir": "data/interim",
+    "processed_dir": "data/processed",
+    "entity_col": "well_id",
+    "date_col": "production_date",
+    "api_county_col": "ApiCountyCode",
+    "api_sequence_col": "ApiSequenceNumber",
+    "api_sidetrack_col": "ApiSidetrack",
+    "min_report_year": 2020,
+    "partition_min": 10,
+    "partition_max": 50,
+    "physical_bounds": {
+        "OilProduced": {"min": 0.0, "max": None},
+        "GasProduced": {"min": 0.0, "max": None},
+        "WaterProduced": {"min": 0.0, "max": None},
+        "OilSales": {"min": 0.0, "max": None},
+        "GasSales": {"min": 0.0, "max": None},
+        "WaterPressureTubing": {"min": 0.0, "max": None},
+        "WaterPressureCasing": {"min": 0.0, "max": None},
+        "GasPressureTubing": {"min": 0.0, "max": None},
+        "GasPressureCasing": {"min": 0.0, "max": None},
+    },
+    "unit_consistency": {
+        "OilProduced_max_bbl_month": 50000.0,
+    },
+}
 
 
-def _write_interim_parquet(tmp_path: Path, df: pd.DataFrame) -> Path:
-    interim_dir = tmp_path / "interim"
-    interim_dir.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(str(interim_dir / "part.0.parquet"), index=False)
-    return interim_dir
-
-
-def _make_transform_config(tmp_path: Path, interim_dir: Path) -> str:
-    import yaml
-
-    processed_dir = tmp_path / "processed"
-    cfg_data = {
-        "acquire": {
-            "base_url_historical": "http://x/{year}.zip",
-            "base_url_current": "http://x/cur.csv",
-            "start_year": 2020,
-            "end_year": 2021,
-            "raw_dir": "data/raw",
-            "max_workers": 2,
-            "sleep_per_worker": 0.0,
-            "timeout": 10,
-            "max_retries": 1,
-            "backoff_multiplier": 1,
-        },
-        "dask": {
-            "scheduler": "local",
-            "n_workers": 2,
-            "threads_per_worker": 1,
-            "memory_limit": "512MB",
-            "dashboard_port": 8787,
-        },
-        "logging": {"log_file": str(tmp_path / "logs/p.log"), "level": "INFO"},
-        "ingest": {"raw_dir": "data/raw", "interim_dir": str(interim_dir), "start_year": 2020},
-        "transform": {"interim_dir": str(interim_dir), "processed_dir": str(processed_dir)},
-        "features": {"processed_dir": str(processed_dir), "features_dir": str(tmp_path / "feat")},
+def _make_partition(**overrides: object) -> pd.DataFrame:
+    """Create a minimal synthetic partition for transform tests."""
+    base = {
+        "ApiCountyCode": ["01"],
+        "ApiSequenceNumber": ["12345"],
+        "ApiSidetrack": ["00"],
+        "ReportYear": [2022],
+        "ReportMonth": [6],
+        "OilProduced": [100.0],
+        "GasProduced": [500.0],
+        "WaterProduced": [50.0],
+        "OilSales": [95.0],
+        "GasSales": [490.0],
+        "WaterPressureTubing": [100.0],
+        "WaterPressureCasing": [105.0],
+        "GasPressureTubing": [200.0],
+        "GasPressureCasing": [210.0],
+        "WellStatus": ["AC"],
+        "OpName": "operator a",
+        "Well": ["WELL 1"],
     }
-    cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text(yaml.dump(cfg_data))
-    return str(cfg_file)
+    base.update(overrides)
+    return pd.DataFrame(base)
 
 
 # ---------------------------------------------------------------------------
-# TRN-01: _add_derived_columns tests
+# Task T1 tests
 # ---------------------------------------------------------------------------
 
 
-def test_add_derived_columns_well_id_correct():
-    df = pd.DataFrame(
-        [
-            {
-                "ApiCountyCode": "01",
-                "ApiSequenceNumber": "00123",
-                "ApiSidetrack": "00",
-                "ReportYear": 2021,
-                "ReportMonth": 6,
-            }
-        ]
-    )
-    result = _add_derived_columns(df)
-    assert result["well_id"].iloc[0] == "010012300"
+@pytest.mark.unit
+def test_clean_partition_negative_oil_replaced(tmp_path: Path):
+    """Negative OilProduced is replaced with NA (TR-01)."""
+    pdf = _make_partition(OilProduced=[-100.0])
+    result = clean_partition(pdf, TRANSFORM_CFG)
+    assert pd.isna(result["OilProduced"].iloc[0])
 
 
-def test_add_derived_columns_padding():
-    df = pd.DataFrame(
-        [
-            {
-                "ApiCountyCode": "5",
-                "ApiSequenceNumber": "456",
-                "ApiSidetrack": None,
-                "ReportYear": 2021,
-                "ReportMonth": 6,
-            }
-        ]
-    )
-    result = _add_derived_columns(df)
-    assert result["well_id"].iloc[0] == "050045600"
+@pytest.mark.unit
+def test_clean_partition_oil_above_unit_threshold_replaced(tmp_path: Path):
+    """Oil above 50,000 BBL/month replaced with NA (TR-02)."""
+    pdf = _make_partition(OilProduced=[99999.0])
+    result = clean_partition(pdf, TRANSFORM_CFG)
+    assert pd.isna(result["OilProduced"].iloc[0])
 
 
-def test_add_derived_columns_production_date():
-    df = pd.DataFrame(
-        [
-            {
-                "ApiCountyCode": "01",
-                "ApiSequenceNumber": "00123",
-                "ApiSidetrack": "00",
-                "ReportYear": 2021,
-                "ReportMonth": 6,
-            }
-        ]
-    )
-    result = _add_derived_columns(df)
-    assert result["production_date"].iloc[0] == pd.Timestamp("2021-06-01")
+@pytest.mark.unit
+def test_clean_partition_dedup_reduces_rows(tmp_path: Path):
+    """Duplicate (entity, date) rows are removed; row count ≤ input (TR-15)."""
+    pdf = pd.concat([_make_partition(), _make_partition()], ignore_index=True)
+    assert len(pdf) == 2
+    result = clean_partition(pdf, TRANSFORM_CFG)
+    assert len(result) <= 2
+    assert len(result) == 1
 
 
-def test_add_derived_columns_production_date_dtype():
-    df = pd.DataFrame(
-        [
-            {
-                "ApiCountyCode": "01",
-                "ApiSequenceNumber": "00123",
-                "ApiSidetrack": "00",
-                "ReportYear": 2021,
-                "ReportMonth": 6,
-            }
-        ]
-    )
-    result = _add_derived_columns(df)
-    assert np.issubdtype(result["production_date"].dtype, np.datetime64)
+@pytest.mark.unit
+def test_clean_partition_dedup_idempotent(tmp_path: Path):
+    """Running clean_partition twice gives identical output (TR-15)."""
+    pdf = pd.concat([_make_partition(), _make_partition()], ignore_index=True)
+    result1 = clean_partition(pdf, TRANSFORM_CFG)
+    result2 = clean_partition(result1, TRANSFORM_CFG)
+    pd.testing.assert_frame_equal(result1.reset_index(drop=True), result2.reset_index(drop=True))
 
 
-def test_add_derived_columns_well_id_dtype():
-    df = pd.DataFrame(
-        [
-            {
-                "ApiCountyCode": "01",
-                "ApiSequenceNumber": "00123",
-                "ApiSidetrack": "00",
-                "ReportYear": 2021,
-                "ReportMonth": 6,
-            }
-        ]
-    )
-    result = _add_derived_columns(df)
-    assert result["well_id"].dtype == object or isinstance(result["well_id"].dtype, pd.StringDtype)
+@pytest.mark.unit
+def test_clean_partition_zero_oil_preserved(tmp_path: Path):
+    """OilProduced=0 stays zero — not converted to NA (TR-05)."""
+    pdf = _make_partition(OilProduced=[0.0])
+    result = clean_partition(pdf, TRANSFORM_CFG)
+    assert float(result["OilProduced"].iloc[0]) == 0.0
 
 
-def test_add_derived_columns_empty_df_meta():
-    """TR-23: empty DataFrame with correct schema produces same columns as meta."""
-    full_df = _make_interim_df(1, 1)
-    empty_df = full_df.iloc[:0].copy()
-    result = _add_derived_columns(empty_df)
+@pytest.mark.unit
+def test_clean_partition_null_entity_rows_dropped(tmp_path: Path):
+    """Rows with null ApiCountyCode → entity is null → row dropped."""
+    pdf = _make_partition(ApiCountyCode=[None])
+    result = clean_partition(pdf, TRANSFORM_CFG)
+    assert len(result) == 0
+
+
+@pytest.mark.unit
+def test_clean_partition_empty_input_returns_full_schema(tmp_path: Path):
+    """Empty partition → empty output with full output schema (ADR-003, TR-23)."""
+    pdf = _make_partition().iloc[:0]
+    result = clean_partition(pdf, TRANSFORM_CFG)
+    assert len(result) == 0
     assert "well_id" in result.columns
     assert "production_date" in result.columns
 
 
+@pytest.mark.unit
+def test_clean_partition_opname_normalized(tmp_path: Path):
+    """OpName is stripped and uppercased."""
+    pdf = _make_partition()
+    pdf["OpName"] = "  operator lowercase  "
+    result = clean_partition(pdf, TRANSFORM_CFG)
+    assert result["OpName"].iloc[0] == "OPERATOR LOWERCASE"
+
+
 # ---------------------------------------------------------------------------
-# TRN-02: _clean_production_volumes tests
+# Task T2 tests
 # ---------------------------------------------------------------------------
 
 
-def _vol_df(**overrides) -> pd.DataFrame:
-    base = {
-        "OilProduced": 100.0,
-        "OilSales": 90.0,
-        "GasProduced": 500.0,
-        "GasSales": 450.0,
-        "GasUsedOnLease": 10.0,
-        "FlaredVented": 2.0,
-        "WaterProduced": 50.0,
-        "GasPressureTubing": 200.0,
-        "GasPressureCasing": 210.0,
-        "WaterPressureTubing": 100.0,
-        "WaterPressureCasing": 105.0,
-        "DaysProduced": pd.array([28], dtype="Int64")[0],
+def _write_interim_parquet(tmp_path: Path, rows: int = 5) -> Path:
+    """Write a synthetic interim Parquet for transform integration-style unit tests."""
+    base_cols = {
+        "ApiCountyCode": ["01"] * rows,
+        "ApiSequenceNumber": ["12345"] * rows,
+        "ApiSidetrack": ["00"] * rows,
+        "ReportYear": [2022] * rows,
+        "ReportMonth": list(range(1, rows + 1)),
+        "OilProduced": [float(i * 10) for i in range(rows)],
+        "GasProduced": [float(i * 50) for i in range(rows)],
+        "WaterProduced": [float(i * 5) for i in range(rows)],
+        "OilSales": [float(i * 9) for i in range(rows)],
+        "GasSales": [float(i * 45) for i in range(rows)],
+        "WaterPressureTubing": [100.0] * rows,
+        "WaterPressureCasing": [105.0] * rows,
+        "GasPressureTubing": [200.0] * rows,
+        "GasPressureCasing": [210.0] * rows,
+        "WellStatus": ["AC"] * rows,
+        "OpName": ["OPERATOR A"] * rows,
+        "Well": ["WELL 1"] * rows,
+        "DaysProduced": [30] * rows,
+        "DocNum": [12345] * rows,
+        "OpNumber": [1] * rows,
+        "FacilityId": [99] * rows,
+        "AcceptedDate": pd.to_datetime(["2022-07-01"] * rows),
+        "Revised": [False] * rows,
+        "OilAdjustment": [0.0] * rows,
+        "OilGravity": [42.0] * rows,
+        "GasBtuSales": [1000.0] * rows,
+        "GasUsedOnLease": [10.0] * rows,
+        "GasShrinkage": [5.0] * rows,
+        "FlaredVented": [0.0] * rows,
+        "BomInvent": [0.0] * rows,
+        "EomInvent": [0.0] * rows,
+        "FormationCode": ["CODELL"] * rows,
     }
-    base.update(overrides)
-    return pd.DataFrame([base])
+    df = pd.DataFrame(base_cols)
+    interim = tmp_path / "interim"
+    interim.mkdir()
+    df.to_parquet(interim / "part.0.parquet", index=False)
+    return interim
 
 
-def test_clean_volumes_negative_oil_becomes_na():
-    df = _vol_df(OilProduced=-100.0)
-    result = _clean_production_volumes(df)
-    assert pd.isna(result["OilProduced"].iloc[0])
+@pytest.mark.unit
+def test_transform_writes_readable_parquet(tmp_path: Path):
+    """Processed Parquet is written and readable after transform (TR-18)."""
+    interim = _write_interim_parquet(tmp_path)
+    processed = tmp_path / "processed"
 
-
-def test_clean_volumes_zero_oil_preserved():
-    df = _vol_df(OilProduced=0.0)
-    result = _clean_production_volumes(df)
-    assert result["OilProduced"].iloc[0] == 0.0
-
-
-def test_clean_volumes_oil_unit_flag_high():
-    df = _vol_df(OilProduced=51000.0)
-    result = _clean_production_volumes(df)
-    assert result["oil_unit_flag"].iloc[0]
-    assert result["OilProduced"].iloc[0] == 51000.0  # not nulled
-
-
-def test_clean_volumes_oil_unit_flag_normal():
-    df = _vol_df(OilProduced=100.0)
-    result = _clean_production_volumes(df)
-    assert not result["oil_unit_flag"].iloc[0]
-
-
-def test_clean_volumes_negative_gas():
-    df = _vol_df(GasProduced=-5.0)
-    result = _clean_production_volumes(df)
-    assert pd.isna(result["GasProduced"].iloc[0])
-
-
-def test_clean_volumes_zero_water_preserved():
-    df = _vol_df(WaterProduced=0.0)
-    result = _clean_production_volumes(df)
-    assert result["WaterProduced"].iloc[0] == 0.0
-
-
-def test_clean_volumes_negative_pressure():
-    df = _vol_df(GasPressureTubing=-10.0)
-    result = _clean_production_volumes(df)
-    assert pd.isna(result["GasPressureTubing"].iloc[0])
-
-
-def test_clean_volumes_days_produced_out_of_range():
-    df = _vol_df()
-    df["DaysProduced"] = pd.array([35], dtype="Int64")
-    result = _clean_production_volumes(df)
-    assert pd.isna(result["DaysProduced"].iloc[0])
-
-
-def test_clean_volumes_days_produced_zero_preserved():
-    df = _vol_df()
-    df["DaysProduced"] = pd.array([0], dtype="Int64")
-    result = _clean_production_volumes(df)
-    assert result["DaysProduced"].iloc[0] == 0
-
-
-def test_clean_volumes_empty_df_meta():
-    """TR-23: empty DataFrame schema matches meta."""
-    full_df = _make_interim_df(1, 1)
-    derived = _add_derived_columns(full_df)
-    empty_df = derived.iloc[:0].copy()
-    result = _clean_production_volumes(empty_df)
-    assert "oil_unit_flag" in result.columns
-
-
-# ---------------------------------------------------------------------------
-# TRN-03: _normalize_operator_names tests
-# ---------------------------------------------------------------------------
-
-
-def _opname_df(name) -> pd.DataFrame:
-    return pd.DataFrame([{"OpName": name}])
-
-
-def test_normalize_strips_llc():
-    df = _opname_df("  Devon Energy Corp , LLC  ")
-    result = _normalize_operator_names(df)
-    assert result["OpName"].iloc[0] == "DEVON ENERGY CORP"
-
-
-def test_normalize_strips_inc_dot():
-    df = _opname_df("Continental Resources, Inc.")
-    result = _normalize_operator_names(df)
-    assert result["OpName"].iloc[0] == "CONTINENTAL RESOURCES"
-
-
-def test_normalize_no_change():
-    df = _opname_df("ENERPLUS RESOURCES")
-    result = _normalize_operator_names(df)
-    assert result["OpName"].iloc[0] == "ENERPLUS RESOURCES"
-
-
-def test_normalize_na_remains_na():
-    df = pd.DataFrame([{"OpName": pd.NA}])
-    result = _normalize_operator_names(df)
-    assert pd.isna(result["OpName"].iloc[0])
-
-
-def test_normalize_empty_string_becomes_na():
-    df = _opname_df("")
-    result = _normalize_operator_names(df)
-    assert pd.isna(result["OpName"].iloc[0])
-
-
-def test_normalize_double_space_lp():
-    df = _opname_df("PDC  Energy,  LP")
-    result = _normalize_operator_names(df)
-    assert result["OpName"].iloc[0] == "PDC ENERGY"
-
-
-def test_normalize_empty_df_meta():
-    """TR-23: empty DataFrame schema matches meta."""
-    full_df = _make_interim_df(1, 1)
-    empty_df = full_df.iloc[:0].copy()
-    result = _normalize_operator_names(empty_df)
-    assert "OpName" in result.columns
-
-
-# ---------------------------------------------------------------------------
-# TRN-04: _deduplicate tests
-# ---------------------------------------------------------------------------
-
-
-def _dup_df(rows: list[dict]) -> pd.DataFrame:
-    df = pd.DataFrame(rows)
-    if "WellStatus" not in df.columns:
-        df["WellStatus"] = pd.Categorical(["AC"] * len(df), categories=_WELL_STATUS_CATS)
-    if "AcceptedDate" not in df.columns:
-        df["AcceptedDate"] = pd.NaT
-    if "Revised" not in df.columns:
-        df["Revised"] = pd.array([False] * len(df), dtype="boolean")
-    return df
-
-
-def _base_row(**overrides) -> dict:
-    base = {
-        "well_id": "010000100",
-        "ReportYear": 2021,
-        "ReportMonth": 1,
-        "OilProduced": 100.0,
-        "Revised": False,
-        "AcceptedDate": pd.Timestamp("2021-02-01"),
+    cfg = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed),
+        }
     }
-    base.update(overrides)
-    return base
+    transform(cfg)
+
+    ddf = dd.read_parquet(str(processed), engine="pyarrow")
+    df = ddf.compute()
+    assert len(df) > 0
 
 
-def test_dedup_exact_duplicates():
-    row = _base_row()
-    df = _dup_df([row, row, row, row, row])
-    result = _deduplicate(df)
-    assert len(result) == 1
+@pytest.mark.unit
+def test_transform_entity_index_established(tmp_path: Path):
+    """Processed Parquet has entity column as index."""
+    interim = _write_interim_parquet(tmp_path)
+    processed = tmp_path / "processed"
 
-
-def test_dedup_revised_true_kept():
-    original = _base_row(Revised=False)
-    revised = _base_row(Revised=True, OilProduced=110.0)
-    df = _dup_df([original, revised])
-    result = _deduplicate(df)
-    assert len(result) == 1
-    assert result["OilProduced"].iloc[0] == 110.0
-
-
-def test_dedup_latest_accepted_date_kept():
-    r1 = _base_row(Revised=True, AcceptedDate=pd.Timestamp("2021-02-01"), OilProduced=100.0)
-    r2 = _base_row(Revised=True, AcceptedDate=pd.Timestamp("2021-03-15"), OilProduced=120.0)
-    df = _dup_df([r1, r2])
-    result = _deduplicate(df)
-    assert len(result) == 1
-    assert result["OilProduced"].iloc[0] == 120.0
-
-
-def test_dedup_row_count_never_increases():
-    random.seed(42)
-    rows = [
-        _base_row(
-            well_id=f"0100{random.randint(0, 3):05d}0",
-            ReportMonth=random.randint(1, 12),
-            OilProduced=float(random.randint(50, 200)),
-        )
-        for _ in range(100)
-    ]
-    # Add 30% duplicates
-    for i in range(30):
-        rows.append(rows[random.randint(0, 99)])
-    df = _dup_df(rows)
-    result = _deduplicate(df)
-    assert len(result) <= len(df)
-
-
-def test_dedup_idempotent():
-    rows = [_base_row(), _base_row(OilProduced=110.0, Revised=True)]
-    df = _dup_df(rows)
-    result1 = _deduplicate(df)
-    result2 = _deduplicate(result1)
-    assert len(result1) == len(result2)
-
-
-def test_dedup_empty_df_meta():
-    """TR-23: empty DataFrame schema matches meta."""
-    full_df = _make_interim_df(1, 1)
-    derived = _add_derived_columns(full_df)
-    empty_df = derived.iloc[:0].copy()
-    result = _deduplicate(empty_df)
-    assert isinstance(result, pd.DataFrame)
-
-
-# ---------------------------------------------------------------------------
-# TRN-05: check_well_completeness tests
-# ---------------------------------------------------------------------------
-
-
-def _make_dask_df(rows: list[dict]) -> dd.DataFrame:
-    df = pd.DataFrame(rows)
-    df["production_date"] = pd.to_datetime(df["production_date"])
-    return dd.from_pandas(df.set_index("well_id"), npartitions=1)
-
-
-def test_well_completeness_no_gaps():
-    rows = [
-        {"well_id": "010000100", "production_date": pd.Timestamp(f"2021-{m:02d}-01")}
-        for m in range(1, 13)
-    ]
-    ddf = _make_dask_df(rows)
-    result = check_well_completeness(ddf)
-    assert result.empty
-
-
-def test_well_completeness_with_gap():
-    rows = [
-        {"well_id": "010000100", "production_date": pd.Timestamp("2021-01-01")},
-        {"well_id": "010000100", "production_date": pd.Timestamp("2021-02-01")},
-        # March missing
-        {"well_id": "010000100", "production_date": pd.Timestamp("2021-04-01")},
-    ]
-    ddf = _make_dask_df(rows)
-    result = check_well_completeness(ddf)
-    assert len(result) == 1
-    assert result.iloc[0]["expected_months"] == 4
-    assert result.iloc[0]["actual_months"] == 3
-    assert result.iloc[0]["gap_count"] == 1
-
-
-def test_well_completeness_only_gapped_well_returned():
-    rows_nogap = [
-        {"well_id": "010000100", "production_date": pd.Timestamp(f"2021-{m:02d}-01")}
-        for m in range(1, 7)
-    ]
-    rows_gap = [
-        {"well_id": "020000100", "production_date": pd.Timestamp("2021-01-01")},
-        {"well_id": "020000100", "production_date": pd.Timestamp("2021-03-01")},
-        {"well_id": "020000100", "production_date": pd.Timestamp("2021-06-01")},
-    ]
-    ddf = _make_dask_df(rows_nogap + rows_gap)
-    result = check_well_completeness(ddf)
-    assert set(result["well_id"].tolist()) == {"020000100"}
-
-
-def test_well_completeness_returns_pandas():
-    rows = [{"well_id": "010000100", "production_date": pd.Timestamp("2021-01-01")}]
-    ddf = _make_dask_df(rows)
-    result = check_well_completeness(ddf)
-    assert isinstance(result, pd.DataFrame)
-
-
-def test_well_completeness_output_columns():
-    rows = [{"well_id": "010000100", "production_date": pd.Timestamp("2021-01-01")}]
-    ddf = _make_dask_df(rows)
-    result = check_well_completeness(ddf)
-    expected_cols = {
-        "well_id",
-        "min_date",
-        "max_date",
-        "expected_months",
-        "actual_months",
-        "gap_count",
+    cfg = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed),
+        }
     }
-    assert set(result.columns) == expected_cols
+    transform(cfg)
+
+    ddf = dd.read_parquet(str(processed), engine="pyarrow")
+    assert ddf.index.name == "well_id"
 
 
-# ---------------------------------------------------------------------------
-# TRN-06 + TRN-07: run_transform integration tests
-# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_transform_partitions_sorted_by_date(tmp_path: Path):
+    """Each partition is sorted by production_date (boundary-transform-features)."""
+    interim = _write_interim_parquet(tmp_path, rows=6)
+    processed = tmp_path / "processed"
 
+    cfg = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed),
+        }
+    }
+    transform(cfg)
 
-@pytest.fixture()
-def transform_setup(tmp_path):
-    df = _make_interim_df(n_wells=2, months_per_well=6)
-    interim_dir = _write_interim_parquet(tmp_path, df)
-    cfg_path = _make_transform_config(tmp_path, interim_dir)
-    processed_dir = tmp_path / "processed"
-    return cfg_path, processed_dir, df
-
-
-def test_run_transform_creates_parquet(transform_setup):
-    cfg_path, processed_dir, _ = transform_setup
-    run_transform(cfg_path)
-    assert list(processed_dir.glob("*.parquet"))
-
-
-def test_run_transform_parquet_readable(transform_setup):
-    """TR-18: All output Parquet files readable."""
-    cfg_path, processed_dir, _ = transform_setup
-    run_transform(cfg_path)
-    for pf in processed_dir.glob("*.parquet"):
+    parquet_files = list(Path(processed).glob("**/*.parquet"))
+    for pf in parquet_files:
         df = pd.read_parquet(pf)
-        assert isinstance(df, pd.DataFrame)
-
-
-def test_run_transform_output_columns(transform_setup):
-    cfg_path, processed_dir, _ = transform_setup
-    run_transform(cfg_path)
-    all_df = dd.read_parquet(str(processed_dir)).compute()
-    for col in ["production_date", "OilProduced", "GasProduced", "WaterProduced", "oil_unit_flag"]:
-        assert col in all_df.columns or col in all_df.index.names
-
-
-def test_run_transform_sorted_within_partitions(transform_setup):
-    cfg_path, processed_dir, _ = transform_setup
-    run_transform(cfg_path)
-    for pf in sorted(processed_dir.glob("*.parquet")):
-        df = pd.read_parquet(pf)
-        if len(df) > 1:
+        if len(df) > 1 and "production_date" in df.columns:
             assert df["production_date"].is_monotonic_increasing
 
 
-def test_run_transform_empty_interim_dir(tmp_path):
-    """Given empty interim_dir, run_transform returns without raising."""
+@pytest.mark.unit
+def test_transform_partition_count_in_range(tmp_path: Path):
+    """Partition count within ADR-004 range after transform."""
+    interim = _write_interim_parquet(tmp_path)
+    processed = tmp_path / "processed"
+
+    cfg = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed),
+        }
+    }
+    transform(cfg)
+
+    ddf = dd.read_parquet(str(processed), engine="pyarrow")
+    assert 10 <= ddf.npartitions <= 50
+
+
+@pytest.mark.unit
+def test_transform_schema_stable_across_partitions(tmp_path: Path):
+    """Two sampled partitions have identical column names and dtypes (TR-14)."""
+    interim = _write_interim_parquet(tmp_path)
+    processed = tmp_path / "processed"
+
+    cfg = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed),
+        }
+    }
+    transform(cfg)
+
+    parquet_files = list(Path(processed).glob("**/*.parquet"))
+    if len(parquet_files) >= 2:
+        df1 = pd.read_parquet(parquet_files[0])
+        df2 = pd.read_parquet(parquet_files[1])
+        assert list(df1.columns) == list(df2.columns)
+        assert dict(df1.dtypes) == dict(df2.dtypes)
+
+
+@pytest.mark.unit
+def test_transform_dtypes_correct(tmp_path: Path):
+    """Numeric cols float, date col datetime, string/categorical cols correct (TR-12)."""
+    interim = _write_interim_parquet(tmp_path)
+    processed = tmp_path / "processed"
+
+    cfg = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed),
+        }
+    }
+    transform(cfg)
+
+    ddf = dd.read_parquet(str(processed), engine="pyarrow")
+    df = ddf.compute()
+
+    assert pd.api.types.is_float_dtype(df["OilProduced"])
+    if "production_date" in df.columns:
+        assert pd.api.types.is_datetime64_any_dtype(df["production_date"])
+
+
+@pytest.mark.unit
+def test_transform_zero_oil_preserved(tmp_path: Path):
+    """Zeros pass through transform unchanged (TR-05)."""
+    interim = _write_interim_parquet(tmp_path, rows=3)
+    # Patch first row's OilProduced to 0
+    pf = list(Path(interim).glob("*.parquet"))[0]
+    df = pd.read_parquet(pf)
+    df.at[0, "OilProduced"] = 0.0
+    df.to_parquet(pf, index=False)
+
+    processed = tmp_path / "processed"
+    cfg = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed),
+        }
+    }
+    transform(cfg)
+
+    out = dd.read_parquet(str(processed), engine="pyarrow").compute()
+    oil_values = out["OilProduced"].dropna()
+    assert 0.0 in oil_values.values
+
+
+@pytest.mark.unit
+def test_transform_idempotent(tmp_path: Path):
+    """Running transform twice yields same row count and content (TR-15)."""
+    interim = _write_interim_parquet(tmp_path)
+    processed1 = tmp_path / "processed1"
+    processed2 = tmp_path / "processed2"
+
+    cfg1 = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed1),
+        }
+    }
+    cfg2 = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim),
+            "processed_dir": str(processed2),
+        }
+    }
+    transform(cfg1)
+    transform(cfg2)
+
+    df1 = dd.read_parquet(str(processed1), engine="pyarrow").compute()
+    df2 = dd.read_parquet(str(processed2), engine="pyarrow").compute()
+    assert len(df1) == len(df2)
+
+
+@pytest.mark.unit
+def test_transform_well_completeness(tmp_path: Path):
+    """Well with records for every month Jan–Jun shows all 6 records (TR-04)."""
     interim_dir = tmp_path / "interim"
     interim_dir.mkdir()
-    cfg_path = _make_transform_config(tmp_path, interim_dir)
-    run_transform(cfg_path)  # should not raise
-
-
-def test_run_transform_no_compute_before_write(transform_setup):
-    """TR-17: run_transform must not call .compute() before writing."""
-
-    cfg_path, processed_dir, _ = transform_setup
-    compute_calls = []
-
-    original_compute = dd.DataFrame.compute
-
-    def tracking_compute(self, **kwargs):
-        compute_calls.append(1)
-        return original_compute(self, **kwargs)
-
-    # We allow compute() only for the well completeness check (diagnostic)
-    # The test verifies no intermediate compute before repartition
-    run_transform(cfg_path)
-    # Main test: output exists (indicating write happened)
-    assert list(processed_dir.glob("*.parquet"))
-
-
-# ---------------------------------------------------------------------------
-# TR-11, TR-12, TR-13, TR-14, TR-15: Integration validations
-# ---------------------------------------------------------------------------
-
-
-def test_tr12_cleaning_validation(tmp_path):
-    """TR-12: Negative GasProduced → NA; duplicates removed; null OilProduced stays null."""
     rows = []
-    # 2 null OilProduced
-    for _ in range(2):
-        r = _make_interim_df(1, 1).iloc[0].to_dict()
-        r["OilProduced"] = None
-        rows.append(r)
-    # 3 negative GasProduced
-    for _ in range(3):
-        r = _make_interim_df(1, 1).iloc[0].to_dict()
-        r["GasProduced"] = -5.0
-        r["ReportMonth"] = 2
-        rows.append(r)
-    # 1 duplicate
-    base = _make_interim_df(1, 1).iloc[0].to_dict()
-    base["ReportMonth"] = 3
-    rows.append(base)
-    rows.append(base)  # exact duplicate
-
+    for m in range(1, 7):
+        rows.append(
+            {
+                "ApiCountyCode": "01",
+                "ApiSequenceNumber": "99999",
+                "ApiSidetrack": "00",
+                "ReportYear": 2022,
+                "ReportMonth": m,
+                "OilProduced": float(100 + m),
+                "GasProduced": 500.0,
+                "WaterProduced": 50.0,
+                "OilSales": 90.0,
+                "GasSales": 490.0,
+                "WaterPressureTubing": 100.0,
+                "WaterPressureCasing": 105.0,
+                "GasPressureTubing": 200.0,
+                "GasPressureCasing": 210.0,
+                "WellStatus": "AC",
+                "OpName": "OP",
+                "Well": "TEST WELL",
+                "DaysProduced": 30,
+                "DocNum": 1,
+                "OpNumber": 1,
+                "FacilityId": 1,
+                "AcceptedDate": None,
+                "Revised": False,
+                "OilAdjustment": 0.0,
+                "OilGravity": 42.0,
+                "GasBtuSales": 1000.0,
+                "GasUsedOnLease": 10.0,
+                "GasShrinkage": 5.0,
+                "FlaredVented": 0.0,
+                "BomInvent": 0.0,
+                "EomInvent": 0.0,
+                "FormationCode": "CODELL",
+            }
+        )
     df = pd.DataFrame(rows)
-    df["ReportYear"] = df["ReportYear"].astype("int64")
-    df["ReportMonth"] = df["ReportMonth"].astype("int64")
-    df["DaysProduced"] = pd.array([28] * len(df), dtype="Int64")
-    df["DocNum"] = pd.array([1001] * len(df), dtype="Int64")
-    df["WellStatus"] = pd.Categorical(["AC"] * len(df), categories=_WELL_STATUS_CATS)
+    df.to_parquet(interim_dir / "part.parquet", index=False)
 
-    interim_dir = tmp_path / "interim"
-    interim_dir.mkdir()
-    df.to_parquet(str(interim_dir / "part.0.parquet"), index=False)
+    processed = tmp_path / "processed"
+    cfg = {
+        "transform": {
+            **TRANSFORM_CFG,
+            "interim_dir": str(interim_dir),
+            "processed_dir": str(processed),
+        }
+    }
+    transform(cfg)
 
-    cfg_path = _make_transform_config(tmp_path, interim_dir)
-    run_transform(cfg_path)
-
-    processed_dir = tmp_path / "processed"
-    result = dd.read_parquet(str(processed_dir)).compute()
-
-    # Null OilProduced must remain null
-    assert result["OilProduced"].isna().any()
-    # Negative GasProduced → NA
-    assert not (result["GasProduced"] < 0).any()
-    # production_date dtype
-    assert np.issubdtype(result["production_date"].dtype, np.datetime64)
-    assert result["OilProduced"].dtype == np.dtype("float64")
+    out = dd.read_parquet(str(processed), engine="pyarrow").compute()
+    well_id = "01-99999-00"
+    well_rows = out[out.index == well_id]
+    assert len(well_rows) == 6
 
 
-def test_tr15_row_count_monotone(transform_setup):
-    """TR-15: Output row count <= input row count."""
-    cfg_path, processed_dir, input_df = transform_setup
-    input_rows = len(input_df)
-    run_transform(cfg_path)
-    output_df = dd.read_parquet(str(processed_dir)).compute()
-    assert len(output_df) <= input_rows
+@pytest.mark.unit
+def test_partition_count_formula():
+    """Verify the ADR-004 formula."""
+    assert _partition_count(5, 10, 50) == 10
+    assert _partition_count(30, 10, 50) == 30
+    assert _partition_count(100, 10, 50) == 50
 
 
-def test_tr14_schema_stability_across_partitions(transform_setup):
-    """TR-14: All partition files have identical column names and dtypes."""
-    cfg_path, processed_dir, _ = transform_setup
-    run_transform(cfg_path)
-    parquet_files = sorted(processed_dir.glob("*.parquet"))
-    if len(parquet_files) < 2:
-        pytest.skip("Need at least 2 partitions for TR-14")
+@pytest.mark.unit
+def test_transform_map_partitions_meta_matches_output(tmp_path: Path):
+    """Meta from clean_partition on zero-row input matches actual output schema (TR-23)."""
+    from cogcc_pipeline.ingest import load_canonical_schema
 
-    df0 = pd.read_parquet(parquet_files[0])
-    df1 = pd.read_parquet(parquet_files[1])
-    assert list(df0.columns) == list(df1.columns)
-    assert dict(df0.dtypes) == dict(df1.dtypes)
+    schema = load_canonical_schema(DICT_PATH)
+    from cogcc_pipeline.ingest import _empty_frame
+
+    empty_input = _empty_frame(schema)
+    meta_df = clean_partition(empty_input, TRANSFORM_CFG)
+
+    # Feed a real minimal partition
+    pdf = _make_partition()
+    actual = clean_partition(pdf, TRANSFORM_CFG)
+
+    # Column names and order must match
+    assert list(meta_df.columns) == list(actual.columns)
+    # Dtypes must match
+    for col in meta_df.columns:
+        assert meta_df[col].dtype == actual[col].dtype, (
+            f"dtype mismatch for {col}: meta={meta_df[col].dtype}, actual={actual[col].dtype}"
+        )

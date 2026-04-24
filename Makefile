@@ -1,31 +1,47 @@
-.PHONY: venv install acquire ingest transform features pipeline test lint typecheck
+.PHONY: venv install acquire ingest transform features pipeline test lint typecheck clean
+
+VENV := .venv
+PYTHON := python3
+PIP := $(VENV)/bin/pip
+PIPELINE := $(VENV)/bin/cogcc-pipeline
 
 venv:
-	python -m venv .venv
+	$(PYTHON) -m venv $(VENV)
 
-install:
-	.venv/bin/pip install --upgrade pip && .venv/bin/pip install -e ".[dev]"
+install: venv
+	$(PIP) install --upgrade pip
+	$(PIP) install -r requirements.txt
+	$(PIP) install -e .
 
 acquire:
-	cogcc-pipeline --stages acquire
+	$(PIPELINE) acquire
 
 ingest:
-	cogcc-pipeline --stages ingest
+	$(PIPELINE) ingest
 
 transform:
-	cogcc-pipeline --stages transform
+	$(PIPELINE) transform
 
 features:
-	cogcc-pipeline --stages features
+	$(PIPELINE) features
 
-pipeline:
-	cogcc-pipeline --stages acquire ingest transform features
+# Full pipeline: chain stage targets — pipeline entry point called once per stage
+pipeline: acquire ingest transform features
 
 test:
-	pytest tests/
+	$(VENV)/bin/pytest tests/ -m "not integration"
+
+test-integration:
+	$(VENV)/bin/pytest tests/ -m integration
+
+test-all:
+	$(VENV)/bin/pytest tests/
 
 lint:
-	ruff check cogcc_pipeline/
+	$(VENV)/bin/ruff check cogcc_pipeline/ tests/
 
 typecheck:
-	mypy cogcc_pipeline/
+	$(VENV)/bin/mypy cogcc_pipeline/
+
+clean:
+	rm -rf $(VENV) __pycache__ .mypy_cache .ruff_cache *.egg-info

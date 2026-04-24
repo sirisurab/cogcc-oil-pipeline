@@ -1,284 +1,341 @@
-"""Features stage: compute all ML-ready derived features from processed Parquet."""
+"""Features stage — compute derived ML features and write to data/features/."""
+
+from __future__ import annotations
 
 import logging
 from pathlib import Path
 
 import dask.dataframe as dd
-import numpy as np
 import pandas as pd
-
-from cogcc_pipeline.utils import get_partition_count, load_config
+from distributed import Client
 
 logger = logging.getLogger(__name__)
 
-_WELL_STATUS_ORDER = ["AB", "AC", "DG", "PA", "PR", "SI", "SO", "TA", "WO"]
-_WELL_STATUS_ENCODING = {code: i for i, code in enumerate(_WELL_STATUS_ORDER)}
-
-
 # ---------------------------------------------------------------------------
-# FEA-01: Cumulative production features
+# Task F1 — Cumulative production features
 # ---------------------------------------------------------------------------
 
 
-def _add_cumulative_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add cum_oil, cum_gas, cum_water per well. Pure and stateless.
+def add_cumulative_features(pdf: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Add per-well cumulative production columns to a partition.
 
-    Uses cumsum with skipna=False so null periods propagate through cumulative.
+    Columns added: cum_oil, cum_gas, cum_water (float).
+
+    Input is sorted by production_date within each well group
+    (boundary-transform-features downstream reliance).
+
+    Args:
+        pdf: Partition from processed Parquet (entity-indexed, sorted by date).
+        config: The ``features`` section of config.yaml (unused here but
+            kept for consistent signature across F1-F4).
+
+    Returns:
+        Partition with input columns plus cum_oil, cum_gas, cum_water.
     """
-    df = df.copy()
+    if pdf.empty:
+        return _add_empty_cols(pdf, ["cum_oil", "cum_gas", "cum_water"])
 
-    for src, dst in [
+    df = pdf.copy()
+    entity_col = df.index.name if df.index.name else "well_id"
+
+    # Reset index temporarily so groupby can reference entity
+    df_reset = df.reset_index()
+
+    for vol_col, cum_col in [
         ("OilProduced", "cum_oil"),
         ("GasProduced", "cum_gas"),
         ("WaterProduced", "cum_water"),
     ]:
-        if src in df.columns:
-            df[dst] = df.groupby(level="well_id", group_keys=False)[src].cumsum(skipna=False)
+        if vol_col in df_reset.columns:
+            # Use fillna(0) for cumsum so NA months don't propagate, but
+            # distinguish NA (missing) from 0 (shut-in) — treat NA as 0
+            # for cumulative purposes (produces flat segment, TR-08)
+            vol = pd.to_numeric(df_reset[vol_col], errors="coerce").fillna(0.0)
+            df_reset[cum_col] = df_reset.groupby(str(entity_col))[str(vol.name)].transform(
+                lambda s: s.cumsum()  # noqa: B023
+            )
+            # Restore NA where original was NA (keep flat, not forward-cum)
+            # Per TR-08: zero→flat is correct; NA months: flat by treating as 0
+            # cumulative must be non-decreasing — fillna(0) achieves this
+            df_reset[cum_col] = df_reset[cum_col].astype("float64")
         else:
-            df[dst] = np.nan
+            df_reset[cum_col] = pd.array([pd.NA] * len(df_reset), dtype="Float64")
 
+    # Restore original index
+    df_reset = df_reset.set_index(entity_col)
+    return df_reset
+
+
+def _add_empty_cols(pdf: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Add float NA columns to an empty partition (TR-23)."""
+    df = pdf.copy()
+    for col in cols:
+        df[col] = pd.Series([], dtype="float64")
     return df
 
 
 # ---------------------------------------------------------------------------
-# FEA-02: Production ratio features (GOR, WOR, WGR, water cut)
+# Task F2 — Ratio features: GOR and water cut
 # ---------------------------------------------------------------------------
 
 
-def _add_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add gor, water_cut, wor, wgr ratio columns. Pure and stateless.
+def add_ratio_features(pdf: pd.DataFrame, config: dict) -> pd.DataFrame:  # noqa: ARG001
+    """Add gor and water_cut columns to a partition.
 
-    All zero-denominator cases produce NaN (not exception, not inf).
+    Formulas (TR-09 d, e):
+    - gor = GasProduced / OilProduced
+    - water_cut = WaterProduced / (OilProduced + WaterProduced)
+
+    Zero-denominator handling (TR-06):
+    - oil=0, gas>0 → gor = NaN
+    - oil=0, gas=0 → gor = 0.0 (shut-in well convention)
+    - oil>0, gas=0 → gor = 0.0
+
+    Water cut boundary values 0.0 and 1.0 are valid (TR-10) and are retained.
+
+    Args:
+        pdf: Partition from processed Parquet.
+        config: The ``features`` section of config.yaml.
+
+    Returns:
+        Partition with input columns plus gor and water_cut (float).
     """
-    df = df.copy()
+    if pdf.empty:
+        return _add_empty_cols(pdf, ["gor", "water_cut"])
 
-    oil = df["OilProduced"] if "OilProduced" in df.columns else pd.Series(dtype=float)
-    gas = df["GasProduced"] if "GasProduced" in df.columns else pd.Series(dtype=float)
-    water = df["WaterProduced"] if "WaterProduced" in df.columns else pd.Series(dtype=float)
+    df = pdf.copy()
 
-    # GOR: gas / oil; zero oil → NaN
-    gor = np.where(
-        oil.isna() | gas.isna(),
-        np.nan,
-        np.where(oil > 0, gas / oil, np.nan),
-    )
-    # When oil=0 and gas=0 → NaN (already handled by second np.where → NaN)
-    # When oil>0 and gas=0 → 0.0
-    gor = np.where(
-        (~oil.isna()) & (~gas.isna()) & (oil > 0) & (gas == 0),
-        0.0,
-        gor,
-    )
-    df["gor"] = gor.astype(float)
+    oil = pd.to_numeric(df.get("OilProduced", pd.Series(0.0, index=df.index)), errors="coerce")
+    gas = pd.to_numeric(df.get("GasProduced", pd.Series(0.0, index=df.index)), errors="coerce")
+    water = pd.to_numeric(df.get("WaterProduced", pd.Series(0.0, index=df.index)), errors="coerce")
 
-    # Water cut: water / (oil + water); both zero → NaN
-    total_liq = oil + water
-    wc = np.where(
-        oil.isna() | water.isna(),
-        np.nan,
-        np.where(total_liq > 0, water / total_liq, np.nan),
-    )
-    df["water_cut"] = wc.astype(float)
+    # GOR computation (TR-06)
+    # oil=0, gas>0 → NaN; oil=0, gas=0 → 0.0; oil>0, gas=0 → 0.0; general → gas/oil
+    oil_zero = oil == 0.0
+    gas_zero = gas == 0.0
 
-    # WOR: water / oil; zero oil → NaN
-    wor = np.where(
-        oil.isna() | water.isna(),
-        np.nan,
-        np.where(oil > 0, water / oil, np.nan),
-    )
-    df["wor"] = wor.astype(float)
+    gor = gas / oil.replace(0.0, float("nan"))  # produces NaN where oil==0
+    # oil=0, gas=0 → shut-in → gor = 0.0
+    gor = gor.where(~(oil_zero & gas_zero), other=0.0)
+    # oil>0, gas=0 → gor = 0.0 (already handled by 0/positive = 0 in numerator)
+    df["gor"] = gor.astype("float64")
 
-    # WGR: water / gas; zero gas → NaN
-    wgr = np.where(
-        gas.isna() | water.isna(),
-        np.nan,
-        np.where(gas > 0, water / gas, np.nan),
-    )
-    df["wgr"] = wgr.astype(float)
+    # Water cut (TR-09 e)
+    total_liquid = oil + water
+    water_cut = water / total_liquid.replace(0.0, float("nan"))
+    # both zero → 0.0 (dry shut-in)
+    water_cut = water_cut.where(total_liquid != 0.0, other=0.0)
+    df["water_cut"] = water_cut.clip(lower=0.0, upper=1.0).astype("float64")
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# FEA-03: Decline rate feature
+# Task F3 — Rolling-window and lag features
 # ---------------------------------------------------------------------------
 
 
-def _add_decline_rates(df: pd.DataFrame) -> pd.DataFrame:
-    """Add decline_rate_oil and decline_rate_gas per well. Pure and stateless.
+def add_rolling_and_lag_features(pdf: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Add rolling averages, lag features, percent-change, and peak-month flag.
 
-    Rates clipped to [-1.0, 10.0]; inf/nan from zero-prior-period → NaN.
-    Prior=0, current=0 → 0.0; Prior=0, current>0 → NaN (TR-07d).
+    Rolling windows and lag sizes come from config (TR-09). At minimum:
+    - 3-month and 6-month rolling averages for OilProduced, GasProduced, WaterProduced
+    - 12-month rolling average for oil and gas
+    - Lag-1 for OilProduced
+    - Month-over-month percent change for oil and gas
+    - Per-well peak-production-month boolean flag
+
+    Args:
+        pdf: Partition from processed Parquet.
+        config: The ``features`` section of config.yaml.
+
+    Returns:
+        Partition with rolling, lag, pct-change, and peak-month columns added.
     """
-    df = df.copy()
+    rolling_windows: list[int] = list(config.get("rolling_windows", [3, 6, 12]))
+    lag_sizes: list[int] = list(config.get("lag_sizes", [1]))
 
-    for src, dst in [("OilProduced", "decline_rate_oil"), ("GasProduced", "decline_rate_gas")]:
-        if src not in df.columns:
-            df[dst] = np.nan
-            continue
+    if pdf.empty:
+        extra_cols: list[str] = []
+        for w in rolling_windows:
+            for col in ["OilProduced", "GasProduced", "WaterProduced"]:
+                extra_cols.append(f"{col}_rolling_{w}m")
+        for lag in lag_sizes:
+            extra_cols.append(f"OilProduced_lag_{lag}")
+        extra_cols += [
+            "OilProduced_pct_change",
+            "GasProduced_pct_change",
+            "is_peak_oil_month",
+        ]
+        return _add_empty_cols(pdf, extra_cols)
 
-        series = df.groupby(level="well_id", group_keys=False)[src]
+    df = pdf.copy()
+    entity_col = df.index.name if df.index.name else "well_id"
+    df_reset = df.reset_index()
 
-        raw = series.pct_change()
+    # Rolling averages per well (ADR-002: grouped vectorized transforms)
+    for w in rolling_windows:
+        for col in ["OilProduced", "GasProduced", "WaterProduced"]:
+            out_col = f"{col}_rolling_{w}m"
+            if col in df_reset.columns:
+                df_reset[out_col] = df_reset.groupby(str(entity_col))[col].transform(
+                    lambda s, window=w: (
+                        pd.to_numeric(s, errors="coerce")  # type: ignore[union-attr, attr-defined]
+                        .rolling(window=window, min_periods=window)
+                        .mean()
+                    )
+                )  # type: ignore[union-attr, attr-defined]
+            else:
+                df_reset[out_col] = float("nan")
+            df_reset[out_col] = df_reset[out_col].astype("float64")
 
-        # Handle TR-07d: prior=0 and current=0 → 0.0; prior=0 and current>0 → NaN
-        prev_vals = series.shift(1)
-        curr_vals = df[src]
-
-        both_zero = (prev_vals == 0) & (curr_vals == 0)
-        prior_zero_curr_pos = (prev_vals == 0) & (curr_vals > 0)
-
-        # Replace inf/-inf with NaN first
-        raw = raw.replace([np.inf, -np.inf], np.nan)
-
-        # Apply TR-07d corrections
-        raw = raw.where(~both_zero, other=0.0)
-        raw = raw.where(~prior_zero_curr_pos, other=np.nan)
-
-        # Clip to [-1.0, 10.0] (NaN remains NaN — clip() preserves NaN)
-        df[dst] = raw.clip(-1.0, 10.0)
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# FEA-04: Rolling average features
-# ---------------------------------------------------------------------------
-
-
-def _add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add 3, 6, 12-month rolling means for oil, gas, water per well. Pure and stateless.
-
-    Uses min_periods=1 so partial windows are computed from available data (not NaN).
-    """
-    df = df.copy()
-
-    for src, prefix in [("OilProduced", "oil"), ("GasProduced", "gas"), ("WaterProduced", "water")]:
-        if src not in df.columns:
-            for w in [3, 6, 12]:
-                df[f"{prefix}_roll{w}"] = np.nan
-            continue
-
-        grp = df.groupby(level="well_id", group_keys=False)[src]
-        for window in [3, 6, 12]:
-            col = f"{prefix}_roll{window}"
-            df[col] = grp.rolling(window=window, min_periods=1).mean().values
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# FEA-05: Lag features
-# ---------------------------------------------------------------------------
-
-
-def _add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add 1-period lag features for oil, gas, water per well. Pure and stateless."""
-    df = df.copy()
-
-    for src, dst in [
-        ("OilProduced", "oil_lag1"),
-        ("GasProduced", "gas_lag1"),
-        ("WaterProduced", "water_lag1"),
-    ]:
-        if src in df.columns:
-            df[dst] = df.groupby(level="well_id", group_keys=False)[src].shift(1)
+    # Lag features (TR-09 c)
+    for lag in lag_sizes:
+        out_col = f"OilProduced_lag_{lag}"
+        if "OilProduced" in df_reset.columns:
+            df_reset[out_col] = df_reset.groupby(str(entity_col))["OilProduced"].transform(
+                lambda s, n=lag: pd.to_numeric(s, errors="coerce").shift(n)  # type: ignore[union-attr, attr-defined]
+            )
         else:
-            df[dst] = np.nan
+            df_reset[out_col] = float("nan")
+        df_reset[out_col] = df_reset[out_col].astype("float64")
 
-    return df
+    # Month-over-month percent change
+    for col in ["OilProduced", "GasProduced"]:
+        out_col = f"{col}_pct_change"
+        if col in df_reset.columns:
+            df_reset[out_col] = df_reset.groupby(str(entity_col))[col].transform(
+                lambda s: pd.to_numeric(s, errors="coerce").pct_change()  # type: ignore[union-attr, attr-defined]
+            )
+        else:
+            df_reset[out_col] = float("nan")
+        df_reset[out_col] = df_reset[out_col].astype("float64")
 
-
-# ---------------------------------------------------------------------------
-# FEA-06: Categorical encoding and days normalization
-# ---------------------------------------------------------------------------
-
-
-def _add_encoded_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add wellstatus_encoded (Int64) and days_produced_norm (float64). Pure and stateless."""
-    df = df.copy()
-
-    # WellStatus ordinal encoding
-    if "WellStatus" in df.columns:
-        ws = df["WellStatus"]
-        # Map categories to codes; NA → -1
-        # Convert to str for mapping, handle NA
-        ws_str = ws.astype(object)
-        encoded = ws_str.map(lambda v: _WELL_STATUS_ENCODING.get(v, -1) if v is not None else -1)
-        df["wellstatus_encoded"] = pd.array(encoded.tolist(), dtype="Int64")
+    # Per-well peak-production-month boolean flag
+    if "OilProduced" in df_reset.columns:
+        oil_numeric = pd.to_numeric(df_reset["OilProduced"], errors="coerce")
+        df_reset["_oil_for_peak"] = oil_numeric
+        group_max = df_reset.groupby(str(entity_col))["_oil_for_peak"].transform("max")
+        df_reset["is_peak_oil_month"] = (oil_numeric == group_max) & oil_numeric.notna()
+        df_reset = df_reset.drop(columns=["_oil_for_peak"])
     else:
-        df["wellstatus_encoded"] = pd.array([-1] * len(df), dtype="Int64")
+        df_reset["is_peak_oil_month"] = False
 
-    # DaysProduced normalization
-    if "DaysProduced" in df.columns:
-        dp = df["DaysProduced"]
-        # Float division, preserve NA
-        norm = dp.astype(float) / 31.0
-        df["days_produced_norm"] = norm
-    else:
-        df["days_produced_norm"] = np.nan
+    df_reset["is_peak_oil_month"] = df_reset["is_peak_oil_month"].astype("bool")
 
-    return df
+    df_reset = df_reset.set_index(entity_col)
+    return df_reset
 
 
 # ---------------------------------------------------------------------------
-# FEA-07: Features pipeline assembler
+# Task F4 — Decline-rate feature with clip bounds
 # ---------------------------------------------------------------------------
 
 
-def run_features(config_path: str = "config/config.yaml") -> None:
-    """Top-level entry point for the features stage.
+def add_decline_rate(pdf: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Add decline_rate column (period-over-period, clipped).
 
-    Reads processed Parquet, computes all feature columns, writes ML-ready Parquet
-    to data/features/.
+    The raw decline rate is computed as (prev - curr) / prev, then clipped to
+    configured bounds. Division-by-zero and zero/zero are resolved to NaN
+    before clipping (TR-07 d).
+
+    Args:
+        pdf: Partition from processed Parquet.
+        config: The ``features`` section of config.yaml.
+
+    Returns:
+        Partition with decline_rate (float) added.
     """
-    config = load_config(config_path)
-    fea_cfg = config["features"]
+    lower: float = float(config.get("decline_rate_lower_bound", -1.0))
+    upper: float = float(config.get("decline_rate_upper_bound", 10.0))
 
-    processed_dir = Path(fea_cfg["processed_dir"])
-    features_dir = Path(fea_cfg["features_dir"])
+    if pdf.empty:
+        return _add_empty_cols(pdf, ["decline_rate"])
 
-    parquet_files = list(processed_dir.glob("*.parquet"))
-    if not parquet_files:
-        logger.warning("No Parquet files found in %s — features skipped", processed_dir)
-        return
+    df = pdf.copy()
+    entity_col = df.index.name if df.index.name else "well_id"
+    df_reset = df.reset_index()
 
-    n = len(parquet_files)
+    if "OilProduced" in df_reset.columns:
+        oil = pd.to_numeric(df_reset["OilProduced"], errors="coerce")
+        prev_oil = df_reset.groupby(str(entity_col))["OilProduced"].transform(
+            lambda s: pd.to_numeric(s, errors="coerce").shift(1)  # type: ignore[union-attr, attr-defined]
+        )
+        prev_oil = pd.to_numeric(prev_oil, errors="coerce")
 
-    try:
-        ddf = dd.read_parquet(str(processed_dir))
+        # Decline rate: (prev - curr) / prev
+        # Replace 0 denominator with NaN BEFORE division (TR-07 d)
+        safe_prev = prev_oil.replace(0.0, float("nan"))
+        raw_decline = (prev_oil - oil) / safe_prev
 
-        # Chain all 6 map_partitions calls lazily
-        meta1 = _add_cumulative_features(ddf._meta.copy())
-        ddf = ddf.map_partitions(_add_cumulative_features, meta=meta1)
-
-        meta2 = _add_ratio_features(ddf._meta.copy())
-        ddf = ddf.map_partitions(_add_ratio_features, meta=meta2)
-
-        meta3 = _add_decline_rates(ddf._meta.copy())
-        ddf = ddf.map_partitions(_add_decline_rates, meta=meta3)
-
-        meta4 = _add_rolling_features(ddf._meta.copy())
-        ddf = ddf.map_partitions(_add_rolling_features, meta=meta4)
-
-        meta5 = _add_lag_features(ddf._meta.copy())
-        ddf = ddf.map_partitions(_add_lag_features, meta=meta5)
-
-        meta6 = _add_encoded_features(ddf._meta.copy())
-        ddf = ddf.map_partitions(_add_encoded_features, meta=meta6)
-
-        # Repartition last (ADR-004)
-        ddf = ddf.repartition(npartitions=get_partition_count(n))
-
-        features_dir.mkdir(parents=True, exist_ok=True)
-        ddf.to_parquet(str(features_dir), write_index=True, overwrite=True)
-
-        logger.info(
-            "Features complete: %d feature columns in schema, output → %s",
-            len(ddf.columns),
-            features_dir,
+        # Clip to configured bounds
+        df_reset["decline_rate"] = raw_decline.clip(lower=lower, upper=upper).astype("float64")
+    else:
+        df_reset["decline_rate"] = pd.array([pd.NA] * len(df_reset), dtype="Float64").astype(
+            "float64"
         )
 
-    except Exception as exc:
-        logger.error("Features stage failed in function: %s", exc)
-        raise
+    df_reset = df_reset.set_index(entity_col)
+    return df_reset
+
+
+# ---------------------------------------------------------------------------
+# Features stage orchestration
+# ---------------------------------------------------------------------------
+
+
+def _partition_count(n: int, cfg_min: int = 10, cfg_max: int = 50) -> int:
+    return max(cfg_min, min(n, cfg_max))
+
+
+def features(config: dict) -> None:
+    """Stage entry point. Read processed Parquet, compute features, write output.
+
+    Applies F1–F4 via map_partitions. Meta is derived by calling each function
+    on a zero-row input (ADR-003). Lazy graph, single compute at write (ADR-005).
+
+    Args:
+        config: Full pipeline config dict (uses ``features`` sub-section).
+    """
+    features_cfg: dict = config.get("features", config)
+    processed_dir = Path(features_cfg.get("processed_dir", "data/processed"))
+    features_dir = Path(features_cfg.get("features_dir", "data/features"))
+    p_min: int = int(features_cfg.get("partition_min", 10))
+    p_max: int = int(features_cfg.get("partition_max", 50))
+
+    features_dir.mkdir(parents=True, exist_ok=True)
+
+    # Reuse existing distributed client (build-env-manifest)
+    try:
+        Client.current()
+    except ValueError:
+        pass
+
+    ddf = dd.read_parquet(str(processed_dir), engine="pyarrow")
+    logger.info("Loaded processed Parquet: %d partitions", ddf.npartitions)
+
+    # Meta derivation per ADR-003: call actual function on zero-row real input
+    meta0 = ddf._meta.copy()
+    meta_cum = add_cumulative_features(meta0, features_cfg)
+    meta_ratio = add_ratio_features(meta_cum, features_cfg)
+    meta_roll = add_rolling_and_lag_features(meta_ratio, features_cfg)
+    meta_decline = add_decline_rate(meta_roll, features_cfg)
+
+    # Build lazy graph — no intermediate .compute() (ADR-005)
+    ddf_cum = ddf.map_partitions(add_cumulative_features, features_cfg, meta=meta_cum)
+    ddf_ratio = ddf_cum.map_partitions(add_ratio_features, features_cfg, meta=meta_ratio)
+    ddf_roll = ddf_ratio.map_partitions(add_rolling_and_lag_features, features_cfg, meta=meta_roll)
+    ddf_out = ddf_roll.map_partitions(add_decline_rate, features_cfg, meta=meta_decline)
+
+    n_parts = _partition_count(ddf_out.npartitions, p_min, p_max)
+    ddf_final = ddf_out.repartition(npartitions=n_parts)
+
+    logger.info("Writing features Parquet to %s (%d partitions)", features_dir, n_parts)
+    # Single compute at write (ADR-005)
+    ddf_final.to_parquet(
+        str(features_dir),
+        engine="pyarrow",
+        write_index=True,
+        overwrite=True,
+    )
+    logger.info("Features complete — features Parquet written")

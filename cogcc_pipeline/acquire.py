@@ -1,205 +1,278 @@
-"""Acquire stage: download COGCC/ECMC production data files from external URLs."""
+"""Acquire stage — download raw COGCC production CSVs from ECMC."""
 
+from __future__ import annotations
+
+import io
 import logging
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
-import dask.bag as db
 import requests
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
-
-from cogcc_pipeline.utils import load_config
 
 logger = logging.getLogger(__name__)
 
-# Module-level default sleep; overridden at runtime from config
-_SLEEP_PER_WORKER: float = 0.5
+
+class AcquireConfigError(ValueError):
+    """Raised when the acquire configuration is invalid."""
 
 
-def build_download_targets(config: dict) -> list[dict]:
-    """Return ordered list of download target descriptors for all configured years.
+class DownloadError(RuntimeError):
+    """Raised when a download cannot be completed."""
 
-    Each descriptor has keys: year, url, output_path, is_current_year.
+
+# ---------------------------------------------------------------------------
+# Task A1 — Build the list of download targets
+# ---------------------------------------------------------------------------
+
+
+def build_download_targets(config: dict, current_year: int | None = None) -> list[dict]:
+    """Produce one download target dict per year in the configured range.
+
+    Args:
+        config: The ``acquire`` section of config.yaml.
+        current_year: Override for the current year (used in tests).
+
+    Returns:
+        List of target dicts with keys: year, url, kind, target_path.
 
     Raises:
-        ValueError: if start_year > end_year.
+        AcquireConfigError: If the year range is missing, empty, or inverted.
     """
-    start_year: int = config["start_year"]
-    end_year: int = config["end_year"]
+    if current_year is None:
+        current_year = datetime.now().year
 
-    if start_year > end_year:
-        raise ValueError(f"Invalid year range: start_year={start_year} > end_year={end_year}")
+    start_year: int | None = config.get("start_year")
+    if start_year is None:
+        raise AcquireConfigError("acquire.start_year is not configured")
+    if start_year > current_year:
+        raise AcquireConfigError(
+            f"start_year {start_year} is after current_year {current_year}"
+        )
 
-    raw_dir = Path(config["raw_dir"]).resolve()
+    base_url: str = config.get("base_url", "")
+    raw_dir: str = config.get("raw_dir", "data/raw")
+    zip_url_tpl: str = config.get(
+        "zip_url_template", "{base_url}/{year}_prod_reports.zip"
+    )
+    monthly_url: str = config.get("monthly_url", "{base_url}/monthly_prod.csv")
+
+    # Resolve template placeholders
+    monthly_url = monthly_url.format(base_url=base_url)
+
     targets: list[dict] = []
-
-    for year in range(start_year, end_year + 1):
-        is_current = year == end_year
-        if is_current:
-            url: str = config["base_url_current"]
-            output_path = raw_dir / "monthly_prod.csv"
+    for year in range(start_year, current_year + 1):
+        if year == current_year:
+            url = monthly_url
+            kind = "csv"
+            filename = "monthly_prod.csv"
         else:
-            url = config["base_url_historical"].format(year=year)
-            # Output is the extracted CSV (zip downloaded then extracted)
-            output_path = raw_dir / f"{year}_prod_reports.csv"
+            url = zip_url_tpl.format(base_url=base_url, year=year)
+            kind = "zip"
+            filename = f"{year}_prod_reports.csv"
 
         targets.append(
             {
                 "year": year,
                 "url": url,
-                "output_path": output_path,
-                "is_current_year": is_current,
+                "kind": kind,
+                "target_path": str(Path(raw_dir) / filename),
             }
         )
 
     return targets
 
 
-def is_valid_download(file_path: Path) -> bool:
-    """Return True if file exists, is non-empty, and readable as UTF-8 text."""
-    if not file_path.exists():
-        return False
-    if file_path.stat().st_size == 0:
+# ---------------------------------------------------------------------------
+# Task A2 — Download a single target with retries and validation
+# ---------------------------------------------------------------------------
+
+
+def _is_valid_csv(path: Path) -> bool:
+    """Return True if the file is non-empty, UTF-8, and has >1 line."""
+    if not path.exists() or path.stat().st_size == 0:
         return False
     try:
-        with open(file_path, "rb") as fh:
-            chunk = fh.read(1024)
-        chunk.decode("utf-8")
+        content = path.read_text(encoding="utf-8")
+        lines = [ln for ln in content.splitlines() if ln.strip()]
+        return len(lines) > 1
     except UnicodeDecodeError:
         return False
-    return True
 
 
-def _make_download_attempt(
-    target: dict,
-    timeout: int,
-    max_retries: int,
-    backoff_multiplier: int,
-) -> Path | None:
-    """Inner implementation with tenacity retry wrapping."""
+def download_target(target: dict, config: dict) -> dict:
+    """Download one target, write to disk, and return a result record.
 
-    @retry(
-        stop=stop_after_attempt(max_retries),
-        wait=wait_exponential(multiplier=backoff_multiplier, min=1, max=60),
-        retry=retry_if_exception_type((requests.exceptions.RequestException, OSError)),
-        reraise=True,
-    )
-    def _attempt() -> Path:
-        output_path: Path = target["output_path"]
-        tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    Args:
+        target: A target dict produced by :func:`build_download_targets`.
+        config: The ``acquire`` section of config.yaml.
 
-        time.sleep(_SLEEP_PER_WORKER)
+    Returns:
+        Result record with keys: year, url, final_path, size_bytes,
+        downloaded_at, status.
+    """
+    year: int = target["year"]
+    url: str = target["url"]
+    kind: str = target["kind"]
+    target_path = Path(target["target_path"])
+    retry_count: int = int(config.get("retry_count", 3))
+    sleep_s: float = float(config.get("sleep_between_downloads", 0.5))
 
-        headers = {"User-Agent": "COGCC-Pipeline/1.0"}
-        response = requests.get(target["url"], timeout=timeout, headers=headers, stream=True)
+    result_base: dict = {
+        "year": year,
+        "url": url,
+        "final_path": str(target_path),
+        "size_bytes": 0,
+        "downloaded_at": datetime.utcnow().isoformat(),
+        "status": "failed",
+    }
 
-        if response.status_code != 200:
-            raise requests.exceptions.HTTPError(f"HTTP {response.status_code} for {target['url']}")
+    # Idempotency: skip if already valid
+    if _is_valid_csv(target_path):
+        logger.info("Skipping %s — already downloaded", target_path)
+        return {
+            **result_base,
+            "final_path": str(target_path),
+            "size_bytes": target_path.stat().st_size,
+            "status": "skipped",
+        }
 
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Rate-limit sleep per worker
+    time.sleep(sleep_s)
+
+    last_exc: Exception | None = None
+    for attempt in range(1, retry_count + 1):
         try:
-            with open(tmp_path, "wb") as fh:
-                for chunk in response.iter_content(chunk_size=65536):
-                    fh.write(chunk)
-        except OSError:
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
+            resp = requests.get(url, timeout=60, stream=True)
+            resp.raise_for_status()
+            raw_bytes = resp.content
 
-        if target["is_current_year"]:
-            # Rename tmp → final path directly
-            tmp_path.rename(output_path)
-        else:
-            # Extract first CSV from the zip tmp file
-            try:
-                with zipfile.ZipFile(tmp_path, "r") as zf:
+            if not raw_bytes:
+                logger.warning("Empty response for %s (attempt %d)", url, attempt)
+                last_exc = DownloadError(f"Empty response from {url}")
+                continue
+
+            if kind == "zip":
+                # Extract inner CSV from ZIP
+                with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
                     csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csv_names:
-                        raise ValueError(f"No CSV found inside zip from {target['url']}")
-                    with zf.open(csv_names[0]) as csv_in, open(output_path, "wb") as csv_out:
-                        csv_out.write(csv_in.read())
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink()
+                        raise DownloadError(f"No CSV found in ZIP from {url}")
+                    csv_bytes = zf.read(csv_names[0])
 
-        if not is_valid_download(output_path):
-            if output_path.exists():
-                output_path.unlink()
-            raise RuntimeError(f"Downloaded file failed validity check: {output_path}")
+                # Validate extracted CSV
+                try:
+                    text = csv_bytes.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise DownloadError(f"ZIP inner CSV is not UTF-8: {url}") from exc
 
-        size = output_path.stat().st_size
-        logger.info("Downloaded %s (%d bytes)", output_path.name, size)
-        return output_path
+                lines = [ln for ln in text.splitlines() if ln.strip()]
+                if len(lines) <= 1:
+                    raise DownloadError(f"ZIP inner CSV has no data rows: {url}")
 
-    return _attempt()
+                target_path.write_bytes(csv_bytes)
+
+            else:  # kind == "csv"
+                try:
+                    text = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise DownloadError(f"Downloaded CSV is not UTF-8: {url}") from exc
+
+                lines = [ln for ln in text.splitlines() if ln.strip()]
+                if len(lines) <= 1:
+                    raise DownloadError(f"Downloaded CSV has no data rows: {url}")
+
+                target_path.write_bytes(raw_bytes)
+
+            size = target_path.stat().st_size
+            logger.info("Downloaded %s → %s (%d bytes)", url, target_path, size)
+            return {
+                **result_base,
+                "final_path": str(target_path),
+                "size_bytes": size,
+                "downloaded_at": datetime.utcnow().isoformat(),
+                "status": "downloaded",
+            }
+
+        except (requests.RequestException, DownloadError) as exc:
+            last_exc = exc
+            logger.warning(
+                "Download attempt %d/%d failed for %s: %s",
+                attempt,
+                retry_count,
+                url,
+                exc,
+            )
+            if attempt < retry_count:
+                time.sleep(2**attempt)  # exponential backoff
+
+    # Cleanup any partial file
+    if target_path.exists():
+        target_path.unlink()
+        logger.debug("Removed partial file %s", target_path)
+
+    logger.error("All %d attempts failed for %s: %s", retry_count, url, last_exc)
+    return result_base
 
 
-def download_file(
-    target: dict,
-    timeout: int = 60,
-    max_retries: int = 3,
-    backoff_multiplier: int = 2,
-) -> Path | None:
-    """Download a single file described by target. Returns Path on success, None if skipped.
+# ---------------------------------------------------------------------------
+# Task A3 — Parallel acquire orchestration
+# ---------------------------------------------------------------------------
 
-    Returns None without making any HTTP request if a valid file already exists.
-    After max_retries failures, logs a WARNING and returns None.
+
+def acquire(config: dict) -> list[dict]:
+    """Entry point for the acquire stage.
+
+    Downloads all configured year targets in parallel using a thread pool
+    (I/O-bound per ADR-001). Returns one result record per target.
+
+    Args:
+        config: The ``acquire`` section of config.yaml.
+
+    Returns:
+        List of per-target result records (downloaded / skipped / failed).
     """
-    output_path: Path = target["output_path"]
-
-    if is_valid_download(output_path):
-        logger.info("Skipping already-present file: %s", output_path.name)
-        return None
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        return _make_download_attempt(target, timeout, max_retries, backoff_multiplier)
-    except Exception as exc:
-        logger.warning(
-            "Failed to download %s after %d attempts: %s", target["url"], max_retries, exc
-        )
-        return None
-
-
-def run_acquire(config_path: str = "config/config.yaml") -> list[Path]:
-    """Top-level entry point for the acquire stage.
-
-    Downloads all configured year files in parallel using the Dask threaded scheduler.
-    Returns a list of Path objects for files that were newly downloaded.
-    """
-    global _SLEEP_PER_WORKER
-
-    config = load_config(config_path)
-    acq_cfg = config["acquire"]
-
-    _SLEEP_PER_WORKER = float(acq_cfg.get("sleep_per_worker", 0.5))
-    timeout: int = int(acq_cfg.get("timeout", 60))
-    max_retries: int = int(acq_cfg.get("max_retries", 3))
-    backoff_multiplier: int = int(acq_cfg.get("backoff_multiplier", 2))
-    max_workers: int = int(acq_cfg.get("max_workers", 5))
-
-    raw_dir = Path(acq_cfg["raw_dir"])
+    raw_dir = Path(config.get("raw_dir", "data/raw"))
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    targets = build_download_targets(acq_cfg)
-    n_partitions = min(len(targets), max_workers)
+    max_workers: int = min(int(config.get("workers", 5)), 5)  # cap at 5 per task-writer
 
-    def _download(t: dict) -> Path | None:
-        return download_file(
-            t, timeout=timeout, max_retries=max_retries, backoff_multiplier=backoff_multiplier
-        )
+    targets = build_download_targets(config)
+    logger.info("Acquire stage: %d targets, %d workers", len(targets), max_workers)
 
-    bag = db.from_sequence(targets, npartitions=n_partitions)
-    results: list[Path | None] = bag.map(_download).compute(scheduler="threads")
+    results: list[dict] = [{}] * len(targets)
 
-    downloaded = [p for p in results if p is not None]
-    skipped = len(results) - len(downloaded)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(download_target, t, config): i
+            for i, t in enumerate(targets)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Unexpected error for target index %d: %s", idx, exc)
+                results[idx] = {
+                    "year": targets[idx]["year"],
+                    "url": targets[idx]["url"],
+                    "final_path": targets[idx]["target_path"],
+                    "size_bytes": 0,
+                    "downloaded_at": datetime.utcnow().isoformat(),
+                    "status": "failed",
+                }
 
+    downloaded = sum(1 for r in results if r.get("status") == "downloaded")
+    skipped = sum(1 for r in results if r.get("status") == "skipped")
+    failed = sum(1 for r in results if r.get("status") == "failed")
     logger.info(
-        "Acquire complete: %d total targets, %d downloaded, %d skipped",
-        len(targets),
-        len(downloaded),
+        "Acquire complete — downloaded=%d skipped=%d failed=%d",
+        downloaded,
         skipped,
+        failed,
     )
-    return downloaded
+    return results
