@@ -1,158 +1,167 @@
-# Acquire Stage — Task Specifications
+# Acquire Stage Tasks
 
-Module: `cogcc_pipeline/acquire.py`
-Tests: `tests/test_acquire.py`
-
-Authoritative references (read before implementing; cite — do not restate):
-- `/agent_docs/ADRs.md` — ADR-001 (scheduler choice), ADR-006 (logging), ADR-007
-  (technology stack), ADR-008 (test strategy)
-- `/agent_docs/stage-manifest-acquire.md` — purpose, input/output state, hazards H1, H2
-- `/agent_docs/build-env-manifest.md` — configuration structure, HTTP library
-  constraint, Dask scheduler initialization
-- `/task-writer-cogcc.md` — dataset layout (`{year}_prod_reports.zip` per year,
-  `monthly_prod.csv` for current year), download rules, rate-limiting constraint
-  (max 5 concurrent workers, 0.5 s sleep per worker)
-- `/test-requirements.xml` — TR-20, TR-21
-
-All configurable values (URLs, years range, output directory, worker count, sleep
-between downloads, retry count) are read from the `acquire` section of `config.yaml`
-per build-env-manifest "Configuration structure". No configurable values may be
-hardcoded.
+**Module:** `cogcc_pipeline/acquire.py`
+**Test file:** `tests/test_acquire.py`
 
 ---
 
-## Task A1 — Build the list of download targets
+## Governing documents
 
-Module: `cogcc_pipeline/acquire.py`
-Function: `build_download_targets(config: dict) -> list[dict]`
-
-Description: Produce the list of download targets the stage must fetch. For each
-year in the configured range (start year through current year), emit one target.
-Per `/task-writer-cogcc.md` dataset instructions, the current year uses the
-monthly CSV URL; each prior year uses the annual ZIP URL. The returned list is
-the single source of truth consumed by A2 and A3 — no other function re-derives
-it.
-
-Each target is a dict carrying at minimum: year, source URL, target file path
-under `data/raw/`, and download kind (`zip` or `csv`) so the downloader knows
-whether post-download extraction is required.
-
-Design decisions the coder must make and the governing doc for each:
-- Year range boundaries — from `acquire` section of `config.yaml` (build-env-manifest
-  "Configuration structure").
-- Current-year vs. prior-year URL selection — governed by
-  `/task-writer-cogcc.md` dataset instructions.
-- Target filename convention — governed by `/task-writer-cogcc.md` context section
-  (`data/raw/{year}_prod_reports.csv`, `data/raw/monthly_prod.csv`).
-
-Error handling: raise a clearly named exception if the configured year range is
-empty, inverted, or missing.
-
-Test cases (unit, do not hit the network):
-- Given a config with `start_year=2020` and a fixed `current_year=2024`, assert
-  the returned list has one entry per year 2020..2024, all prior years are `zip`
-  kind, 2024 is `csv` kind.
-- Given a config with `start_year > current_year`, assert the function raises.
-- Assert target file paths resolve under the configured raw directory.
-
-Definition of done: Function is implemented, test cases pass, ruff and mypy report
-no errors, requirements.txt updated with all third-party packages imported in this task.
+All scheduler decisions: ADR-001.
+All design decisions in this stage: stage-manifest-acquire.md.
+Build environment and HTTP library constraints: build-env-manifest.md.
+Test marking (unit vs integration): ADR-008.
 
 ---
 
-## Task A2 — Download a single target with retries and validation
+## Scope constraints (apply to every task in this file)
 
-Module: `cogcc_pipeline/acquire.py`
-Function: `download_target(target: dict, config: dict) -> dict`
-
-Description: Download exactly one target produced by A1, write the downloaded
-bytes to the target path under `data/raw/`, and return a per-target result record
-containing at minimum: target year, source URL, final CSV path on disk, size in
-bytes, download timestamp, and status (`downloaded`, `skipped`, `failed`). The
-function is the unit of work submitted to the parallel executor in A3 and must be
-safe to call concurrently with itself on different targets.
-
-Behavior requirements:
-- Idempotent: if the target CSV already exists on disk and is valid (non-zero
-  bytes, UTF-8 decodable, more than one line), return a `skipped` record without
-  re-downloading. Governs TR-20.
-- Integrity: a file is only considered successfully downloaded if it is non-empty,
-  UTF-8 decodable, and contains at least one data row beyond the header. Governs
-  TR-21 and stage-manifest-acquire H2.
-- Retries: transient HTTP/network errors retry up to the configured retry count
-  with backoff. Exhausted retries produce a `failed` status — not an exception
-  that aborts the whole stage.
-- ZIP targets: after a successful download of a ZIP, extract the inner production
-  CSV into `data/raw/` under the configured filename and remove the ZIP
-  artifact. The returned `final_path` points to the CSV, not the ZIP.
-- Per-worker rate limit: honour the sleep interval specified in the project
-  task-writer file (`/task-writer-cogcc.md` dataset instructions).
-- Library choice: HTTP request library and HTML parsing library only — browser
-  automation is prohibited per ADR-007 and build-env-manifest "HTTP library for
-  acquire".
-
-Error handling: a failed download must not leave a partially written file that
-would pass an existence check at ingest time (stage-manifest-acquire H2). Any
-partially written artifact is removed before the function returns `failed`.
-
-Test cases (unit, no real network — mock the HTTP client):
-- Given a target whose mocked response returns 200 and a valid multi-line body,
-  assert the file is written and the returned record status is `downloaded`.
-- Given a target whose file already exists on disk with valid content, assert
-  no HTTP call is made and the returned record status is `skipped` (TR-20).
-- Given a target whose mocked response returns an empty body, assert no file is
-  left on disk and the returned record status is `failed` (TR-21, H2).
-- Given a target that fails with a connection error on every attempt up to the
-  retry limit, assert the function returns `failed` and does not raise.
-- Given a ZIP target whose mocked response returns a valid archive containing a
-  CSV, assert the CSV is extracted to the configured path and the ZIP artifact
-  is removed.
-
-Definition of done: Function is implemented, test cases pass, ruff and mypy report
-no errors, requirements.txt updated with all third-party packages imported in this task.
+- URL construction uses the `zip-file-path` and `monthly-file-path` templates from
+  `task-writer-cogcc.md` directly — do not fetch or scrape an index page to discover URLs.
+- No retry logic. No caching layer. No URL discovery. No HTML link scraping.
+- bs4/BeautifulSoup is listed in the build environment for acquire HTML parsing tasks only.
+  There are no HTML parsing tasks in this stage — the URLs are fully specified. Do not use
+  bs4/BeautifulSoup anywhere in this stage.
+- The acquire stage uses the Dask threaded scheduler (see ADR-001). Do not use the Dask
+  distributed scheduler or initialize a distributed cluster in this stage.
+- Scheduler choice is governed by ADR-001 — cite it, do not restate it.
 
 ---
 
-## Task A3 — Parallel acquire orchestration
+## Task 01: Load acquire configuration
 
-Module: `cogcc_pipeline/acquire.py`
-Function: `acquire(config: dict) -> list[dict]`
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `load_config(config_path: str) -> dict`
 
-Description: Entry point for the acquire stage. Produces the target list via A1,
-downloads all targets in parallel, and returns the list of per-target result
-records produced by A2.
+**Description:** Read `config.yaml` from `config_path` and return the `acquire` section as
+a dict. The returned dict must contain all acquire-stage settings: the zip URL template,
+the monthly CSV URL, the list of target years, the maximum number of concurrent workers,
+the per-worker sleep duration, and the raw output directory path. No default values are
+assumed — all required keys must be present in the config file.
 
-Design decisions the coder must make and the governing doc for each:
-- Parallelization mechanism — ADR-001 specifies the threaded scheduler for the
-  I/O-bound acquire stage. Concurrency is bounded by the worker count from the
-  `acquire` section of `config.yaml`, capped at the limit in
-  `/task-writer-cogcc.md` dataset instructions.
-- Output directory creation — `data/raw/` is created if absent before any
-  download runs.
-- Failure handling — a failed target does not abort the stage; `failed` records
-  are returned alongside `downloaded` and `skipped` records so downstream stages
-  can reason about what is present.
-- Logging — per ADR-006, this stage uses the logger configured at pipeline
-  startup; it does not configure its own handlers.
+**Error handling:** Raise `KeyError` with a descriptive message if any required acquire
+key is missing from the loaded config.
 
-Return contract: the returned list contains one record per target in the input
-list. Every return path satisfies the same record shape and keys — regardless of
-whether a target was downloaded, skipped, or failed.
+**Dependencies:** pyyaml
 
-Test cases (unit):
-- Given a mocked A2 that returns `downloaded` for all targets, assert the
-  aggregate result length equals the target count and every record has status
-  `downloaded`.
-- Given a mocked A2 that returns `skipped` for a target that already exists and
-  `downloaded` for others, assert the result reflects both statuses without
-  duplicating or re-ordering targets.
-- Given a mocked A2 that returns `failed` for one target, assert the stage still
-  returns and the result records for the remaining targets are present.
-- Running `acquire` twice against a raw directory pre-populated with valid files
-  produces the same file count after both runs and leaves existing file content
-  unchanged (TR-20 a, b, c).
-- Every file in the raw directory after acquire has size > 0 bytes, is UTF-8
-  readable, and contains at least one row beyond the header (TR-21 a, b, c).
+**Not required:** environment variable fallback, config merging, schema validation beyond
+key-presence checks.
 
-Definition of done: Function is implemented, test cases pass, ruff and mypy report
-no errors, requirements.txt updated with all third-party packages imported in this task.
+**Test cases (all marked `@pytest.mark.unit`):**
+- Given a valid config dict with all required acquire keys present, assert the function
+  returns a dict containing all expected keys.
+- Given a config file missing a required acquire key, assert `KeyError` is raised.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task 02: Build target file list
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `build_download_targets(config: dict) -> list[dict]`
+
+**Description:** Given the acquire config dict (from Task 01), return a list of download
+target descriptors — one per year in the configured year range. Each descriptor must
+contain: the download URL, the destination file path under `data/raw/`, and the year.
+For all years except the current calendar year, the URL is the zip-file-path template
+from `task-writer-cogcc.md` with `{year}` substituted; the destination filename follows
+the pattern `data/raw/{year}_prod_reports.csv`. For the current calendar year, the URL is
+the monthly-file-path; the destination filename is `data/raw/monthly_prod.csv`. URL
+construction uses the templates directly — no index page is fetched.
+
+**Not required:** file existence checks, URL validation, network access.
+
+**Dependencies:** datetime (stdlib), pathlib (stdlib)
+
+**Test cases (all marked `@pytest.mark.unit`):**
+- Given a config specifying years 2020–2022 where the current year is beyond 2022, assert
+  the function returns exactly 3 descriptors, each with the zip URL template resolved for
+  its year, and each destination path under `data/raw/`.
+- Given a config where the current year is included in the target year list, assert that
+  descriptor uses the monthly-file-path URL and the `monthly_prod.csv` destination.
+- Assert that no descriptor URL contains an unresolved `{year}` placeholder.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task 03: Download a single file
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `download_file(target: dict, sleep_seconds: float) -> Path | None`
+
+**Description:** Download the file described by `target` (a descriptor from Task 02) to
+its configured destination path. If the destination file already exists on disk, skip the
+download and return the existing path without making any network request — this satisfies
+TR-20 (idempotency). For zip targets, extract the CSV from the downloaded zip in-memory
+and write only the CSV to the destination path; do not persist the zip file to disk. For
+monthly CSV targets, write the response body directly to the destination path. Sleep for
+`sleep_seconds` after the download completes (or after the skip, to preserve consistent
+pacing). Return the destination `Path` on success, or `None` if the download fails for
+any reason. A failed download must not produce a file at the destination path — see
+stage-manifest-acquire.md H2.
+
+**Error handling:** On any exception during download or extraction, log a warning with
+the year and URL, ensure no partial file remains at the destination path, and return
+`None`.
+
+**Dependencies:** requests, zipfile (stdlib), pathlib (stdlib), time (stdlib), logging
+(stdlib)
+
+**Not required:** retry logic, redirect following beyond requests defaults, checksum
+verification, content-type validation.
+
+**Test cases (all marked `@pytest.mark.unit` unless noted):**
+- Given a target whose destination file already exists on disk, assert the function
+  returns the existing path and makes no network request (mock `requests.get` to assert
+  it is not called).
+- Given a mocked successful zip download, assert the function writes a CSV file (not a
+  zip) to the destination path and returns a `Path`.
+- Given a mocked successful monthly CSV download, assert the function writes the CSV
+  content to the destination path and returns a `Path`.
+- Given a mocked network error (`requests.exceptions.RequestException`), assert the
+  function returns `None` and leaves no file at the destination path.
+- Given a mocked download that returns an empty response body (0 bytes), assert the
+  function returns `None` and leaves no file at the destination path — satisfying
+  TR-21(a).
+- `@pytest.mark.integration`: After a real download to `tmp_path`, assert the output
+  file size is greater than 0 bytes, the file is readable as UTF-8 text, and contains
+  at least two lines (header + one data row) — satisfying TR-21(a)(b)(c).
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task 04: Run parallel acquire stage
+
+**Module:** `cogcc_pipeline/acquire.py`
+**Function:** `acquire(config: dict) -> list[Path | None]`
+
+**Description:** Orchestrate the full acquire stage. Build the list of download targets
+(Task 02), then execute all downloads in parallel using the Dask threaded scheduler
+(ADR-001) with a maximum of `config["acquire"]["max_workers"]` concurrent workers. Return
+a list of results — one per target — where each element is the `Path` written or `None`
+for a failed download. The output directory `data/raw/` must be created if it does not
+exist before any download is attempted.
+
+Parallelization mechanism: governed by ADR-001. The acquire stage is I/O-bound; see
+ADR-001 for scheduler choice.
+
+**Not required:** progress bar, retry orchestration, partial-result recovery beyond
+returning `None` per failed target.
+
+**Test cases (all marked `@pytest.mark.unit` unless noted):**
+- Given a config with 3 targets where `download_file` is mocked to return a `Path` for
+  each, assert `acquire` returns a list of 3 `Path` values.
+- Given a config where one target's `download_file` mock returns `None`, assert `acquire`
+  returns a list containing `None` at the corresponding position without raising.
+- `@pytest.mark.integration` (TR-20): Run `acquire` twice on the same `tmp_path` output
+  directory. Assert the file count after the second run equals the file count after the
+  first run, no file content has changed, and no exception is raised.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.

@@ -40,6 +40,17 @@
 	</constraint>
 </data-filtering>
 
+<deduplication>
+  <rule>
+  COGCC raw data contains revised production reports — a well may have two rows
+  for the same (well_id, production_date): the original submission and a revised
+  one. After set_index("well_id"), deduplication must key on (well_id, production_date).
+  Tie-breaking rule: sort by AcceptedDate descending before dedup and keep the first
+  row — this retains the most recently accepted report (Revised=True supersedes the
+  original). A bare drop_duplicates() with no subset must not be used.
+  </rule>
+</deduplication>
+
 <data-dictionaries>
   <file>references/production-data-dictionary.csv</file>
   <description>Use production-data-dictionary.csv as the authoritative data-type source for all

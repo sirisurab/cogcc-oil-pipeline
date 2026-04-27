@@ -1,178 +1,294 @@
-# Ingest Stage — Task Specifications
+# Ingest Stage Tasks
 
-Module: `cogcc_pipeline/ingest.py`
-Tests: `tests/test_ingest.py`
-
-Authoritative references (read before implementing; cite — do not restate):
-- `/agent_docs/ADRs.md` — ADR-001 (Dask distributed scheduler for CPU-bound
-  stages), ADR-002 (scale-first design, no per-row iteration), ADR-003 (data
-  dictionary as single source of truth for schema; nullable dtype mapping rules;
-  meta derivation rule), ADR-004 (partition count formula), ADR-005 (lazy task
-  graph, single compute), ADR-006 (dual-channel logging), ADR-007 (pandas/Dask
-  stack, Parquet only), ADR-008 (test strategy)
-- `/agent_docs/stage-manifest-ingest.md` — purpose, input/output state, hazards
-  H1, H2, H3
-- `/agent_docs/boundary-ingest-transform.md` — upstream guarantee
-- `/references/production-data-dictionary.csv` — single source of truth for
-  column names, dtypes, nullable status, categorical allowed values
-- `/task-writer-cogcc.md` — raw file naming convention, data-filtering constraint
-  (filter to `ReportYear >= 2020` after reading)
-- `/test-requirements.xml` — TR-05, TR-17, TR-18, TR-22, TR-24
-
-All configurable values (raw input directory, interim output directory,
-partition count parameters, dtype overrides if any) are read from the `ingest`
-section of `config.yaml` per build-env-manifest "Configuration structure".
+**Module:** `cogcc_pipeline/ingest.py`
+**Test file:** `tests/test_ingest.py`
 
 ---
 
-## Task I1 — Data-dictionary-driven schema loader
+## Governing documents
 
-Module: `cogcc_pipeline/ingest.py`
-Function: `load_canonical_schema(dictionary_path: str) -> dict`
-
-Description: Read `/references/production-data-dictionary.csv` and produce the
-canonical schema object consumed by every other ingest task. The schema
-object exposes, for each column in the dictionary: the canonical column name,
-the pandas dtype to apply, nullable status, and declared categorical values
-when present. This is the only function in the pipeline that interprets the
-data dictionary — per ADR-003 no other function may infer, hardcode, or
-heuristically derive column types or names.
-
-Design decisions the coder must make and the governing doc for each:
-- Mapping from data-dictionary dtype strings (`int`, `Int64`, `float`, `string`,
-  `bool`, `datetime`, `categorical`) to pandas dtypes — governed by ADR-003
-  consequences on nullable-aware dtype variants. Columns marked `nullable=yes`
-  must use nullable-aware variants; `nullable=no` columns may use
-  non-nullable variants only when they cannot hold nulls.
-- Categorical handling — allowed values come from the dictionary `categories`
-  column (pipe-separated) per ADR-003.
-
-Error handling: raise if the dictionary file is missing, malformed, or declares
-an unsupported dtype token.
-
-Test cases (unit):
-- Given the project dictionary, assert every column listed in TR-22 is present
-  in the returned schema with correct nullable status.
-- Assert every nullable column maps to a nullable-aware pandas dtype
-  (ADR-003 consequence).
-- Assert categorical columns carry the exact declared value set from the
-  dictionary's `categories` cell.
-- Given a malformed dictionary row, assert the function raises.
-
-Definition of done: Function is implemented, test cases pass, ruff and mypy report
-no errors, requirements.txt updated with all third-party packages imported in this task.
+Schema and dtype decisions: ADR-003, `references/production-data-dictionary.csv`.
+Scheduler and parallelization: ADR-001.
+Parquet partitioning formula and inter-stage format: ADR-004.
+Task graph laziness: ADR-005.
+Test marking: ADR-008.
+Stage input/output contract: stage-manifest-ingest.md.
+Output boundary consumed by transform: boundary-ingest-transform.md.
 
 ---
 
-## Task I2 — Per-file partition reader with schema enforcement
+## Scope constraints (apply to every task in this file)
 
-Module: `cogcc_pipeline/ingest.py`
-Function: `read_raw_file_to_frame(raw_path: str, schema: dict) -> pandas.DataFrame`
-
-Description: Read one raw CSV under `data/raw/` into an in-memory pandas
-DataFrame whose columns match the canonical schema exactly — canonical names,
-data-dictionary dtypes, every nullable column present (filled with NA if absent
-from the source), categoricals cast only after invalid values have been replaced
-with the null sentinel. This function is the partition-level unit of work
-invoked from I3; every path through the function — including the zero-row path
-— returns a DataFrame that satisfies the canonical schema (stage-manifest-ingest
-H2: schema enforcement applies to all DataFrames regardless of row count).
-
-After schema enforcement, filter rows to `ReportYear >= 2020` per
-`/task-writer-cogcc.md` data-filtering constraint.
-
-Design decisions the coder must make and the governing doc for each:
-- Source column name → canonical name mapping — governed by ADR-003 and
-  `/references/production-data-dictionary.csv`. Columns in the raw file that
-  are not in the dictionary are dropped. Renames happen before dtype casting.
-- Absent column handling — governed by stage-manifest-ingest H3:
-  `nullable=yes` absent → add as all-NA at the correct dtype; `nullable=no`
-  absent → raise immediately. These two branches must remain distinct.
-- Categorical cleanup — governed by ADR-003: values outside the declared
-  category set are replaced with the null sentinel before `astype("category")`.
-- Preservation of zero values — raw zeros in numeric columns must remain zeros,
-  not be converted to nulls (TR-05).
-- No per-row iteration — governed by ADR-002.
-
-Return contract: every return path yields a DataFrame with the exact column
-set, dtypes, and order defined by the canonical schema.
-
-Test cases (unit, no Dask):
-- Given a synthetic raw CSV covering every column in the dictionary, assert the
-  returned frame has canonical names, data-dictionary dtypes, and rows filtered
-  to `ReportYear >= 2020`.
-- Given a raw CSV missing a `nullable=yes` column, assert the returned frame
-  has that column present as all-NA at the dictionary dtype (H3).
-- Given a raw CSV missing a `nullable=no` column, assert the function raises
-  (H3).
-- Given a raw CSV whose `WellStatus` contains a value outside the declared
-  category set, assert the resulting category column contains only declared
-  values and the invalid value is represented by the null sentinel.
-- Given a raw CSV with zero values in numeric columns, assert the output
-  preserves zeros — they are not converted to nulls (TR-05).
-- Given a raw CSV with zero rows after filtering, assert the returned frame
-  has zero rows but carries the full canonical schema (H2).
-
-Definition of done: Function is implemented, test cases pass, ruff and mypy report
-no errors, requirements.txt updated with all third-party packages imported in this task.
+- bs4/BeautifulSoup is present for the acquire stage only — do not use it in ingest.
+- No schema inference from data. No dynamic column discovery.
+- Canonical column names are those defined in `references/production-data-dictionary.csv`.
+  Do not invent or guess column names.
+- All dtypes derive from the data dictionary — never infer from data (ADR-003).
+- Null sentinel selection is dtype-dependent (ADR-003): `np.nan` for float64 columns;
+  `pd.NA` is valid only for nullable extension types (Int64, StringDtype, CategoricalDtype,
+  bool). Using `pd.NA` on a float64 column raises TypeError at compute time.
+- Per-file parallelization must produce delayed DataFrames, not Dask Bag partitions —
+  Bag partitions compute to lists and cannot be passed to `dd.from_delayed` (see
+  stage-manifest-ingest.md H4).
+- Meta derivation for `dd.from_delayed`: call the actual read function on a minimal real
+  input and slice to zero rows — do not construct a named helper or empty-frame builder
+  (ADR-003).
+- The task graph must remain lazy until the Parquet write (ADR-005). No intermediate
+  `.compute()` calls inside transformation chains.
 
 ---
 
-## Task I3 — Parallel ingest and Parquet write
+## Canonical column set
 
-Module: `cogcc_pipeline/ingest.py`
-Function: `ingest(config: dict) -> None`
+The following column names are authoritative — derived from
+`references/production-data-dictionary.csv`. All ingest output must contain exactly these
+columns in the order defined by the data dictionary:
 
-Description: Stage entry point. Enumerate raw CSV files under the configured
-raw directory, read them in parallel using the CPU-bound scheduler, concatenate
-the per-file frames into a single Dask DataFrame that carries the canonical
-schema, repartition to the contract partition count, and write the result as
-partitioned Parquet under the configured interim directory. This function is
-the only place in the stage that writes Parquet, and it is the boundary at
-which the upstream guarantee in `/agent_docs/boundary-ingest-transform.md` is
-established.
+`DocNum`, `ReportMonth`, `ReportYear`, `DaysProduced`, `AcceptedDate`, `Revised`,
+`OpName`, `OpNumber`, `FacilityId`, `ApiCountyCode`, `ApiSequenceNumber`, `ApiSidetrack`,
+`Well`, `WellStatus`, `FormationCode`, `OilProduced`, `OilSales`, `OilAdjustment`,
+`OilGravity`, `GasProduced`, `GasSales`, `GasBtuSales`, `GasUsedOnLease`, `GasShrinkage`,
+`GasPressureTubing`, `GasPressureCasing`, `WaterProduced`, `WaterPressureTubing`,
+`WaterPressureCasing`, `FlaredVented`, `BomInvent`, `EomInvent`
 
-Design decisions the coder must make and the governing doc for each:
-- Scheduler and parallelization — governed by ADR-001 (CPU-bound distributed
-  scheduler for ingest). The stage must reuse an existing client if one is
-  running (build-env-manifest "Dask scheduler initialization").
-- Meta derivation for any Dask DataFrame constructed from delayed partitions —
-  governed by ADR-003 consequence: meta must come from calling the actual
-  partition function (I2) on a minimal real input sliced to zero rows.
-  Construction of meta by any other means is prohibited.
-- Partition count at write time — governed by ADR-004 formula
-  `max(10, min(n, 50))`. The repartition is the last operation before the
-  Parquet write (ADR-004).
-- Lazy graph / single compute — governed by ADR-005. No intermediate `.compute()`
-  inside the stage.
-- Output format — Parquet only (ADR-007). Overwrite or partition semantics are
-  an implementation decision but must preserve the upstream guarantee for
-  transform.
+---
 
-Return contract: writes interim Parquet and returns nothing. The written
-artifacts must satisfy the upstream guarantees in
-`/agent_docs/boundary-ingest-transform.md`.
+## Task 01: Load data dictionary
 
-Test cases:
-- Unit: given a config pointing at a tmp raw directory containing 2 synthetic
-  CSVs and an interim output under `tmp_path`, run `ingest` and assert the
-  interim Parquet is readable, every expected column named in TR-22 is present,
-  data-dictionary dtypes are carried (TR-12 dtype portion applies at transform
-  but TR-22 schema completeness applies here), and partition count is within
-  the ADR-004 range (TR-22).
-- Unit: assert that the return type exposed to downstream stages is a Dask
-  DataFrame at the point immediately before write — verifying no internal
-  `.compute()` was called (TR-17).
-- Unit: assert that sampling at least 3 written partitions yields the full
-  canonical column set on every sample (TR-22).
-- Unit: assert every written Parquet file is readable by a fresh pandas/Dask
-  process (TR-18).
-- Integration (`@pytest.mark.integration`, TR-24): run `ingest` on 2–3 real raw
-  source files with all output paths overridden to `tmp_path` (ADR-008). Assert
-  (a) interim Parquet is readable; (b) all columns carry data-dictionary
-  dtypes; (c) the upstream guarantees in
-  `/agent_docs/boundary-ingest-transform.md` hold; (d) all schema-required
-  columns from TR-22 are present.
+**Module:** `cogcc_pipeline/ingest.py`
+**Function:** `load_data_dictionary(dd_path: str) -> dict`
 
-Definition of done: Function is implemented, test cases pass, ruff and mypy report
-no errors, requirements.txt updated with all third-party packages imported in this task.
+**Description:** Read `references/production-data-dictionary.csv` from `dd_path` and
+return a dict keyed by column name. Each value must be a dict containing: `dtype` (the
+pandas type mapping described below), `nullable` (bool, from the `nullable` column), and
+`categories` (list of allowed values for categorical columns, or empty list otherwise).
+
+**Dtype mapping** (governed by ADR-003 — derive all dtype assignments from this mapping,
+not from data):
+
+| data-dictionary dtype | nullable=no pandas type | nullable=yes pandas type |
+|---|---|---|
+| int | int64 | Int64 |
+| float | float64 | float64 |
+| string | object | StringDtype (pd.StringDtype()) |
+| bool | bool | pd.BooleanDtype() |
+| datetime | datetime64[ns] | datetime64[ns] |
+| categorical | pd.CategoricalDtype | pd.CategoricalDtype |
+
+Note: float64 nullable columns use float64 (not a nullable extension type) because the
+float64 null sentinel is np.nan, which float64 natively holds — see ADR-003.
+
+**Dependencies:** pandas, csv (stdlib)
+
+**Test cases (all marked `@pytest.mark.unit`):**
+- Given the production data dictionary CSV, assert the returned dict contains all 32
+  column names defined in the canonical column set.
+- Assert that `OilProduced` maps to `float64` with `nullable=True`.
+- Assert that `ReportYear` maps to `int64` with `nullable=False`.
+- Assert that `WellStatus` maps to a CategoricalDtype whose categories include all values
+  declared in the data dictionary (`AB`, `AC`, `DG`, `PA`, `PR`, `SI`, `SO`, `TA`, `WO`).
+- Assert that `DocNum` maps to `Int64` (nullable integer extension type) with
+  `nullable=True`.
+- Assert that `AcceptedDate` maps to `datetime64[ns]`.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task 02: Read and validate a single raw CSV file
+
+**Module:** `cogcc_pipeline/ingest.py`
+**Function:** `read_raw_file(file_path: str, data_dict: dict) -> pd.DataFrame`
+
+**Description:** Read a single raw CSV file and return a pandas DataFrame that conforms to
+the canonical schema. This function is the unit of parallelization — it is called once per
+file inside a `dask.delayed` wrapper (Task 03). Every return path of this function must
+satisfy the same output contract: canonical column names, data-dictionary dtypes, and the
+correct null sentinel per dtype (ADR-003).
+
+The function must:
+1. Read the CSV with no dtype inference — all columns read as object initially, then cast
+   to data-dictionary types (ADR-003).
+2. For each canonical column: if the column is present in the CSV, cast it to the
+   data-dictionary dtype. If absent and `nullable=yes`, add it as an all-NA column at the
+   correct dtype. If absent and `nullable=no`, raise `ValueError` immediately (see
+   stage-manifest-ingest.md H3).
+3. Return a DataFrame with exactly the canonical columns in canonical order, with
+   data-dictionary dtypes enforced on all columns — including on a zero-row DataFrame.
+
+**Error handling:** Raise `ValueError` if a `nullable=no` column is absent from the
+source file. Log a warning for any column present in the CSV but not in the data
+dictionary (do not drop silently, but do not raise).
+
+**Null sentinel rule (ADR-003):** float64 columns use `np.nan`; nullable extension types
+(Int64, StringDtype, BooleanDtype) use `pd.NA`.
+
+**Not required:** row-level validation beyond dtype casting, outlier detection.
+
+**Dependencies:** pandas, numpy, logging (stdlib)
+
+**Test cases (all marked `@pytest.mark.unit`):**
+- Given a CSV with all canonical columns present and valid values, assert the returned
+  DataFrame has the correct dtypes for every column (spot-check at least 5 columns of
+  different types).
+- Given a CSV where a `nullable=yes` column (`DocNum`) is absent, assert the function
+  returns a DataFrame with that column present, all-NA, and at the correct dtype (Int64).
+- Given a CSV where a `nullable=no` column (`ApiCountyCode`) is absent, assert
+  `ValueError` is raised.
+- Given a CSV with zero data rows (header only), assert the function returns a DataFrame
+  with zero rows but with all canonical columns at their correct dtypes — not an empty
+  untyped DataFrame.
+- Assert that float columns (`OilProduced`, `GasProduced`, `WaterProduced`) use `np.nan`
+  as the null sentinel, not `pd.NA` (ADR-003).
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task 03: Build Dask graph from raw files
+
+**Module:** `cogcc_pipeline/ingest.py`
+**Function:** `build_dask_dataframe(file_paths: list[str], data_dict: dict) -> dd.DataFrame`
+
+**Description:** Given a list of raw CSV file paths and the data dictionary (from Task 01),
+return a lazy Dask DataFrame constructed from one `dask.delayed` call to `read_raw_file`
+per file path. Each delayed unit must compute to a pandas DataFrame — not a list or
+collection (stage-manifest-ingest.md H4). Assemble the delayed objects using
+`dd.from_delayed`.
+
+Meta derivation (ADR-003): derive the `meta=` argument for `dd.from_delayed` by calling
+`read_raw_file` on a minimal real input (first available file) and slicing to zero rows.
+Do not construct a named helper or empty-frame builder for meta — the actual function must
+be called on real input.
+
+Partition count is not adjusted here — that happens at write time (ADR-004).
+
+**Not required:** filtering, type re-casting, schema re-derivation.
+
+**Dependencies:** dask, dask.delayed, pandas
+
+**Test cases (all marked `@pytest.mark.unit`):**
+- Given a list of 3 synthetic CSV file paths (each containing valid data), assert the
+  returned object is a `dask.dataframe.DataFrame` (not a pandas DataFrame — TR-17).
+- Assert the Dask DataFrame has the correct column names matching the canonical column set.
+- Assert the Dask DataFrame's `_meta` dtypes match the data-dictionary dtype mapping for
+  all columns.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task 04: Filter to target date range
+
+**Module:** `cogcc_pipeline/ingest.py`
+**Function:** `filter_year(ddf: dd.DataFrame, min_year: int) -> dd.DataFrame`
+
+**Description:** Return a lazy Dask DataFrame containing only rows where `ReportYear >=
+min_year`. The filter is applied using Dask's partition-level operations — row filtering
+using string operations on columns produced by type-casting must be done inside a
+partition-level function (ADR-004). This function receives a typed DataFrame (from Task
+03) so `ReportYear` is already `int64` or `Int64` — no string operations are needed here.
+The filtered result must carry the same schema, dtypes, and column order as the input
+(boundary-ingest-transform.md).
+
+All return paths (including the case where filtering produces zero matching rows in a
+partition) must satisfy the same output contract: same column names, same dtypes, same
+column order.
+
+**Not required:** partition re-count adjustment.
+
+**Dependencies:** dask
+
+**Test cases (all marked `@pytest.mark.unit`):**
+- Given a Dask DataFrame containing rows for years 2018, 2019, 2020, and 2021, assert that
+  `filter_year(ddf, 2020)` returns a DataFrame with only 2020 and 2021 rows.
+- Given a Dask DataFrame where all rows have `ReportYear < 2020`, assert the function
+  returns a Dask DataFrame with zero rows but with the correct schema — not an error.
+- Assert the returned object is a `dask.dataframe.DataFrame`, not a pandas DataFrame
+  (TR-17).
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task 05: Write partitioned Parquet output
+
+**Module:** `cogcc_pipeline/ingest.py`
+**Function:** `write_parquet(ddf: dd.DataFrame, output_dir: str) -> None`
+
+**Description:** Repartition the Dask DataFrame to `max(10, min(n_partitions, 50))`
+partitions (where `n_partitions` is the current partition count before repartition) and
+write to `output_dir` as partitioned Parquet. The repartition step must be the last
+operation before writing — no operations may be applied after repartition (ADR-004).
+Partition count formula is governed by ADR-004.
+
+The output directory must be created if it does not exist before writing.
+
+**Not required:** compression-codec selection beyond pyarrow defaults, schema embedding
+beyond what `to_parquet` provides.
+
+**Dependencies:** dask, pyarrow, pathlib (stdlib)
+
+**Test cases (all marked `@pytest.mark.unit` unless noted):**
+- Given a Dask DataFrame with 5 partitions, assert the written Parquet directory contains
+  files and the Parquet is readable back into a Dask DataFrame.
+- `@pytest.mark.integration` (TR-18): Write a Dask DataFrame to `tmp_path` and assert
+  the resulting Parquet files are readable by both `dask.dataframe.read_parquet` and
+  `pandas.read_parquet`.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.
+
+---
+
+## Task 06: Ingest stage orchestrator
+
+**Module:** `cogcc_pipeline/ingest.py`
+**Function:** `ingest(config: dict) -> None`
+
+**Description:** Orchestrate the full ingest stage. Reads all raw CSV files from the
+configured raw data directory, applies schema enforcement, filters to `year >= 2020`, and
+writes partitioned Parquet to the configured interim output directory. The Dask distributed
+scheduler must be reused if already running — do not initialize a new cluster inside this
+function (build-env-manifest.md). Scheduler choice is governed by ADR-001.
+
+Execution sequence (governed by ADR-005 — task graph must remain lazy until Parquet
+write):
+1. Load data dictionary (Task 01).
+2. Discover all raw CSV files in `config["ingest"]["raw_dir"]`.
+3. Build the lazy Dask DataFrame (Task 03).
+4. Filter to `ReportYear >= 2020` (Task 04).
+5. Write partitioned Parquet (Task 05) — this is the single `.compute()` trigger.
+
+All independent computations must be batched — no intermediate `.compute()` calls before
+the write (ADR-005).
+
+**Error handling:** Log a warning if the raw directory contains no CSV files and return
+without writing. Raise if the raw directory does not exist.
+
+**Not required:** schema re-derivation, per-file error recovery beyond what Task 02
+provides.
+
+**Dependencies:** dask, pathlib (stdlib), logging (stdlib)
+
+**Test cases (all marked `@pytest.mark.unit` unless noted):**
+- Given a config pointing to a directory with no CSV files, assert the function logs a
+  warning and returns without raising.
+- `@pytest.mark.integration` (TR-24): Run `ingest()` on 2–3 real raw source files using
+  a config dict with all output paths pointing to `tmp_path`. Assert: (a) interim Parquet
+  files are written and readable; (b) all columns carry data-dictionary dtypes; (c) the
+  output satisfies all upstream guarantees in boundary-ingest-transform.md; (d) all
+  schema-required columns are present.
+- `@pytest.mark.integration` (TR-22): Read a sample of at least 3 interim Parquet
+  partitions from `tmp_path` and assert all expected columns are present in every
+  partition: `ApiCountyCode`, `ApiSequenceNumber`, `ReportYear`, `ReportMonth`,
+  `OilProduced`, `OilSales`, `GasProduced`, `GasSales`, `FlaredVented`,
+  `GasUsedOnLease`, `WaterProduced`, `DaysProduced`, `Well`, `OpName`, `OpNumber`,
+  `DocNum`. Assert no expected column is missing or renamed in any sampled partition.
+
+**Definition of done:** Function is implemented, test cases pass, ruff and mypy report no
+errors, requirements.txt updated with all third-party packages imported in this task.

@@ -1,47 +1,34 @@
-.PHONY: venv install acquire ingest transform features pipeline test lint typecheck clean
+.PHONY: venv install acquire ingest transform features pipeline clean
 
-VENV := .venv
-PYTHON := python3
-PIP := $(VENV)/bin/pip
-PIPELINE := $(VENV)/bin/cogcc-pipeline
+VENV = .venv
+PYTHON = $(VENV)/bin/python
+PIP = $(VENV)/bin/pip
+CMD = $(VENV)/bin/cogcc-pipeline
 
 venv:
-	$(PYTHON) -m venv $(VENV)
+	python3 -m venv $(VENV)
+	$(PIP) install --upgrade pip
 
 install: venv
-	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements.txt
-	$(PIP) install -e .
+	$(PIP) install -e ".[dev]"
 
 acquire:
-	$(PIPELINE) acquire
+	$(CMD) acquire
 
 ingest:
-	$(PIPELINE) ingest
+	$(CMD) ingest
 
 transform:
-	$(PIPELINE) transform
+	$(CMD) transform
 
 features:
-	$(PIPELINE) features
+	$(CMD) features
 
-# Full pipeline: chain stage targets — pipeline entry point called once per stage
-pipeline: acquire ingest transform features
-
-test:
-	$(VENV)/bin/pytest tests/ -m "not integration"
-
-test-integration:
-	$(VENV)/bin/pytest tests/ -m integration
-
-test-all:
-	$(VENV)/bin/pytest tests/
-
-lint:
-	$(VENV)/bin/ruff check cogcc_pipeline/ tests/
-
-typecheck:
-	$(VENV)/bin/mypy cogcc_pipeline/
+pipeline:
+	$(CMD) acquire ingest transform features
 
 clean:
-	rm -rf $(VENV) __pycache__ .mypy_cache .ruff_cache *.egg-info
+	rm -rf data/raw/* data/interim/* data/processed/* data/features/* logs/
+	rm -rf build dist *.egg-info cogcc_pipeline.egg-info
+	find . -type d -name __pycache__ -exec rm -rf {} +
+	find . -name "*.pyc" -delete

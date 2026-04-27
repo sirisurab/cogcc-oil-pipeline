@@ -1,6 +1,9 @@
 # Task Index
 
-- tasks/acquire_tasks.md    <- all acquire stage tasks: project scaffolding, config loader, URL builder, file validity checker, single-file downloader with retry, parallel acquire runner, and acquire integration tests
-- tasks/ingest_tasks.md     <- all ingest stage tasks: data dictionary loader, dtype mapper, schema enforcer, raw CSV reader, multi-file ingest runner, shared utilities module, and ingest integration tests
-- tasks/transform_tasks.md  <- all transform stage tasks: derived column derivation, production volume cleaning, operator name normalization, deduplication, well completeness check, transform pipeline assembler, and transform integration tests
-- tasks/features_tasks.md   <- all features stage tasks: cumulative production, ratio features (GOR/WOR/WGR/water cut), decline rates, rolling averages, lag features, categorical encoding, features pipeline assembler, CLI entry point, and features integration tests
+| File | Description |
+|---|---|
+| `tasks/acquire_tasks.md` | Download COGCC production zip and monthly CSV files for 2020–current year using Dask threaded scheduler |
+| `tasks/ingest_tasks.md` | Read raw CSVs, enforce canonical schema from data dictionary, filter to year >= 2020, write partitioned interim Parquet |
+| `tasks/transform_tasks.md` | Clean, deduplicate, cast categoricals, validate bounds, set entity index, sort by production date, write processed Parquet |
+| `tasks/features_tasks.md` | Compute cumulative volumes, GOR, water cut, decline rates, rolling averages, lag features; write ML-ready Parquet |
+| `tasks/pipeline_tasks.md` | Pipeline orchestration, dual-channel logging, Dask scheduler initialization, CLI entry point, build environment (pyproject.toml, Makefile, config.yaml, .gitignore) |

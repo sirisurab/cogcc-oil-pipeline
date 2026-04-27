@@ -5,30 +5,29 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cogcc-pipeline"
 version = "0.1.0"
-description = "COGCC oil and gas production data pipeline"
 requires-python = ">=3.11"
 dependencies = [
-    "dask[distributed]>=2024.1.0",
-    "pandas>=2.1.0",
-    "pyarrow>=14.0.0",
-    "requests>=2.31.0",
-    "beautifulsoup4>=4.12.0",
-    "pyyaml>=6.0.1",
-    "bokeh>=3.0.0",
+    "dask[distributed]",
+    "pandas",
+    "numpy",
+    "pyarrow",
+    "requests",
+    "pyyaml",
+    "bokeh",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+    "pandas-stubs",
+    "types-requests",
 ]
 
 [project.scripts]
-cogcc-pipeline = "cogcc_pipeline.__main__:main"
+cogcc-pipeline = "cogcc_pipeline.pipeline:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["cogcc_pipeline*"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py311"
-
-[tool.mypy]
-python_version = "3.11"
-strict = false
-ignore_missing_imports = true

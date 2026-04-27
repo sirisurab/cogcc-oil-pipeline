@@ -6,10 +6,10 @@ conversation_history/
 __pycache__/
 *.py[cod]
 *.egg-info/
-dist/
-build/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
-*.parquet
-*.zip
+dist/
+build/
+*.egg
+.DS_Store
